@@ -1,0 +1,105 @@
+{
+  "name": "@saitdigital/rt-dspplr",
+  "version": "0.2.0",
+  "author": "eightraw (SAIT Digital)",
+  "homepage": "https://github.com/eightraw/rt-dspplr#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eightraw/rt-dspplr.git",
+    "directory": "packages/rt-dspplr"
+  },
+  "bugs": {
+    "url": "https://github.com/eightraw/rt-dspplr/issues"
+  },
+  "description": "Web audio player with real-time DSP: pitch-preserving speed, loop, DSP chain, two-track A/B mixer, waveform. Headless engine + React component.",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "keywords": [
+    "audio",
+    "player",
+    "web-audio",
+    "dsp",
+    "web-audio-player",
+    "time-stretch",
+    "waveform",
+    "react"
+  ],
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE.md"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/types/react/index.d.ts",
+      "import": "./dist/react.js",
+      "default": "./dist/react.js"
+    },
+    "./stretch-rubberband": {
+      "types": "./dist/types/stretch-rubberband/index.d.ts",
+      "import": "./dist/stretch-rubberband.js",
+      "default": "./dist/stretch-rubberband.js"
+    },
+    "./styles.css": "./dist/styles.css",
+    "./package.json": "./package.json",
+    "./advanced": {
+      "types": "./dist/types/advanced.d.ts",
+      "import": "./dist/advanced.js",
+      "default": "./dist/advanced.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "react": [
+        "./dist/types/react/index.d.ts"
+      ],
+      "stretch-rubberband": [
+        "./dist/types/stretch-rubberband/index.d.ts"
+      ],
+      "advanced": [
+        "./dist/types/advanced.d.ts"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node build/clean.mjs && vite build && node build/build-rubberband.mjs && tsc -p tsconfig.build.json && node build/fix-dts-extensions.mjs && node build/copy-assets.mjs && node build/check-dist.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "test": "node build/test-node.mjs",
+    "prepack": "npm run build",
+    "test:browser": "playwright test",
+    "test:package": "node build/test-package.mjs"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "rubberband-wasm": "^3.3.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "rubberband-wasm": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "esbuild": "^0.25.0",
+    "react": "^18.3.1",
+    "rubberband-wasm": "^3.3.0",
+    "typescript": "~5.6.2",
+    "vite": "~6.4.1"
+  }
+}

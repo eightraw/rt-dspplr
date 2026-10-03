@@ -1,0 +1,17 @@
+node_modules
+dist
+*.local
+*.tgz
+.env
+.env.*
+.vite
+*.tsbuildinfo
+
+# Example storage folder: keep only the placeholder and the README
+examples/demo/storage/clips/*
+!examples/demo/storage/clips/.gitkeep
+!examples/demo/storage/clips/README.md
+
+# Browser test output
+test-results/
+playwright-report/

@@ -1,0 +1,23 @@
+.g-studio { padding: 0; border-radius: 12px; background: #15171b; border: 1px solid #2a2e35; color: #c9ced6; font-size: 12px; overflow: hidden; }
+.st-head { display: flex; align-items: center; gap: 16px; padding: 10px 14px; border-bottom: 1px solid #2a2e35; background: #1b1e23; }
+.st-title { flex: none; font: 500 11px 'JetBrains Mono', monospace; letter-spacing: .12em; color: #fff; }
+.st-file { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7d8590; }
+.st-tc { flex: none; margin-left: auto; margin-right: 34px; font: 500 15px 'JetBrains Mono', monospace; color: #7ee0c3; }
+.st-view { height: 210px; padding: 10px 12px 4px; }
+.g-studio .st-view .rtd.rtd-timeline { --rtd-overlay-wave: rgba(255, 255, 255, .12); --rtd-overlay-wave-rms: rgba(255, 255, 255, .2); --rtd-overlay-played: rgba(255, 255, 255, .26); --rtd-overlay-played-rms: rgba(255, 255, 255, .42); --rtd-accent: #7ee0c3; --rtd-loop-fill: rgba(126, 224, 195, .12); --rtd-loop-edge: #7ee0c3; --rtd-ruler: #2f343c; --rtd-ruler-text: #6c7480; }
+.st-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid #2a2e35; background: #1b1e23; }
+.st-btn { height: 30px; min-width: 30px; padding: 0 10px; border: 1px solid #353b44; border-radius: 6px; background: #22262c; color: #c9ced6; font: 500 10px 'JetBrains Mono', monospace; letter-spacing: .08em; display: grid; place-items: center; }
+.st-btn svg { width: 14px; height: 14px; fill: #e6e9ee; }
+.st-btn.is-on { border-color: #7ee0c3; color: #7ee0c3; }
+.st-ab { flex: 1; min-width: 280px; display: flex; align-items: center; gap: 10px; }
+.st-ab button, .st-law button { height: 30px; padding: 0 12px; border: 1px solid #353b44; border-radius: 6px; background: #22262c; color: #8a929d; font: 500 10px 'JetBrains Mono', monospace; letter-spacing: .08em; white-space: nowrap; }
+.st-ab button.is-on.is-a { border-color: #eb9746; color: #eb9746; }
+.st-ab button.is-on.is-b { border-color: #65a8ed; color: #65a8ed; }
+.st-ab input { flex: 1; min-width: 60px; accent-color: #ae7be7; }
+.st-law { display: flex; }
+.st-law button { padding: 0 8px; font-size: 9px; }
+.st-law button:first-child { border-radius: 6px 0 0 6px; }
+.st-law button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
+.st-law button.is-on { color: #c9ced6; background: #2c3138; }
+.st-meter { width: 90px; height: 8px; border-radius: 4px; background: #262a31; overflow: hidden; }
+.st-meter span { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #36c28e, #e2c044 75%, #e85d4f); }

@@ -1,0 +1,23 @@
+.g-np { --np-level: 0; display: flex; gap: 28px; padding: 26px; border-radius: 24px; color: #fff; background: radial-gradient(circle at 15% 20%, #6e3bd6 0, transparent 45%), radial-gradient(circle at 85% 80%, #f08a4b 0, transparent 50%), linear-gradient(135deg, #21123f, #8a2d5c 55%, #e0714c); overflow: hidden; }
+.g-np::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: radial-gradient(circle at 14% 50%, rgba(255, 226, 240, .5), transparent 34%), radial-gradient(circle at 62% 38%, rgba(170, 205, 255, .3), transparent 46%); opacity: var(--np-level); }
+.np-art { position: relative; flex: none; width: 170px; height: 170px; border-radius: 18px; display: grid; place-items: center; background: conic-gradient(from 200deg, #ffd27a, #ff6f91, #845ec2, #2c73d2, #ffd27a); box-shadow: 0 18px 40px rgba(0, 0, 0, .35), 0 0 calc(10px + 60px * var(--np-level)) calc(2px + 10px * var(--np-level)) rgba(255, 236, 222, calc(.15 + .65 * var(--np-level))); transform: scale(calc(1 + .04 * var(--np-level))); }
+.np-art span { font: 600 64px/1 Fraunces, serif; color: rgba(255, 255, 255, .9); mix-blend-mode: overlay; }
+.np-body { position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.np-eyebrow { font-size: 11px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; opacity: .7; }
+.np-title { margin-top: 6px; font: 600 30px/1.1 Fraunces, serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.np-artist { margin-top: 4px; font-size: 14px; opacity: .8; }
+.np-wave { height: 56px; margin-top: 16px; }
+.g-np .np-wave .rtd.rtd-timeline { --rtd-wave: rgba(255, 255, 255, .28); --rtd-wave-rms: rgba(255, 255, 255, .42); --rtd-wave-played: rgba(255, 255, 255, .78); --rtd-wave-played-rms: #fff; --rtd-accent: #fff; }
+.np-row { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
+.np-time { font-size: 12px; font-variant-numeric: tabular-nums; opacity: .75; min-width: 40px; }
+.np-time:last-child { text-align: right; }
+.np-controls { display: flex; align-items: center; gap: 18px; }
+.np-controls button { border: 0; background: none; padding: 0; display: grid; place-items: center; }
+.np-controls button svg { width: 22px; height: 22px; fill: rgba(255, 255, 255, .85); }
+.np-controls .np-play { width: 52px; height: 52px; border-radius: 50%; background: #fff; }
+.np-controls .np-play svg { width: 22px; height: 22px; fill: #3a1840; }
+@media (max-width: 620px) {
+    .g-np { flex-direction: column; }
+    .np-art { width: 96px; height: 96px; }
+    .np-art span { font-size: 40px; }
+}

@@ -1,0 +1,14 @@
+.g-lesson { padding: 24px 26px; border-radius: 18px; background: #fff; box-shadow: 0 10px 30px rgba(31, 41, 74, .08); color: #1e2440; }
+.ls-badge { display: inline-block; padding: 3px 9px; border-radius: 6px; background: #eef1ff; color: #4053d6; font: 600 10px Inter, sans-serif; letter-spacing: .1em; }
+.ls-head h3 { margin: 10px 0 4px; font: 700 22px Inter, sans-serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ls-head p { margin: 0; font-size: 13px; color: #6b7290; }
+.ls-wave { height: 54px; margin-top: 18px; }
+.ls-wave .rtd-timeline { --rtd-wave: #d5dbf5; --rtd-wave-played: #4053d6; --rtd-accent: #4053d6; --rtd-loop-fill: rgba(64, 83, 214, .1); --rtd-loop-edge: #4053d6; }
+.ls-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 16px; }
+.ls-play { width: 44px; height: 44px; border: 0; border-radius: 12px; background: #4053d6; display: grid; place-items: center; }
+.ls-play svg { width: 18px; height: 18px; fill: #fff; }
+.ls-repeat { height: 44px; padding: 0 16px; border: 1px solid #d9def2; border-radius: 12px; background: #fff; color: #1e2440; font-weight: 600; font-size: 13px; }
+.ls-speed { display: flex; padding: 4px; gap: 4px; border-radius: 12px; background: #f1f3fb; }
+.ls-speed button { height: 36px; padding: 0 12px; border: 0; border-radius: 9px; background: transparent; color: #4b5375; font-weight: 600; font-size: 13px; }
+.ls-speed button.is-on { background: #fff; color: #4053d6; box-shadow: 0 1px 3px rgba(31, 41, 74, .12); }
+.ls-note { margin-left: auto; font-size: 12px; color: #8a90aa; }

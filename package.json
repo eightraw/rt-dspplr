@@ -1,0 +1,23 @@
+{
+    "name": "workspace",
+    "private": true,
+    "type": "module",
+    "workspaces": [
+        "packages/*",
+        "examples/*"
+    ],
+    "scripts": {
+        "build": "npm run build -w packages/rt-dspplr && npm run build -w examples/demo && npm run build -w examples/gallery",
+        "build:lib": "npm run build -w packages/rt-dspplr",
+        "dev": "npm run build:lib && npm run dev -w examples/demo",
+        "gallery": "npm run build:lib && npm run dev -w examples/gallery",
+        "typecheck": "npm run typecheck --workspaces --if-present",
+        "test": "npm run test -w packages/rt-dspplr",
+        "samples": "npm run samples -w examples/demo",
+        "test:browser": "npm run build:lib && npm run test:browser -w packages/rt-dspplr",
+        "test:package": "npm run build:lib && npm run test:package -w packages/rt-dspplr"
+    },
+    "overrides": {
+        "rollup": "4.64.0"
+    }
+}

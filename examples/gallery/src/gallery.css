@@ -1,0 +1,19 @@
+html, body { margin: 0; }
+body { background: #eceef2; color: #1b1f24; font-family: Inter, system-ui, sans-serif; }
+button { font: inherit; cursor: pointer; }
+button:disabled { cursor: default; opacity: .55; }
+
+.page { box-sizing: border-box; min-height: 100vh; padding: 32px 16px 64px; }
+.page[data-drop-over] { background: #e2e6ee; }
+.page-head, .cards { max-width: 860px; margin: 0 auto; }
+.page-head h1 { margin: 0; font: 600 26px/1.2 Fraunces, serif; }
+.page-head p { max-width: 640px; margin: 8px 0 16px; font-size: 14px; line-height: 1.5; color: #4b5361; }
+.page-head code { font: 500 12px 'JetBrains Mono', monospace; }
+.pick { display: inline-block; padding: 9px 16px; border-radius: 10px; background: #1b1f24; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; }
+.pick input { display: none; }
+.cards { display: grid; gap: 28px; margin-top: 28px; }
+
+.g-card { position: relative; box-sizing: border-box; }
+.g-card[data-drop-over] { outline: 2px dashed #4053d6; outline-offset: 4px; }
+/* The player's author credit sits in each card's corner. */
+.g-card .rtd-attribution-button { position: absolute; top: 8px; right: 8px; }

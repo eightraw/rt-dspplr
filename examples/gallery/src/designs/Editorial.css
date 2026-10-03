@@ -1,0 +1,14 @@
+.g-ed { padding: 34px 38px 28px; background: #fbfaf7; border: 1px solid #e3e0d8; color: #151515; }
+.ed-top { display: flex; align-items: baseline; justify-content: space-between; gap: 24px; }
+.ed-tc { font: 300 62px/1 Fraunces, serif; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.ed-title { min-width: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; padding-right: 22px; }
+.ed-title em { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: italic 600 20px Fraunces, serif; }
+.ed-title span { font-size: 12px; color: #6d6a63; letter-spacing: .04em; }
+.ed-wave { height: 96px; margin-top: 22px; }
+.ed-wave .rtd-timeline { --rtd-wave: #d6d2c8; --rtd-wave-rms: #bdb8ac; --rtd-wave-played: #4a4741; --rtd-wave-played-rms: #151515; --rtd-accent: #151515; --rtd-loop-fill: rgba(21, 21, 21, .07); --rtd-loop-edge: #151515; --rtd-ruler: #e3e0d8; --rtd-ruler-text: #8d897f; --rtd-font: Inter, sans-serif; }
+.ed-links { display: flex; flex-wrap: wrap; gap: 22px; margin-top: 14px; font-size: 13px; }
+.ed-links button { border: 0; padding: 0 0 2px; background: none; color: #151515; border-bottom: 1px solid #151515; }
+.ed-links span { margin-left: auto; color: #8d897f; }
+@media (max-width: 620px) {
+    .ed-tc { font-size: 40px; }
+}

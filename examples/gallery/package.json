@@ -1,0 +1,25 @@
+{
+  "name": "gallery",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.node.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@saitdigital/rt-dspplr": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "~5.6.2",
+    "vite": "~6.4.1"
+  }
+}

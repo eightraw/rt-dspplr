@@ -1,0 +1,27 @@
+{
+  "name": "demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.node.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "samples": "bash scripts/make-samples.sh"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "rubberband-wasm": "^3.3.0",
+    "@saitdigital/rt-dspplr": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "~5.6.2",
+    "vite": "~6.4.1"
+  }
+}
