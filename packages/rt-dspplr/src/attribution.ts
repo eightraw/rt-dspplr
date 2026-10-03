@@ -9,6 +9,17 @@ export const PLAYER_ATTRIBUTION = Object.freeze({
 /** An info mark, drawn in the text colour, for the menu's one entry. */
 const INFO_ICON = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" style="flex:none;display:block"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 10.6v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="7.4" r="1.15" fill="currentColor"/></svg>';
 
+/**
+ * When the ⓘ button shows. 'always' (default): on every device. 'touch': only
+ * where the primary input cannot hover (phones, tablets); with a mouse the
+ * menu opens by right-click alone.
+ */
+export type InfoButtonMode = 'always' | 'touch';
+
+export interface AttributionOptions {
+    button?: InfoButtonMode;
+}
+
 interface AttributionBinding {
     open(position?: { x: number; y: number }): void;
     close(): void;
@@ -19,11 +30,17 @@ interface AttributionBinding {
  * Put the author menu on a player's interface element: right-click, the
  * context-menu key / Shift+F10, and a tappable About button. Players call this
  * from mount(); every player sharing one element shares one menu, which stays
- * until the last of them releases it. No stylesheet is required.
+ * until the last of them releases it (the first one's options apply). No
+ * stylesheet is required.
+ *
+ * The button lives inside the element. An element inside it marked
+ * `data-rtd-credit` gets the button as its child; without one the button sits
+ * over the element's top-right corner (the element becomes `position: relative`
+ * while bound if it was static), offset by `--rtd-credit-top` / `--rtd-credit-right`.
  */
-export function bindAttribution(root: HTMLElement): () => void {
+export function bindAttribution(root: HTMLElement, options: AttributionOptions = {}): () => void {
     const existing = bindings.get(root);
-    const entry = existing ?? { binding: createBinding(root), count: 0 };
+    const entry = existing ?? { binding: createBinding(root, options), count: 0 };
     entry.count += 1;
     bindings.set(root, entry);
     let released = false;
@@ -37,7 +54,10 @@ export function bindAttribution(root: HTMLElement): () => void {
     };
 }
 
-function createBinding(root: HTMLElement): AttributionBinding {
+const BUTTON_CSS = 'box-sizing:border-box;place-items:center;flex:none;width:28px;height:28px;margin:0;padding:0;border:0;border-radius:50%;background:transparent;color:var(--rtd-text-muted,#6b7280);cursor:pointer;transition:color .15s,background-color .15s;';
+const OVERLAY_CSS = 'position:absolute;top:var(--rtd-credit-top,6px);right:var(--rtd-credit-right,6px);z-index:3;';
+
+function createBinding(root: HTMLElement, options: AttributionOptions): AttributionBinding {
     const doc = root.ownerDocument;
     const win = doc.defaultView;
     if (!win) throw new Error('The player interface element must belong to a window.');
@@ -51,18 +71,54 @@ function createBinding(root: HTMLElement): AttributionBinding {
     button.setAttribute('aria-haspopup', 'menu');
     button.setAttribute('aria-expanded', 'false');
     button.title = PLAYER_ATTRIBUTION.label;
-    button.style.cssText = 'align-self:flex-end;display:inline-grid;place-items:center;width:28px;height:28px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--rtd-text-muted,#6b7280);cursor:pointer;transition:color .15s,background-color .15s;';
     const hover = (on: boolean) => {
         button.style.color = on ? 'var(--rtd-text,#1b1f24)' : 'var(--rtd-text-muted,#6b7280)';
         button.style.backgroundColor = on ? 'var(--rtd-surface-hover,rgba(127,127,127,.14))' : 'transparent';
     };
     button.addEventListener('pointerenter', () => hover(true));
     button.addEventListener('pointerleave', () => hover(false));
-    root.append(button);
 
     let menu: HTMLDivElement | null = null;
     let previousFocus: HTMLElement | null = null;
     let disposed = false;
+
+    // 'touch': shown only where the primary input cannot hover, which is where right-click is missing.
+    const touchOnly = options.button === 'touch' ? win.matchMedia('(hover: none)') : null;
+    const showButton = () => {
+        const hidden = !!touchOnly && !touchOnly.matches;
+        button.style.display = hidden ? 'none' : 'inline-grid';
+        // A slot can fold away with it (the card's does, so no empty gap is left in its row).
+        const slot = button.parentElement;
+        if (slot && slot !== root) slot.toggleAttribute('data-rtd-credit-hidden', hidden);
+    };
+    touchOnly?.addEventListener('change', showButton);
+
+    // Keep the button inside the player: in the marked slot when the interface has one (and
+    // follow it when the interface re-renders it), otherwise over the root's corner.
+    let placement: 'slot' | 'overlay' | null = null;
+    let positioned: string | null = null;
+    function place() {
+        if (disposed) return;
+        const slot = root.querySelector<HTMLElement>('[data-rtd-credit]');
+        const parent = slot ?? root;
+        const moved = button.parentNode !== parent;
+        if (moved) parent.append(button);
+        const next = slot ? 'slot' : 'overlay';
+        if (next !== placement) {
+            placement = next;
+            button.style.cssText = BUTTON_CSS + (next === 'overlay' ? OVERLAY_CSS : 'position:relative;');
+        } else if (!moved) {
+            return;
+        }
+        showButton();
+        if (next === 'overlay' && positioned === null && win!.getComputedStyle(root).position === 'static') {
+            positioned = root.style.position;
+            root.style.position = 'relative';
+        }
+    }
+    const observer = new win.MutationObserver(place);
+    place();
+    observer.observe(root, { childList: true, subtree: true });
 
     function close() {
         menu?.remove();
@@ -143,7 +199,8 @@ function createBinding(root: HTMLElement): AttributionBinding {
             menu.setAttribute('popover', 'manual');
             menu.showPopover();
         }
-        const anchor = button.getBoundingClientRect();
+        // A hidden button ('touch' mode with a mouse) has no box: open by the player instead.
+        const anchor = (button.offsetParent ? button : root).getBoundingClientRect();
         const bounds = menu.getBoundingClientRect();
         menu.style.left = `${Math.max(8, Math.min(position?.x ?? anchor.left, win!.innerWidth - bounds.width - 8))}px`;
         menu.style.top = `${Math.max(8, Math.min(position?.y ?? anchor.bottom, win!.innerHeight - bounds.height - 8))}px`;
@@ -177,7 +234,10 @@ function createBinding(root: HTMLElement): AttributionBinding {
             if (disposed) return;
             disposed = true;
             close();
+            observer.disconnect();
+            touchOnly?.removeEventListener('change', showButton);
             button.remove();
+            if (positioned !== null) root.style.position = positioned;
             root.removeEventListener('contextmenu', context, true);
             root.removeEventListener('keydown', keyboard, true);
         },

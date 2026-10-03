@@ -50,6 +50,8 @@ function StudioPanel({ source, onFiles, law, onLawChange }: CardProps & { law: M
                 <span className="st-title">STEM COMPARE</span>
                 <span className="st-file">{file}</span>
                 <span className="st-tc">{clock(now, true)}</span>
+                {/* The player puts its ⓘ button here, at the end of the header. */}
+                <span className="st-credit" data-rtd-credit="" />
             </header>
             <div className="st-view">
                 <Timeline player={player} display="both" spectrogram={{ colorMode: 'dual' }} theme="dark" emptyText="No audio yet" />

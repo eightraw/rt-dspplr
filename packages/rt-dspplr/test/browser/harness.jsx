@@ -63,7 +63,8 @@ function TimelinePage(props) {
     return <div ref={player.ref}><div style={{ height: 120 }}><Timeline player={player} {...props} /></div><div style={{ height: 3000 }} /></div>;
 }
 window.h = { ...api, advanced, sleep, buffer, wav, slowBlob, delayedStrategy, make, rms,
-    mountMenu(layout) { const root = createRoot(document.getElementById('root')); root.render(<AudioPlayer layout={layout} title="Example" />); return root; },
+    mountMenu(layout, options) { const root = createRoot(document.getElementById('root')); root.render(<AudioPlayer layout={layout} title="Example" options={options} />); return root; },
+    renderMenu(root, layout) { root.render(<AudioPlayer layout={layout} title="Example" />); },
     mountCustom() { const root = createRoot(document.getElementById('root')); root.render(<StrictMode><CustomPlayer /></StrictMode>); return root; },
     mountTimeline(props) { const root = createRoot(document.getElementById('root')); root.render(<TimelinePage {...props} />); return root; },
     mountStrict() { const root = createRoot(document.getElementById('root')); root.render(<StrictMode><StrictPlayer clip={buffer()} /></StrictMode>); return root; },

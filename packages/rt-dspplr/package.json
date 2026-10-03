@@ -1,6 +1,6 @@
 {
   "name": "@saitdigital/rt-dspplr",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "eightraw (SAIT Digital)",
   "homepage": "https://github.com/eightraw/rt-dspplr#readme",
   "repository": {
@@ -13,6 +13,9 @@
   },
   "description": "Web audio player with real-time DSP: pitch-preserving speed, loop, DSP chain, two-track A/B mixer, waveform. Headless engine + React component.",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "license": "SEE LICENSE IN LICENSE.md",
   "keywords": [
     "audio",

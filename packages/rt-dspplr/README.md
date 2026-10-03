@@ -154,6 +154,7 @@ Construction is free. No AudioContext, node, or worker exists until the first
 | `sampleRate` | `number` | `48000` | Sample rate of the shared AudioContext (the first player to start decides). |
 | `latencyHint` | `'playback' \| 'interactive' \| 'balanced' \| number` | `'playback'` | Output buffering of the shared AudioContext (the first player to start decides). `'playback'` keeps the sound clean while the page is busy. |
 | `element` | `HTMLElement` | none | The element your interface lives in; same as `mount(element)`. |
+| `infoButton` | `'always' \| 'touch'` | `'always'` | The ⓘ button of the author menu: on every device, or only on devices without right-click. See [The author credit](#the-author-credit). |
 
 `AudioInput` is `string` (URL) `| ArrayBuffer` (encoded bytes) `| Blob | AudioBuffer`.
 A clip is an `AudioInput` or `{ src, srcB?, id? }`. `id` defaults to the URL.
@@ -495,9 +496,9 @@ WASM fails to load at runtime, each job falls back to the built-in vocoder.
 
 ## Bundlers, workers, CSP
 
-The core and React entries contain three small scripts as strings: the
-dynamics AudioWorklet (~2 KB), the vocoder worker (~5 KB), and the waveform
-peaks worker (~5 KB). Each is started from a `blob:` URL the first time it is
+The core and React entries contain four small scripts as strings: the
+dynamics AudioWorklet (~2 KB), the vocoder worker (~5 KB), the waveform
+peaks worker (~5 KB) and the spectrogram worker (~7 KB). Each is started from a `blob:` URL the first time it is
 needed. No extra files, loaders, or `new URL()` patterns are involved. The
 same build is verified in Vite (dev and build) and webpack 5. Nothing in it is
 bundler-specific, so other ESM bundlers should behave the same.
@@ -626,12 +627,29 @@ a claim that Safari, Firefox, mobile devices and all bundlers were tested.
 ### The author credit
 
 Right-clicking the player (or the context-menu key / Shift+F10) opens a menu with
-**RT-DSPPLR by SAIT Digital** linking to the project; on touch devices the ⓘ
-button opens it. The player puts this menu into every element it is mounted in:
-the React `<AudioPlayer />` root, `ref={player.ref}` from `useAudioPlayer()`, or
-`createAudioPlayer({ element })` / `player.mount(element)` in any framework.
-The menu carries its own styles. There is no option to turn it off, and the
-[license](./LICENSE.md) requires it to stay.
+**RT-DSPPLR by SAIT Digital** linking to the project; the ⓘ button opens it too.
+The player places this for you, styled and ready, in every element it is mounted
+in: the React `<AudioPlayer />` root, `ref={player.ref}` from `useAudioPlayer()`,
+or `createAudioPlayer({ element })` / `player.mount(element)` in any framework, so
+you never have to build a credit of your own. The right-click menu is caught on
+the player's element only; the rest of your page keeps its own. The
+[license](./LICENSE.md) is what requires the credit to stay.
+
+The ⓘ button lives inside the player's element. Mark an element inside your
+interface with `data-rtd-credit` and the button goes there, in your layout.
+Without one it sits over the element's top-right corner (the element is made
+`position: relative` while mounted if it was static), offset by the
+`--rtd-credit-top` and `--rtd-credit-right` custom properties. `<AudioPlayer />`
+has its own place for it in the heading row. With `infoButton: 'touch'` the
+button shows only where the primary input cannot hover (phones, tablets), and a
+mouse uses right-click alone.
+
+```html
+<section id="player">
+    <header>My player <span data-rtd-credit></span></header>
+    <button data-play>Play</button>
+</section>
+```
 
 Mount the element that holds all your player controls. In browsers with the
 Popover API the menu uses the top layer; older browsers get a fixed-position
@@ -645,9 +663,12 @@ you ship a modified player, or serve it to people outside your organization,
 publish its source under the same license; your own application code stays closed.
 The terms fit on one page: [LICENSE.md](./LICENSE.md).
 
-The build checks exclude Rubber Band implementation code and WASM from the core, React and advanced entries. The
-optional `./stretch-rubberband` entry makes your application load
-`rubberband-wasm`, which is GPL-2.0-or-later. An optional dependency does not waive its licence conditions. The application
-integrator must verify that the licences of the combined distributed product
-are compatible, or obtain an appropriate commercial Rubber Band licence.
-See [Rubber Band's licensing terms](https://breakfastquay.com/rubberband/license.html).
+The build checks exclude Rubber Band implementation code and WASM from the core,
+React and advanced entries. The optional `./stretch-rubberband` entry makes your
+application load `rubberband-wasm`, which is GPL-2.0-or-later. The GPL wants the
+whole combined program under the GPL, and this player's license adds conditions
+(the credit, open changes) that the GPL does not allow. In practice that means:
+do not ship the Rubber Band entry in an application other people get, a web page
+included, unless you hold a commercial Rubber Band licence. Without one, use the
+built-in vocoder. See
+[Rubber Band's licensing terms](https://breakfastquay.com/rubberband/license.html).

@@ -227,6 +227,18 @@
     flex: none;
 }
 
+/* The author menu's ⓘ button, put here by the player. */
+.rtd-credit {
+    display: flex;
+    flex: none;
+    margin-right: -6px;
+}
+
+.rtd-credit:empty,
+.rtd-credit[data-rtd-credit-hidden] {
+    display: none;
+}
+
 /* ---- buttons --------------------------------------------------------------- */
 
 .rtd-btn {

@@ -15,5 +15,5 @@ button:disabled { cursor: default; opacity: .55; }
 
 .g-card { position: relative; box-sizing: border-box; }
 .g-card[data-drop-over] { outline: 2px dashed #4053d6; outline-offset: 4px; }
-/* The player's author credit sits in each card's corner. */
-.g-card .rtd-attribution-button { position: absolute; top: 8px; right: 8px; }
+/* The player puts its author credit over each card's corner, unless the card marks a place for it. */
+.g-card { --rtd-credit-top: 8px; --rtd-credit-right: 8px; }

@@ -19,6 +19,9 @@ import { computeTicks } from './ruler';
 import { barCountFor, computeBarHeights, drawBars } from './waveBars';
 import { drawEnvelope } from './waveEnvelope';
 
+// Layout effects only in the browser: during SSR React warns about them.
+const useIsomorphicLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
+
 // ---------------------------------------------------------------------------
 // Scrubber — the waveform (or the spectrogram) doubles as the seek bar.
 //
@@ -160,7 +163,7 @@ export const Scrubber = forwardRef<ScrubberHandle, ScrubberProps>(function Scrub
     }, []);
 
     // ---- size --------------------------------------------------------------
-    useLayoutEffect(() => {
+    useIsomorphicLayoutEffect(() => {
         const el = trackRef.current;
         if (!el) return undefined;
         const measure = () => setSize({ w: el.clientWidth, h: el.clientHeight });
@@ -207,7 +210,7 @@ export const Scrubber = forwardRef<ScrubberHandle, ScrubberProps>(function Scrub
     }, [zoom, offset, viewSize, duration, isSpectrogram]);
 
     // ---- draw ----------------------------------------------------------------
-    useLayoutEffect(() => {
+    useIsomorphicLayoutEffect(() => {
         if (!drawsWaveform) return;
         const base = baseCanvasRef.current;
         const playedCanvas = playedCanvasRef.current;
@@ -271,7 +274,7 @@ export const Scrubber = forwardRef<ScrubberHandle, ScrubberProps>(function Scrub
         },
     }), [paint, timeToFraction]);
 
-    useLayoutEffect(() => {
+    useIsomorphicLayoutEffect(() => {
         paint(timeRef.current);
     });
 

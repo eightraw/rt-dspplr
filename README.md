@@ -131,9 +131,9 @@ framework and no stylesheet. Playback needs an element on the page; without one,
 - [Workers, bundlers and CSP](packages/rt-dspplr/README.md#bundlers-workers-csp)
 
 Rubber Band is optional and not bundled. The built-in vocoder works without it.
-The optional adapter requires a separate `rubberband-wasm` installation and
-compliance with [Rubber Band's terms](https://breakfastquay.com/rubberband/license.html).
-Separate installation does not waive those terms or establish license compatibility.
+Rubber Band is GPL, which does not combine with this player's license: shipping the
+Rubber Band entry in an application other people get, a web page included, needs a
+commercial Rubber Band licence. See [Rubber Band's terms](https://breakfastquay.com/rubberband/license.html).
 
 ## License and attribution
 
@@ -194,4 +194,4 @@ After changing library source, run `npm run build:lib` and refresh the demo.
 The demo consumes `dist/`, not library source. Build checks verify the optional
 Rubber Band boundary and generate a bundle size report.
 
-See [RELEASING.md](RELEASING.md) for publication steps.
+See [RELEASING.md](RELEASING.md) for publication steps and [CHANGELOG.md](CHANGELOG.md) for what changed.

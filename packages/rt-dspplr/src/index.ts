@@ -1,5 +1,5 @@
 // Main entry: the framework-agnostic engine.
-export { PLAYER_ATTRIBUTION } from './attribution';
+export { PLAYER_ATTRIBUTION, type InfoButtonMode } from './attribution';
 
 export {
     AudioPlayerCore,

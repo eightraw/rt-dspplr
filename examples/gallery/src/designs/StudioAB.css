@@ -2,7 +2,10 @@
 .st-head { display: flex; align-items: center; gap: 16px; padding: 10px 14px; border-bottom: 1px solid #2a2e35; background: #1b1e23; }
 .st-title { flex: none; font: 500 11px 'JetBrains Mono', monospace; letter-spacing: .12em; color: #fff; }
 .st-file { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7d8590; }
-.st-tc { flex: none; margin-left: auto; margin-right: 34px; font: 500 15px 'JetBrains Mono', monospace; color: #7ee0c3; }
+.st-tc { flex: none; margin-left: auto; font: 500 15px 'JetBrains Mono', monospace; color: #7ee0c3; }
+.st-credit { display: flex; flex: none; margin: -4px -6px -4px 0; }
+/* The ⓘ button takes its colours from these tokens. */
+.g-studio { --rtd-text: #e6e9ee; --rtd-text-muted: #7d8590; --rtd-surface-hover: rgba(255, 255, 255, .08); }
 .st-view { height: 210px; padding: 10px 12px 4px; }
 .g-studio .st-view .rtd.rtd-timeline { --rtd-overlay-wave: rgba(255, 255, 255, .12); --rtd-overlay-wave-rms: rgba(255, 255, 255, .2); --rtd-overlay-played: rgba(255, 255, 255, .26); --rtd-overlay-played-rms: rgba(255, 255, 255, .42); --rtd-accent: #7ee0c3; --rtd-loop-fill: rgba(126, 224, 195, .12); --rtd-loop-edge: #7ee0c3; --rtd-ruler: #2f343c; --rtd-ruler-text: #6c7480; }
 .st-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid #2a2e35; background: #1b1e23; }

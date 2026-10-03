@@ -462,6 +462,9 @@ function AudioPlayerCard({
         </div>
     ) : null;
 
+    // Where the player puts its ⓘ button (see AudioPlayerOptions.infoButton).
+    const creditSlot = <span className="rtd-credit" data-rtd-credit="" />;
+
     const heading = (
         <div className="rtd-head">
             <div className="rtd-titles">
@@ -475,6 +478,7 @@ function AudioPlayerCard({
                 {metaLine !== null && <span className="rtd-meta">{metaLine}</span>}
             </div>
             {actions}
+            {!compact && creditSlot}
         </div>
     );
 
@@ -508,6 +512,7 @@ function AudioPlayerCard({
                     >
                         <IconSliders />
                     </button>
+                    {creditSlot}
                 </div>
                 {drawerOpen && (
                     <div className="rtd-drawer" id={drawerId}>

@@ -30,7 +30,7 @@ import { BufferLoader } from './loader/BufferLoader';
 import { StretchService } from './stretch/StretchService';
 import { vocoderStretcher, type StretchStrategy } from './stretch/strategies';
 import { setAudioCacheBudget } from './cache/pcmCache';
-import { bindAttribution } from '../attribution';
+import { bindAttribution, type InfoButtonMode } from '../attribution';
 
 // ---------------------------------------------------------------------------
 // AudioPlayer — the headless player: one clip on stem A, an optional stem B
@@ -134,6 +134,13 @@ export interface AudioPlayerOptions {
      * The player puts its author menu there. Playback needs one.
      */
     element?: HTMLElement;
+    /**
+     * When the ⓘ button of the author menu shows: 'always' (default), or 'touch' for
+     * devices without right-click only. Right-click on the player opens the menu either way.
+     * Mark an element inside your interface with `data-rtd-credit` to put the button there;
+     * otherwise it sits over the interface element's top-right corner.
+     */
+    infoButton?: InfoButtonMode;
 }
 
 export type PlayerStatus = 'idle' | 'loading' | 'ready' | 'error';
@@ -333,7 +340,7 @@ export class AudioPlayerCore {
      * leaves mounted elements alone, so a reactivated player keeps them.
      */
     mount = (element: HTMLElement): (() => void) => {
-        const release = bindAttribution(element);
+        const release = bindAttribution(element, { button: this._options.infoButton });
         this._interfaces.set(element, (this._interfaces.get(element) ?? 0) + 1);
         let released = false;
         return () => {
