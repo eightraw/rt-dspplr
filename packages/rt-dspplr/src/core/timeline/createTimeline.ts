@@ -23,7 +23,7 @@ export interface TimelineOptions {
     waveformStyle?: 'envelope' | 'bars';
     /** Colours and axis of the spectrogram. */
     spectrogram?: SpectrogramOptions;
-    /** 'modifier' (default): Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. 'plain': the wheel alone zooms. */
+    /** 'plain' (default): the wheel alone zooms. 'modifier': only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. */
     wheelZoom?: 'plain' | 'modifier';
     /** Zoom and pan with the wheel, the keys and the overview strip. Default true. */
     zoom?: boolean;
@@ -143,7 +143,7 @@ export function mountTimeline(root: HTMLElement, player: AudioPlayerCore, option
         display: display(),
         waveformStyle: current.waveformStyle ?? 'envelope',
         spectrogram: current.spectrogram,
-        wheelZoom: current.wheelZoom ?? 'modifier',
+        wheelZoom: current.wheelZoom ?? 'plain',
         zoomable: current.zoom ?? true,
         ruler: current.ruler ?? true,
     }, (seconds) => current.onSeek?.(seconds));
@@ -203,7 +203,7 @@ export function mountTimeline(root: HTMLElement, player: AudioPlayerCore, option
                 display: display(),
                 waveformStyle: current.waveformStyle ?? 'envelope',
                 spectrogram: current.spectrogram,
-                wheelZoom: current.wheelZoom ?? 'modifier',
+                wheelZoom: current.wheelZoom ?? 'plain',
                 zoomable: current.zoom ?? true,
                 ruler: current.ruler ?? true,
             });

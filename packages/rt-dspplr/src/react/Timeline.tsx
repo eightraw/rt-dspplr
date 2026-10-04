@@ -22,7 +22,7 @@ export interface TimelineProps {
     waveformStyle?: 'envelope' | 'bars';
     /** Colours and axis of the spectrogram. */
     spectrogram?: SpectrogramOptions;
-    /** 'modifier' (default): Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. 'plain': the wheel alone zooms. */
+    /** 'plain' (default): the wheel alone zooms. 'modifier': only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. */
     wheelZoom?: 'plain' | 'modifier';
     /**
      * Zoom and pan with the wheel, the keys and the overview strip. Default true.
@@ -54,7 +54,7 @@ export function Timeline({
     display = 'waveform',
     waveformStyle = 'envelope',
     spectrogram,
-    wheelZoom = 'modifier',
+    wheelZoom = 'plain',
     zoom = true,
     ruler = true,
     theme = 'light',

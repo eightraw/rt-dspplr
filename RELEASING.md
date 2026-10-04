@@ -34,12 +34,15 @@ The root README is the GitHub landing page; the package README is the npm page.
 npm publish --workspace packages/rt-dspplr --access public
 ```
 
+Publish from a clean tree: `npm publish` packs whatever is in the folder, so
+unfinished work there would ship. With work in progress, pack the release
+commit in a clean copy and publish that tarball (`npm publish <file>.tgz`).
+
 Then, in this order:
 
-1. `npm view @saitdigital/rt-dspplr@<version> readme | head` must print the
-   README. The 0.2.0 publish left this field empty and the npm page without a
-   README; if it happens again, publish a patch from inside
-   `packages/rt-dspplr` (`cd packages/rt-dspplr && npm publish --access public`).
+1. Open the package page on npmjs.com and check that the README shows. (The
+   page reads it from the package itself; `npm view … readme` may print
+   nothing after a workspace publish, which is harmless.)
 2. Install the published version in a new project and run its quick start.
 3. Tag the published commit `v<version>`, push the tag, and write the GitHub
    release from the CHANGELOG entry.

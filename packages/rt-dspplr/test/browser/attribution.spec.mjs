@@ -75,7 +75,7 @@ test('a custom interface gets the menu from the player itself, without React or 
     expect(await page.locator('#b').evaluate(el => el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })))).toBe(true);
 });
 
-test('right-click yields to the interface, links, text fields, selected text and Shift; the page still sees it', async ({ page }) => {
+test('right-click anywhere on the player opens the credit, whatever is under it; the page outside keeps its menu', async ({ page }) => {
     await page.goto('/test/browser/index.html');
     await page.waitForFunction(() => window.h);
     await page.evaluate(() => {
@@ -90,22 +90,23 @@ test('right-click yields to the interface, links, text fields, selected text and
         h.createAudioPlayer({ element: host });
     });
     const menu = page.getByRole('menu', { name: 'About this player' });
-    for (const id of ['#own', '#link', '#field']) {
-        await page.locator(id).click({ button: 'right' });
+    const opens = async (locator, options = {}) => {
+        await locator.click({ button: 'right', ...options });
+        await expect(menu.getByRole('menuitem')).toContainText('RT-DSPPLR by SAIT Digital');
+        await page.keyboard.press('Escape');
         await expect(menu).toHaveCount(0);
-    }
-    await page.locator('#plain').click({ button: 'right', modifiers: ['Shift'] });
-    await expect(menu).toHaveCount(0);
+    };
+    // A handler of the interface's own, a link, a text field, Shift, selected text: the credit all the same.
+    for (const id of ['#own', '#link', '#field', '#plain']) await opens(page.locator(id));
+    await opens(page.locator('#plain'), { modifiers: ['Shift'] });
     await page.locator('#text').selectText();
-    await page.locator('#text').click({ button: 'right' });
-    await expect(menu).toHaveCount(0);
-    await page.evaluate(() => window.getSelection().removeAllRanges());
-    await page.locator('#plain').click({ button: 'right' });
-    await expect(menu).toHaveCount(1);
-    await expect(menu.getByRole('menuitem')).toContainText('RT-DSPPLR by SAIT Digital');
+    await opens(page.locator('#text'));
     const seen = await page.evaluate(() => window.seen);
-    expect(seen.own).toBe(1);
-    expect(seen.parent).toBeGreaterThanOrEqual(6);
+    expect(seen).toEqual({ own: 0, parent: 0 });
+    // Outside the player the page's own handlers run as before.
+    const outside = await page.evaluate(() => document.body.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })));
+    expect(outside).toBe(true);
+    expect(await page.evaluate(() => window.seen.parent)).toBe(1);
 });
 
 test('playback needs a mounted interface element on the page', async ({ page }) => {

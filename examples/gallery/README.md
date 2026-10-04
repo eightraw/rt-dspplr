@@ -3,7 +3,9 @@
 Five interfaces built on `useAudioPlayer()` and `<Timeline>` from
 `@saitdigital/rt-dspplr`. They are the animations in the
 [project README](../../README.md). They are examples to copy from, not part
-of the package.
+of the package: their code is under MIT No Attribution
+([examples/LICENSE.md](../LICENSE.md)), while the player they run on keeps its
+own license, author credit included.
 
 ```bash
 npm ci

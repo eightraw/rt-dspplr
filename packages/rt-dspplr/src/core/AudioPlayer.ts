@@ -138,7 +138,7 @@ export interface AudioPlayerOptions {
     element?: HTMLElement;
     /**
      * When the ⓘ button of the author menu shows: 'always' (default), or 'touch' for
-     * devices without right-click only. Right-click on the player opens the menu either way.
+     * devices with a touch screen only. Right-click on the player opens the menu either way.
      * Mark an element inside your interface with `data-rtd-credit` to put the button there;
      * otherwise it sits over the interface element's top-right corner.
      */

@@ -27,8 +27,8 @@ with their length.
   stem in its own.
 - **Waveform scrubber** that previews the DSP settings: a peak/RMS pyramid
   computed in a worker, drawn as a peak envelope with an RMS layer at
-  device-pixel resolution. Click or tap to seek, drag to loop, Ctrl/Cmd + wheel
-  to zoom, with a time ruler and an overview of the zoomed window.
+  device-pixel resolution. Click or tap to seek, drag to loop, wheel to zoom,
+  with a time ruler and an overview of the zoomed window.
 - **Zero bundler configuration** for the core and React entries. Workers and
   the worklet ship inside the JavaScript and start from Blob URLs.
 - Optional **Rubber Band** stretcher in a separate entry point, for higher
@@ -155,7 +155,7 @@ Construction is free. No AudioContext, node, or worker exists until the first
 | `sampleRate` | `number` | `48000` | Sample rate of the shared AudioContext (the first player to start decides). |
 | `latencyHint` | `'playback' \| 'interactive' \| 'balanced' \| number` | `'playback'` | Output buffering of the shared AudioContext (the first player to start decides). `'playback'` keeps the sound clean while the page is busy. |
 | `element` | `HTMLElement` | none | The element your interface lives in; same as `mount(element)`. |
-| `infoButton` | `'always' \| 'touch'` | `'always'` | The ⓘ button of the author menu: on every device, or only on devices without right-click. See [The author credit](#the-author-credit). |
+| `infoButton` | `'always' \| 'touch'` | `'always'` | The ⓘ button of the author menu: on every device, or only on devices with a touch screen. See [The author credit](#the-author-credit). |
 
 `AudioInput` is `string` (URL) `| ArrayBuffer` (encoded bytes) `| Blob | AudioBuffer`.
 A clip is an `AudioInput` or `{ src, srcB?, id? }`. `id` defaults to the URL.
@@ -256,7 +256,8 @@ and StrictMode's mount/unmount/mount cycle is handled. For your own interface, p
 
 An inline card that sits in the page flow and fills its container's width:
 
-- a heading row: title, meta, and an Auto-next icon button when enabled;
+- a heading row: title, meta, an Auto-next icon button when enabled, and the
+  ⓘ button of the author menu;
 - the main row: "back to start" and −/+ step buttons around a round
   play/pause button; the waveform as the scrubber (min/max peak envelope
   plus an inner RMS layer, played part in the accent colour, time tooltip
@@ -287,7 +288,7 @@ below it. The ruler is hidden in this layout.
 | `display` | `'waveform'` | What the seek bar draws: `'waveform'`, `'spectrogram'` (see [Spectrogram](#spectrogram)), or `'both'`: the waveform as an outline over the spectrogram. |
 | `spectrogram` | none | Options of the spectrogram, see [Spectrogram](#spectrogram). |
 | `waveformStyle` | `'envelope'` | `'envelope'`: min/max peak envelope with an inner RMS layer, one column per device pixel. `'bars'`: rounded bars. |
-| `wheelZoom` | `'modifier'` | `'modifier'`: Ctrl/Cmd + wheel over the waveform zooms, the wheel alone scrolls the page. `'plain'`: the wheel alone zooms (at 1x, scrolling down still scrolls the page). |
+| `wheelZoom` | `'plain'` | `'plain'`: the wheel over the waveform zooms (at 1x, scrolling down still scrolls the page). `'modifier'`: only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. |
 | `zoom` | `true` | `false`: no zoom or pan by any means (wheel, keys, overview strip). The waveform always shows the whole clip and the wheel scrolls the page; seeking and loops stay. |
 | `ruler` | `true` | Time ruler and zoom overview under the waveform (full layout only). |
 | `layout` | `'auto'` | `'full' \| 'compact' \| 'auto'`. |
@@ -297,12 +298,13 @@ below it. The ruler is hidden in this layout.
 
 **Mouse.** Click the waveform to seek; a click outside an active loop also
 clears it. Drag across the waveform to select a loop, then drag its handles to
-adjust it. Ctrl/Cmd + wheel over the waveform (or the ruler) zooms around the
+adjust it. The wheel over the waveform (or the ruler) zooms around the
 pointer, in proportion to the wheel's travel, down to a 0.5 s visible window;
-the wheel alone scrolls the page (`wheelZoom="plain"`: the wheel alone zooms;
-`zoom={false}`: no zoom at all). A trackpad pinch arrives as Ctrl + wheel and
-zooms too. Shift + wheel or a horizontal wheel pans while zoomed; so does
-dragging or clicking the overview strip under the ruler. While playing zoomed
+at the whole clip, scrolling down still scrolls the page (`wheelZoom="modifier"`:
+only Ctrl/Cmd + wheel zooms and the wheel alone scrolls the page; `zoom={false}`:
+no zoom at all). A trackpad pinch arrives as Ctrl + wheel and zooms too.
+Shift + wheel or a horizontal wheel pans while zoomed; so does dragging or
+clicking the overview strip under the ruler. While playing zoomed
 in, the view follows the playhead. The "× · reset" chip (or `0`) shows the
 whole clip again. Double-click any slider to reset it. The mix slider is
 disabled (with a tooltip) when the clip has no stem B; it stays movable
@@ -311,8 +313,8 @@ stem B loads.
 
 **Touch.** A tap seeks. A finger that swipes up or down scrolls the page, as
 anywhere else; a finger that moves sideways across the waveform selects a loop,
-and the handles move the same way. There is no two-finger gesture: zoom with
-the keys, the overview strip or a trackpad.
+and the handles move the same way. Pinch-to-zoom on a touch screen is not
+supported; a trackpad pinch is.
 
 **Keyboard.** Every control is a native button, choice group or range input,
 or an ARIA slider, with a visible focus ring.
@@ -365,9 +367,9 @@ createAudioPlayer({
 ## Timeline
 
 The card's seek bar on its own, for an interface of your own: click or tap to
-seek, drag to loop (with handles), Ctrl/Cmd + wheel to zoom, Shift + wheel or
-the overview strip to pan, the keyboard for all of it, and a time ruler. It draws the waveform,
-the spectrogram, or both, and fills the box it is given. It is the same
+seek, drag to loop (with handles), wheel to zoom, Shift + wheel or the overview
+strip to pan, the keyboard for all of it, and a time ruler. It draws the
+waveform, the spectrogram, or both, and fills the box it is given. It is the same
 timeline with React or without: `<Timeline>`, or `createTimeline()` from the
 main entry for any framework or none.
 
@@ -386,7 +388,7 @@ import '@saitdigital/rt-dspplr/styles.css';
 | `display` | `'waveform'` | `'waveform'`, `'spectrogram'` or `'both'`. |
 | `waveformStyle` | `'envelope'` | `'envelope'` or `'bars'`. |
 | `spectrogram` | none | Options of the spectrogram, see below. |
-| `wheelZoom` | `'modifier'` | `'modifier'`: Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. `'plain'`: the wheel alone zooms. |
+| `wheelZoom` | `'plain'` | `'plain'`: the wheel zooms. `'modifier'`: only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. |
 | `zoom` | `true` | `false`: no zoom or pan; the wheel scrolls the page, clicks still seek. |
 | `ruler` | `true` | Time ruler and zoom overview under the track. |
 | `theme` | `'light'` | `'light'`, `'dark'` or `'auto'`. The `--rtd-*` tokens restyle it. |
@@ -496,8 +498,8 @@ stretcher. On `setSpeed`, the old rate keeps playing until the requested
 variant is ready; `state.pendingSpeed` exposes this wait. The latest request
 wins. This avoids an intentional pause but does not promise click-free
 phase continuity between independently stretched buffers. The built-in
-vocoder keeps the level of tonal material and speech within half a decibel at
-every speed, and its output lands within a few milliseconds of the source
+vocoder keeps the level of tonal material within half a decibel at every
+speed, and its output lands within a few milliseconds of the source
 time scaled by the speed; noise-like material comes out a few decibels quieter,
 as from any phase vocoder.
 
@@ -553,8 +555,8 @@ WASM fails to load at runtime, each job falls back to the built-in vocoder.
 
 The core and React entries contain four small scripts as strings: the
 dynamics AudioWorklet (~2 KB), the vocoder worker (~5 KB), the waveform
-peaks worker (~5 KB) and the spectrogram worker (~7 KB). Each is started from a `blob:` URL the first time it is
-needed. No extra files, loaders, or `new URL()` patterns are involved. The
+peaks worker (~5 KB) and the spectrogram worker (~7 KB). Each is started from
+a `blob:` URL the first time it is needed. No extra files, loaders, or `new URL()` patterns are involved. The
 same build is verified in Vite (dev and build) and webpack 5. Nothing in it is
 bundler-specific, so other ESM bundlers should behave the same.
 
@@ -629,8 +631,9 @@ Eviction never interrupts playback. Rendering a speed variant needs little
 beyond the variant itself: the built-in vocoder goes through clips longer than
 15 s frame by frame (see [Time-stretch strategies](#time-stretch-strategies)).
 For large files or constrained devices, set `prewarmSpeeds: false`, avoid
-unnecessary stem B prefetch, and dispose unused players. Full-file decoding remains required; this is not a streaming
-player or a solution for arbitrarily long recordings.
+unnecessary stem B prefetch, and dispose unused players. Full-file decoding
+remains required; this is not a streaming player or a solution for arbitrarily
+long recordings.
 
 ```ts
 import { setAudioCacheBudget, getAudioCacheStats, clearAudioCache } from '@saitdigital/rt-dspplr';
@@ -695,12 +698,10 @@ Right-clicking the player (or the context-menu key / Shift+F10) opens a menu wit
 The player places this for you, styled and ready, in every element it is mounted
 in: the React `<AudioPlayer />` root, `ref={player.ref}` from `useAudioPlayer()`,
 or `createAudioPlayer({ element })` / `player.mount(element)` in any framework, so
-you never have to build a credit of your own. The right-click menu is caught on
-the player's element only, after your own handlers: a handler inside your
-interface that takes the event wins, and so do links, text fields and selected
-text, which keep the browser's menu; Shift + right-click gives the browser's
-menu anywhere in the player, and the page around the player still sees the
-event. The [license](./LICENSE.md) is what requires the credit to stay.
+you never have to build a credit of your own. Right-click anywhere on the
+player opens it, whatever is under the pointer; it is caught on the player's
+element only, so the rest of your page keeps its own menus. The
+[license](./LICENSE.md) is what requires the credit to stay.
 
 The ⓘ button lives inside the player's element. Mark an element inside your
 interface with `data-rtd-credit` and the button goes there, in your layout.
@@ -708,10 +709,10 @@ Without one it sits over the element's top-right corner, offset by the
 `--rtd-credit-top` and `--rtd-credit-right` custom properties and stacked by
 `--rtd-credit-z` (default 3). For that the element is made `position: relative`
 while mounted if it was static, which moves anything inside it that is
-positioned against an outer box; give such an interface a `data-rtd-credit` slot. `<AudioPlayer />`
-has its own place for it in the heading row. With `infoButton: 'touch'` the
-button shows only where the primary input cannot hover (phones, tablets), and a
-mouse uses right-click alone.
+positioned against an outer box; give such an interface a `data-rtd-credit`
+slot. `<AudioPlayer />` has its own place for it in the heading row. With `infoButton: 'touch'` the
+button shows only on devices with a touch screen (phones, tablets, touch laptops),
+and a mouse alone uses right-click.
 
 ```html
 <section id="player">
@@ -730,7 +731,9 @@ or an input element.
 Free to use, including in commercial, closed-source apps and hosted services. If
 you ship a modified player, or serve it to people outside your organization,
 publish its source under the same license; your own application code stays closed.
-The terms fit on one page: [LICENSE.md](./LICENSE.md).
+The terms fit on one page: [LICENSE.md](./LICENSE.md). The code samples in this
+README are under MIT No Attribution: copy and change them freely; the player
+they use keeps this license.
 
 The build checks exclude Rubber Band implementation code and WASM from the core,
 React and advanced entries. The optional `./stretch-rubberband` entry makes your

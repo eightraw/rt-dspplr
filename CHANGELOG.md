@@ -2,10 +2,10 @@
 
 ## 0.3.0
 
-- Breaking: `wheelZoom` defaults to `'modifier'`. The wheel over the waveform
-  scrolls the page, Ctrl/Cmd + wheel (and a trackpad pinch) zooms, in
-  proportion to the wheel's travel. `'plain'` keeps the wheel alone zooming, and
-  in either mode the event is taken from the page only when the zoom changes.
+- The wheel zooms in proportion to its travel, and the event is taken from the
+  page only when the zoom changes: at the whole clip, scrolling down scrolls the
+  page. `wheelZoom: 'modifier'` leaves the wheel to the page and zooms with
+  Ctrl/Cmd + wheel (and a trackpad pinch) only.
 - The built-in vocoder keeps the level at every speed. It was scaled by the
   speed: +6 dB at 2x, −6 dB at 0.5x, a jump on every speed change.
 - The built-in vocoder's output lands on time. It was early or late by
@@ -15,11 +15,8 @@
   used to unfold the time spent looping into a jump towards the end of the clip,
   and pause/resume then ended the clip. A loop set behind the playhead now starts
   from its beginning, both stems together.
-- Right-click yields to the interface: a handler inside the player that takes
-  the event, links, text fields and selected text keep the browser's menu, Shift +
-  right-click gives it anywhere, and the page around the player sees the event.
 - Touch: a tap seeks, a vertical swipe scrolls the page instead of seeking, a
-  sideways drag selects a loop. The docs no longer promise a pinch gesture.
+  sideways drag selects a loop.
 - The variant of the current clip at the current speed is held by the player:
   a seek or a restart never renders it again, even when it is too large for the
   cache budget. Prewarming fits the budget beside what the cache already holds.
@@ -48,13 +45,12 @@
   request.
 - `emptyText` of `<AudioPlayer>` and `<Timeline>` is a string.
 - `infoButton: 'always' | 'touch'`. With `'touch'` the ⓘ button of the author menu
-  shows only on devices without right-click; with a mouse, right-click alone opens it.
+  shows only on devices with a touch screen; with a mouse alone, right-click opens it.
 - The ⓘ button lives inside the player and no longer takes a row of the host's
   layout. It goes into an element marked `data-rtd-credit`, or over the top-right
   corner of the player's element (`--rtd-credit-top`, `--rtd-credit-right`).
   `<AudioPlayer />` keeps it in its heading row, and in the compact row.
 - No layout-effect warnings from the scrubber during server rendering.
-- README: four inline scripts, not three; Rubber Band licensing in plain words.
 
 ## 0.2.0
 

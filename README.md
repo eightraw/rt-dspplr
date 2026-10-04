@@ -152,6 +152,10 @@ two conditions:
 The [license](LICENSE.md) fits on one page. It is a custom, source-available
 license, not an OSI-approved one.
 
+The examples in [examples/](examples) and the code samples in the READMEs are
+under MIT No Attribution ([examples/LICENSE.md](examples/LICENSE.md)): copy and
+change them freely. The player they use keeps its own license.
+
 ## Try the demo locally
 
 The repository includes a development workspace and a Vite demo for exploring or

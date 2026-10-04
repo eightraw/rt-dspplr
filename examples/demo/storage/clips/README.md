@@ -32,7 +32,7 @@ the details card as-is.
 
 `npm run samples` (`scripts/make-samples.sh`, needs Docker) creates them.
 They are synthetic: phrases synthesised by espeak-ng, the processed example
-audio produced with ffmpeg filters (300–3400 Hz band, hiss, hard clipping).
+audio produced with ffmpeg filters (a low-pass at 4.5 kHz, quiet pink noise, gentle saturation).
 Timestamps are made up.
 
 The `*.b.wav` files are the clean synthesis before the degradation. In a real

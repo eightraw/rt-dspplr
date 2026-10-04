@@ -41,8 +41,24 @@ test('zoom={false}: the wheel scrolls the page, nothing zooms or pans, a click s
     await expect.poll(() => page.evaluate(() => window.timelinePlayer.getCurrentTime())).toBeGreaterThan(5.5);
 });
 
-test('by default the wheel scrolls the page; Ctrl + wheel zooms and the page stays put', async ({ page }) => {
+test('by default the wheel zooms and the page stays put; scrolling down at 1x still scrolls the page', async ({ page }) => {
     const { box } = await mount(page, {});
+    await page.mouse.wheel(0, -300);
+    await expect.poll(() => zoomed(page)).toBe(1);
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+    expect(await page.locator('.rtd-overview').count()).toBe(1);
+
+    await page.locator('.rtd-zoom-reset').click();
+    await expect.poll(() => zoomed(page)).toBe(0);
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.wheel(0, 400);
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
+    expect(await zoomed(page)).toBe(0);
+});
+
+test("wheelZoom 'modifier': the wheel scrolls the page, Ctrl + wheel zooms", async ({ page }) => {
+    const { box } = await mount(page, { wheelZoom: 'modifier' });
+    await page.mouse.wheel(0, -300);
     await page.mouse.wheel(0, 400);
     await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
     expect(await zoomed(page)).toBe(0);
@@ -52,20 +68,6 @@ test('by default the wheel scrolls the page; Ctrl + wheel zooms and the page sta
     await page.keyboard.down('Control');
     await page.mouse.wheel(0, -300);
     await page.keyboard.up('Control');
-    await expect.poll(() => zoomed(page)).toBe(1);
-    expect(await page.evaluate(() => window.scrollY)).toBe(0);
-    expect(await page.locator('.rtd-overview').count()).toBe(1);
-});
-
-test("wheelZoom 'plain': the wheel zooms, but scrolling down at 1x still scrolls the page", async ({ page }) => {
-    const { box } = await mount(page, { wheelZoom: 'plain' });
-    await page.mouse.wheel(0, 400);
-    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
-    expect(await zoomed(page)).toBe(0);
-    await page.evaluate(() => window.scrollTo(0, 0));
-
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await page.mouse.wheel(0, -300);
     await expect.poll(() => zoomed(page)).toBe(1);
     expect(await page.evaluate(() => window.scrollY)).toBe(0);
 });

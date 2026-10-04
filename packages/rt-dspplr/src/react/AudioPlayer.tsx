@@ -88,8 +88,8 @@ export interface AudioPlayerProps {
     /** Colours and axis of the spectrogram. */
     spectrogram?: SpectrogramOptions;
     /**
-     * 'modifier' (default): Ctrl/Cmd + wheel over the waveform zooms around the
-     * pointer, the wheel alone scrolls the page. 'plain': the wheel alone zooms.
+     * 'plain' (default): the wheel over the waveform zooms around the pointer.
+     * 'modifier': only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page.
      * Shift + wheel or a horizontal wheel pans in both modes.
      */
     wheelZoom?: 'plain' | 'modifier';
@@ -227,7 +227,7 @@ function AudioPlayerCard({
     waveformStyle = 'envelope',
     display = 'waveform',
     spectrogram,
-    wheelZoom = 'modifier',
+    wheelZoom = 'plain',
     zoom = true,
     ruler = true,
     layout = 'auto',

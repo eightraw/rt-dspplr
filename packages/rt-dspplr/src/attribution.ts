@@ -11,8 +11,8 @@ const INFO_ICON = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="
 
 /**
  * When the ⓘ button shows. 'always' (default): on every device. 'touch': only
- * where the primary input cannot hover (phones, tablets); with a mouse the
- * menu opens by right-click alone.
+ * on devices with a touch screen (phones, tablets, touch laptops), where a
+ * finger has no right-click; with a mouse alone the menu opens by right-click.
  */
 export type InfoButtonMode = 'always' | 'touch';
 
@@ -31,8 +31,7 @@ interface AttributionBinding {
  * context-menu key / Shift+F10, and a tappable About button. Players call this
  * from mount(); every player sharing one element shares one menu, which stays
  * until the last of them releases it (the first one's options apply). No
- * stylesheet is required. Links, text fields, selected text, a handler inside
- * the player that took the event, and Shift + right-click keep the browser's menu.
+ * stylesheet is required. Right-click anywhere on the element opens the menu.
  *
  * The button lives inside the element. An element inside it marked
  * `data-rtd-credit` gets the button as its child; without one the button sits
@@ -84,8 +83,10 @@ function createBinding(root: HTMLElement, options: AttributionOptions): Attribut
     let previousFocus: HTMLElement | null = null;
     let disposed = false;
 
-    // 'touch': shown only where the primary input cannot hover, which is where right-click is missing.
-    const touchOnly = options.button === 'touch' ? win.matchMedia('(hover: none)') : null;
+    // 'touch': shown wherever any pointer is coarse, a finger. Asking only about the
+    // primary pointer would hide it on an iPad with a trackpad, where a finger still
+    // cannot right-click (iOS sends no contextmenu on a long press).
+    const touchOnly = options.button === 'touch' ? win.matchMedia('(any-pointer: coarse)') : null;
     const showButton = () => {
         const hidden = !!touchOnly && !touchOnly.matches;
         button.style.display = hidden ? 'none' : 'inline-grid';
@@ -221,36 +222,23 @@ function createBinding(root: HTMLElement, options: AttributionOptions): Attribut
         win!.addEventListener('scroll', close, true);
         win!.addEventListener('blur', close);
     }
-    // Where the browser's own menu, or the interface's, comes first: links and text
-    // fields keep theirs, so does a handler inside the player that already took
-    // the event, and so does selected text (copy). Shift + right-click is the
-    // browser's menu anywhere in the player.
-    const NATIVE_MENU = 'a[href], input, textarea, select, [contenteditable]:not([contenteditable="false"])';
-    function yieldsToNative(event: Event, allowShift: boolean): boolean {
-        if (event.defaultPrevented) return true;
-        if (allowShift && (event as MouseEvent).shiftKey) return true;
-        const target = event.target instanceof Element ? event.target : null;
-        if (target?.closest(NATIVE_MENU)) return true;
-        const selection = doc.getSelection?.();
-        return !!(selection && !selection.isCollapsed && target && selection.containsNode(target, true));
-    }
+    // Right-click on the player is the credit's: caught first, on the player's element
+    // only, whatever is under the pointer. The rest of the page keeps its own menus.
     function context(event: MouseEvent) {
-        if (yieldsToNative(event, true)) return;
         event.preventDefault();
+        event.stopPropagation();
         open(event.clientX || event.clientY ? { x: event.clientX, y: event.clientY } : undefined);
     }
     function keyboard(event: KeyboardEvent) {
         if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return;
-        if (yieldsToNative(event, false)) return;
         event.preventDefault();
+        event.stopPropagation();
         const rect = (event.target as HTMLElement).getBoundingClientRect();
         open({ x: rect.left, y: rect.bottom });
     }
     button.addEventListener('click', () => menu ? close() : open());
-    // In the bubbling phase and without stopping it: the interface's own handlers
-    // run first, and the page around the player still sees the event.
-    root.addEventListener('contextmenu', context);
-    root.addEventListener('keydown', keyboard);
+    root.addEventListener('contextmenu', context, true);
+    root.addEventListener('keydown', keyboard, true);
     return {
         open, close,
         dispose() {
@@ -261,8 +249,8 @@ function createBinding(root: HTMLElement, options: AttributionOptions): Attribut
             touchOnly?.removeEventListener('change', showButton);
             button.remove();
             if (positioned !== null) root.style.position = positioned;
-            root.removeEventListener('contextmenu', context);
-            root.removeEventListener('keydown', keyboard);
+            root.removeEventListener('contextmenu', context, true);
+            root.removeEventListener('keydown', keyboard, true);
         },
     };
 }
