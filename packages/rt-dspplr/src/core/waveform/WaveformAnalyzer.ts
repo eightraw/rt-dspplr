@@ -83,6 +83,19 @@ export class WaveformAnalyzer {
                 this._onUpdate(this._pyramids);
             }
         };
+        // A worker that fails after starting (a CSP reported late, a crash) is
+        // dropped with one warning; the waveform drawn so far stays.
+        this._worker.onerror = (event) => {
+            event.preventDefault?.();
+            this._fail(event.message || event.error);
+        };
+        this._worker.onmessageerror = () => this._fail('message could not be read');
+    }
+
+    private _fail(reason: unknown): void {
+        if (!this._worker) return;
+        console.warn('[WaveformAnalyzer] Peak worker failed; waveform disabled', reason);
+        this.dispose();
     }
 
     get pyramids(): WaveformPyramids {

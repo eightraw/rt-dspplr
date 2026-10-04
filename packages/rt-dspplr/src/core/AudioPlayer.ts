@@ -16,6 +16,8 @@ import { dbToGain } from './dsp/compression';
 import {
     DEFAULT_PROCESSING,
     DEFAULT_SPEEDS,
+    SPEED_MIN,
+    SPEED_MAX,
     LIMITER_CEILING_DB,
     clamp01,
     mixGains,
@@ -308,8 +310,13 @@ export class AudioPlayerCore {
 
     constructor(options: AudioPlayerOptions = {}) {
         this._options = options;
-        this._speeds = (options.speeds && options.speeds.length > 0 ? options.speeds : DEFAULT_SPEEDS)
-            .map(normalizeSpeed);
+        const offered = options.speeds && options.speeds.length > 0 ? options.speeds : DEFAULT_SPEEDS;
+        const outOfRange = offered.filter((speed) => !(speed >= SPEED_MIN && speed <= SPEED_MAX));
+        if (outOfRange.length > 0) {
+            console.warn(`[AudioPlayer] speeds outside ${SPEED_MIN}–${SPEED_MAX}x are not offered:`, outOfRange);
+        }
+        const inRange = offered.filter((speed) => speed >= SPEED_MIN && speed <= SPEED_MAX);
+        this._speeds = (inRange.length > 0 ? inRange : DEFAULT_SPEEDS).map(normalizeSpeed);
         const prewarm = options.prewarmSpeeds ?? true;
         this._prewarmSpeeds = prewarm === true
             ? this._speeds
@@ -567,6 +574,13 @@ export class AudioPlayerCore {
         trackB?.setLoopRange(snapped);
 
         this._update({ loop: snapped });
+
+        // A loop set behind the playhead: browsers differ on what a source does when
+        // its loop ends before the playhead, so jump to its start ourselves, both
+        // stems together. A loop ahead plays up to its end and loops from there.
+        if (snapped && trackA.state.playState === 'playing' && trackA.currentTime >= snapped.end) {
+            void this.seek(snapped.start);
+        }
     };
 
     setPauseMode = (mode: PauseMode): void => {

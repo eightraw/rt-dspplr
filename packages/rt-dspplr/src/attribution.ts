@@ -31,12 +31,14 @@ interface AttributionBinding {
  * context-menu key / Shift+F10, and a tappable About button. Players call this
  * from mount(); every player sharing one element shares one menu, which stays
  * until the last of them releases it (the first one's options apply). No
- * stylesheet is required.
+ * stylesheet is required. Links, text fields, selected text, a handler inside
+ * the player that took the event, and Shift + right-click keep the browser's menu.
  *
  * The button lives inside the element. An element inside it marked
  * `data-rtd-credit` gets the button as its child; without one the button sits
  * over the element's top-right corner (the element becomes `position: relative`
- * while bound if it was static), offset by `--rtd-credit-top` / `--rtd-credit-right`.
+ * while bound if it was static), offset by `--rtd-credit-top` / `--rtd-credit-right`
+ * and stacked by `--rtd-credit-z` (default 3).
  */
 export function bindAttribution(root: HTMLElement, options: AttributionOptions = {}): () => void {
     const existing = bindings.get(root);
@@ -55,7 +57,7 @@ export function bindAttribution(root: HTMLElement, options: AttributionOptions =
 }
 
 const BUTTON_CSS = 'box-sizing:border-box;place-items:center;flex:none;width:28px;height:28px;margin:0;padding:0;border:0;border-radius:50%;background:transparent;color:var(--rtd-text-muted,#6b7280);cursor:pointer;transition:color .15s,background-color .15s;';
-const OVERLAY_CSS = 'position:absolute;top:var(--rtd-credit-top,6px);right:var(--rtd-credit-right,6px);z-index:3;';
+const OVERLAY_CSS = 'position:absolute;top:var(--rtd-credit-top,6px);right:var(--rtd-credit-right,6px);z-index:var(--rtd-credit-z,3);';
 
 function createBinding(root: HTMLElement, options: AttributionOptions): AttributionBinding {
     const doc = root.ownerDocument;
@@ -116,7 +118,13 @@ function createBinding(root: HTMLElement, options: AttributionOptions): Attribut
             root.style.position = 'relative';
         }
     }
-    const observer = new win.MutationObserver(place);
+    // Only elements coming and going can move the slot; text changes (a running clock) cannot.
+    const observer = new win.MutationObserver((records) => {
+        for (const record of records) {
+            for (const node of record.addedNodes) if (node.nodeType === 1) return place();
+            for (const node of record.removedNodes) if (node.nodeType === 1) return place();
+        }
+    });
     place();
     observer.observe(root, { childList: true, subtree: true });
 
@@ -213,21 +221,36 @@ function createBinding(root: HTMLElement, options: AttributionOptions): Attribut
         win!.addEventListener('scroll', close, true);
         win!.addEventListener('blur', close);
     }
+    // Where the browser's own menu, or the interface's, comes first: links and text
+    // fields keep theirs, so does a handler inside the player that already took
+    // the event, and so does selected text (copy). Shift + right-click is the
+    // browser's menu anywhere in the player.
+    const NATIVE_MENU = 'a[href], input, textarea, select, [contenteditable]:not([contenteditable="false"])';
+    function yieldsToNative(event: Event, allowShift: boolean): boolean {
+        if (event.defaultPrevented) return true;
+        if (allowShift && (event as MouseEvent).shiftKey) return true;
+        const target = event.target instanceof Element ? event.target : null;
+        if (target?.closest(NATIVE_MENU)) return true;
+        const selection = doc.getSelection?.();
+        return !!(selection && !selection.isCollapsed && target && selection.containsNode(target, true));
+    }
     function context(event: MouseEvent) {
+        if (yieldsToNative(event, true)) return;
         event.preventDefault();
-        event.stopPropagation();
         open(event.clientX || event.clientY ? { x: event.clientX, y: event.clientY } : undefined);
     }
     function keyboard(event: KeyboardEvent) {
         if (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10')) return;
+        if (yieldsToNative(event, false)) return;
         event.preventDefault();
-        event.stopPropagation();
         const rect = (event.target as HTMLElement).getBoundingClientRect();
         open({ x: rect.left, y: rect.bottom });
     }
     button.addEventListener('click', () => menu ? close() : open());
-    root.addEventListener('contextmenu', context, true);
-    root.addEventListener('keydown', keyboard, true);
+    // In the bubbling phase and without stopping it: the interface's own handlers
+    // run first, and the page around the player still sees the event.
+    root.addEventListener('contextmenu', context);
+    root.addEventListener('keydown', keyboard);
     return {
         open, close,
         dispose() {
@@ -238,8 +261,8 @@ function createBinding(root: HTMLElement, options: AttributionOptions): Attribut
             touchOnly?.removeEventListener('change', showButton);
             button.remove();
             if (positioned !== null) root.style.position = positioned;
-            root.removeEventListener('contextmenu', context, true);
-            root.removeEventListener('keydown', keyboard, true);
+            root.removeEventListener('contextmenu', context);
+            root.removeEventListener('keydown', keyboard);
         },
     };
 }

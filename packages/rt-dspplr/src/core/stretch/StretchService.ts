@@ -1,4 +1,5 @@
-import { audioBufferBytes, audioBufferId, pcmCache } from '../cache/pcmCache';
+import { audioBufferId, pcmCache } from '../cache/pcmCache';
+import { normalizeSpeed } from '../controls';
 import type { StretchWorkerMessage, StretchWorkerRequest } from './protocol';
 import type { StretchStrategy } from './strategies';
 
@@ -57,7 +58,10 @@ interface WorkerSlot {
     worker: Worker | null;
     busy: boolean;
     current: { requestId: number; job: Job } | null;
+    /** Crashes in a row; a job that completes resets it. */
     failures: number;
+    /** The watchdog of the running job. */
+    timer: ReturnType<typeof setTimeout> | null;
 }
 
 const MAX_WORKER_RESTARTS = 3;
@@ -65,10 +69,6 @@ const MAX_WORKER_RESTARTS = 3;
 function defaultPoolSize(): number {
     const cores = typeof navigator !== 'undefined' ? navigator.hardwareConcurrency ?? 2 : 2;
     return Math.max(1, Math.min(2, cores - 1 || 1));
-}
-
-function normalizeSpeed(speed: number): number {
-    return Number.isFinite(speed) && speed > 0 ? speed : 1;
 }
 
 function speedCacheKey(speed: number): string {
@@ -91,6 +91,14 @@ export class StretchService {
         }
         return service;
     }
+
+    /**
+     * How long a job may run before its worker is taken for dead: at least
+     * 10 s, and two seconds per second of audio per channel. A worker that dies
+     * without an `error` event would otherwise keep its slot (and the player's
+     * pending speed) forever. Replaceable, for tests.
+     */
+    static jobTimeoutMs = (seconds: number, channels: number): number => Math.max(10_000, seconds * channels * 2000);
 
     readonly strategy: StretchStrategy;
 
@@ -194,9 +202,11 @@ export class StretchService {
             .filter((speed) => !isUnitSpeed(normalizeSpeed(speed)))
             .sort((a, b) => Number(isPreferred(b)) - Number(isPreferred(a)));
 
-        // Speculative renders should fit alongside the source and earlier variants.
-        // Explicit playback requests may exceed this cache budget and remain uncached.
-        let remaining = Math.max(0, pcmCache.budgetBytes - audioBufferBytes(source));
+        // Speculative renders must fit beside what the cache already holds: the
+        // decoded clips and variants of every player on the page. Counting only
+        // this clip's source let a prewarm evict another player's variants.
+        // Explicit playback requests may exceed the budget and remain uncached.
+        let remaining = Math.max(0, pcmCache.budgetBytes - pcmCache.stats().usedBytes);
         for (const speed of [...new Set(ordered)]) {
             const bytes = Math.round(source.length / speed) * source.numberOfChannels * 4;
             if (bytes > remaining) continue;
@@ -277,11 +287,27 @@ export class StretchService {
                 speed: job.speed,
                 transientSensitivity: job.transientSensitivity,
                 channels,
+                options: this.strategy.options,
             };
 
             slot.busy = true;
             slot.current = { requestId, job };
-            slot.worker.postMessage(request, channels);
+            try {
+                slot.worker.postMessage(request, channels);
+            } catch (error) {
+                // Options that cannot be cloned (a function, say) never reach the worker:
+                // the job fails here, the slot stays free, and playback falls back.
+                slot.busy = false;
+                slot.current = null;
+                this._settle(job, new StretchUnavailableError(`The stretch request could not be sent: ${error instanceof Error ? error.message : String(error)}`));
+                continue;
+            }
+            const worker = slot.worker;
+            slot.timer = setTimeout(() => {
+                slot.timer = null;
+                if (slot.current?.requestId !== requestId || slot.worker !== worker) return;
+                this._crash(slot, worker, new Error('Stretch job timed out'));
+            }, StretchService.jobTimeoutMs(job.source.duration, job.source.numberOfChannels));
         }
 
         // No live worker left at all: fail what is queued so callers fall back.
@@ -306,76 +332,95 @@ export class StretchService {
         job.resolve(result);
     }
 
+    /** Clear the watchdog of the slot's running job. */
+    private _disarm(slot: WorkerSlot): void {
+        if (slot.timer !== null) {
+            clearTimeout(slot.timer);
+            slot.timer = null;
+        }
+    }
+
+    /**
+     * A worker crashed, or its job ran past the watchdog: fail the job, drop the
+     * worker and start another, but not forever. A worker that cannot even start
+     * (bad script, blocked by CSP at load time) would otherwise respawn in a
+     * tight loop. Three crashes in a row retire the slot; a completed job resets
+     * the count, so a rare crash does not switch pitch preservation off for good.
+     */
+    private _crash(slot: WorkerSlot, worker: Worker, error: Error): void {
+        this._disarm(slot);
+        const failed = slot.current;
+        slot.busy = false;
+        slot.current = null;
+        if (failed) {
+            this._settle(failed.job, error);
+        }
+
+        try {
+            worker.terminate();
+        } catch {
+            // no-op
+        }
+
+        slot.failures += 1;
+        const replacement = slot.failures <= MAX_WORKER_RESTARTS ? this.strategy.createWorker() : null;
+        slot.worker = replacement;
+        if (replacement) {
+            this._attach(slot, replacement);
+        }
+        this._schedule();
+    }
+
+    private _attach(slot: WorkerSlot, worker: Worker): void {
+        worker.onmessage = (event: MessageEvent<StretchWorkerMessage>) => {
+            const message = event.data;
+            if (!message || !slot.current || message.requestId !== slot.current.requestId) {
+                return;
+            }
+
+            this._disarm(slot);
+            const { job } = slot.current;
+            slot.busy = false;
+            slot.current = null;
+            slot.failures = 0;
+
+            if (message.type === 'stretch-error') {
+                this._settle(job, new Error(message.message || 'Stretch failed'));
+            } else {
+                try {
+                    const length = Math.max(0, Math.floor(message.length));
+                    const buffer = job.context.createBuffer(message.channels.length, Math.max(1, length), message.sampleRate);
+                    message.channels.forEach((channelBuffer, channelIndex) => {
+                        // Honour `length`: never assume the transferred
+                        // ArrayBuffer is exactly as long as the stretched audio.
+                        const frames = Math.min(length, Math.floor(channelBuffer.byteLength / 4));
+                        buffer.copyToChannel(new Float32Array(channelBuffer, 0, frames), channelIndex);
+                    });
+                    this._settle(job, buffer);
+                } catch (error) {
+                    this._settle(job, error instanceof Error ? error : new Error(String(error)));
+                }
+            }
+
+            this._schedule();
+        };
+
+        worker.onerror = (event) => {
+            event.preventDefault?.();
+            this._crash(slot, worker, event.error instanceof Error ? event.error : new Error(event.message || 'Stretch worker failed'));
+        };
+    }
+
     private _createSlot(): WorkerSlot {
         const slot: WorkerSlot = {
             worker: this.strategy.createWorker(),
             busy: false,
             current: null,
             failures: 0,
+            timer: null,
         };
-
-        const attach = (worker: Worker) => {
-            worker.onmessage = (event: MessageEvent<StretchWorkerMessage>) => {
-                const message = event.data;
-                if (!message || !slot.current || message.requestId !== slot.current.requestId) {
-                    return;
-                }
-
-                const { job } = slot.current;
-                slot.busy = false;
-                slot.current = null;
-
-                if (message.type === 'stretch-error') {
-                    this._settle(job, new Error(message.message || 'Stretch failed'));
-                } else {
-                    try {
-                        const length = Math.max(0, Math.floor(message.length));
-                        const buffer = job.context.createBuffer(message.channels.length, Math.max(1, length), message.sampleRate);
-                        message.channels.forEach((channelBuffer, channelIndex) => {
-                            // Honour `length`: never assume the transferred
-                            // ArrayBuffer is exactly as long as the stretched audio.
-                            const frames = Math.min(length, Math.floor(channelBuffer.byteLength / 4));
-                            buffer.copyToChannel(new Float32Array(channelBuffer, 0, frames), channelIndex);
-                        });
-                        this._settle(job, buffer);
-                    } catch (error) {
-                        this._settle(job, error instanceof Error ? error : new Error(String(error)));
-                    }
-                }
-
-                this._schedule();
-            };
-
-            worker.onerror = (event) => {
-                event.preventDefault?.();
-                const failed = slot.current;
-                slot.busy = false;
-                slot.current = null;
-                if (failed) {
-                    this._settle(failed.job, event.error instanceof Error ? event.error : new Error(event.message || 'Stretch worker failed'));
-                }
-
-                try {
-                    worker.terminate();
-                } catch {
-                    // no-op
-                }
-
-                // Respawn a crashed worker, but not forever: a worker that
-                // cannot even start (bad script, blocked by CSP at load time)
-                // would otherwise respawn in a tight loop.
-                slot.failures += 1;
-                const replacement = slot.failures <= MAX_WORKER_RESTARTS ? this.strategy.createWorker() : null;
-                slot.worker = replacement;
-                if (replacement) {
-                    attach(replacement);
-                }
-                this._schedule();
-            };
-        };
-
         if (slot.worker) {
-            attach(slot.worker);
+            this._attach(slot, slot.worker);
         }
         return slot;
     }

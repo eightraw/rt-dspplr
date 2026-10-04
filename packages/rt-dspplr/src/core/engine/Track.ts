@@ -69,6 +69,15 @@ export class Track {
     private _ended = false;
 
     private _rafId: number | null = null;
+    private _timerId: ReturnType<typeof setTimeout> | null = null;
+    private _onVisibility: (() => void) | null = null;
+    /**
+     * The variant playing (or prepared) for the current buffer and rate. Kept
+     * here so a seek or a restart at the same speed never asks the stretch
+     * service again: a variant too large for the cache budget, or evicted by
+     * other players' prewarms, would otherwise be rendered anew every time.
+     */
+    private _activeTarget: { buffer: AudioBuffer; rate: number; target: PlaybackTarget } | null = null;
     private _listeners = new Set<(state: TrackState) => void>();
 
     constructor(id: string, engine?: AudioEngine, options?: TrackOptions) {
@@ -162,6 +171,7 @@ export class Track {
             this._stretch?.cancelPrewarm(this._buffer);
         }
         this._buffer = null;
+        this._activeTarget = null;
         this._loopRange = null;
         this._playbackAnchorOffset = 0;
         this._pausedAt = 0;
@@ -285,6 +295,17 @@ export class Track {
     }
 
     setLoopRange(range: LoopRange | null): void {
+        // The position is anchor + elapsed·rate, folded into the loop while one
+        // is set. Re-anchor at the current position before the loop changes, or
+        // dropping or moving it would unfold the time spent looping into a jump
+        // towards the end of the clip.
+        if (this._playState === 'playing' && this._loopRange) {
+            const ctx = this._engine.context;
+            if (ctx) {
+                this._playbackAnchorOffset = this._computeCurrentTime();
+                this._startedAt = Math.max(this._startedAt, ctx.currentTime);
+            }
+        }
         this._loopRange = range;
 
         if (this._source) {
@@ -381,6 +402,7 @@ export class Track {
             this._gainNode = null;
         }
         this._buffer = null;
+        this._activeTarget = null;
         this._listeners.clear();
     }
 
@@ -500,6 +522,11 @@ export class Track {
             };
         }
 
+        const held = this._activeTarget;
+        if (held && held.buffer === this._buffer && held.rate === rate) {
+            return held.target;
+        }
+
         if (!this._stretch?.available) {
             // No worker (native strategy, blocked by CSP, crashed): change the
             // rate on the source node. Pitch follows speed, but position
@@ -512,12 +539,15 @@ export class Track {
         }
 
         try {
-            const stretchedBuffer = await this._stretch.ensureVariant(ctx, this._buffer, rate, 'playback');
-            return {
+            const source = this._buffer;
+            const stretchedBuffer = await this._stretch.ensureVariant(ctx, source, rate, 'playback');
+            const target: PlaybackTarget = {
                 buffer: stretchedBuffer,
                 nativePlaybackRate: 1,
                 usesStretchedBuffer: true,
             };
+            if (source === this._buffer) this._activeTarget = { buffer: source, rate, target };
+            return target;
         } catch (error) {
             console.warn('[Track] Stretch worker failed, falling back to native playbackRate', error);
             return {
@@ -531,29 +561,62 @@ export class Track {
     private _startPositionReporting(): void {
         this._stopPositionReporting();
         let lastReported = -1;
+        const doc = typeof document !== 'undefined' ? document : null;
 
-        const tick = () => {
-            if (this._playState !== 'playing') {
-                return;
-            }
-
+        const report = () => {
             const time = this._computeCurrentTime();
             if (Math.abs(time - lastReported) >= 0.03) {
                 lastReported = time;
                 this._notify();
             }
-
-            this._rafId = requestAnimationFrame(tick);
         };
+        // Every animation frame while the page shows; in a background tab the
+        // frames stop, so a timer keeps the position and `timeupdate` moving
+        // (browsers run it at least once a second while audio plays).
+        const schedule = () => {
+            if (this._playState !== 'playing') return;
+            if (doc?.hidden) {
+                this._timerId = setTimeout(() => {
+                    this._timerId = null;
+                    report();
+                    schedule();
+                }, 250);
+            } else {
+                this._rafId = requestAnimationFrame(() => {
+                    this._rafId = null;
+                    report();
+                    schedule();
+                });
+            }
+        };
+        schedule();
 
-        this._rafId = requestAnimationFrame(tick);
+        if (doc) {
+            this._onVisibility = () => {
+                this._cancelTicks();
+                schedule();
+            };
+            doc.addEventListener('visibilitychange', this._onVisibility);
+        }
     }
 
-    private _stopPositionReporting(): void {
+    private _cancelTicks(): void {
         if (this._rafId !== null) {
             cancelAnimationFrame(this._rafId);
             this._rafId = null;
         }
+        if (this._timerId !== null) {
+            clearTimeout(this._timerId);
+            this._timerId = null;
+        }
+    }
+
+    private _stopPositionReporting(): void {
+        this._cancelTicks();
+        if (this._onVisibility && typeof document !== 'undefined') {
+            document.removeEventListener('visibilitychange', this._onVisibility);
+        }
+        this._onVisibility = null;
     }
 
     private _notify(): void {

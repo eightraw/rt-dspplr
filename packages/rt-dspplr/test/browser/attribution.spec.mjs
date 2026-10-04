@@ -75,6 +75,39 @@ test('a custom interface gets the menu from the player itself, without React or 
     expect(await page.locator('#b').evaluate(el => el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })))).toBe(true);
 });
 
+test('right-click yields to the interface, links, text fields, selected text and Shift; the page still sees it', async ({ page }) => {
+    await page.goto('/test/browser/index.html');
+    await page.waitForFunction(() => window.h);
+    await page.evaluate(() => {
+        const host = document.createElement('section');
+        host.id = 'host';
+        host.innerHTML = '<div id="own">own menu</div><a id="link" href="https://example.com/">link</a>'
+            + '<input id="field" value="text"><p id="text">selectable words</p><button id="plain">Play</button>';
+        document.body.append(host);
+        window.seen = { own: 0, parent: 0 };
+        document.getElementById('own').addEventListener('contextmenu', (event) => { event.preventDefault(); window.seen.own += 1; });
+        document.body.addEventListener('contextmenu', () => { window.seen.parent += 1; });
+        h.createAudioPlayer({ element: host });
+    });
+    const menu = page.getByRole('menu', { name: 'About this player' });
+    for (const id of ['#own', '#link', '#field']) {
+        await page.locator(id).click({ button: 'right' });
+        await expect(menu).toHaveCount(0);
+    }
+    await page.locator('#plain').click({ button: 'right', modifiers: ['Shift'] });
+    await expect(menu).toHaveCount(0);
+    await page.locator('#text').selectText();
+    await page.locator('#text').click({ button: 'right' });
+    await expect(menu).toHaveCount(0);
+    await page.evaluate(() => window.getSelection().removeAllRanges());
+    await page.locator('#plain').click({ button: 'right' });
+    await expect(menu).toHaveCount(1);
+    await expect(menu.getByRole('menuitem')).toContainText('RT-DSPPLR by SAIT Digital');
+    const seen = await page.evaluate(() => window.seen);
+    expect(seen.own).toBe(1);
+    expect(seen.parent).toBeGreaterThanOrEqual(6);
+});
+
 test('playback needs a mounted interface element on the page', async ({ page }) => {
     await page.goto('/test/browser/index.html');
     await page.waitForFunction(() => window.h);

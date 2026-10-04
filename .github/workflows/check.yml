@@ -1,11 +1,20 @@
 name: Library checks
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -13,6 +22,8 @@ jobs:
       - run: npm run build
       - run: npm run typecheck
       - run: npm test
+      - run: npx publint packages/rt-dspplr
+      - run: npx --yes @arethetypeswrong/cli --pack packages/rt-dspplr --profile esm-only --exclude-entrypoints ./styles.css
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser -w packages/rt-dspplr
       - run: npm run test:package -w packages/rt-dspplr

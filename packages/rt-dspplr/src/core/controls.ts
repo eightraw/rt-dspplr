@@ -12,6 +12,9 @@ export const OUTPUT_MAX_DB = 24;
 export const OUTPUT_DEFAULT_DB = 0;
 export const LIMITER_CEILING_DB = -0.01;
 export const DEFAULT_SPEEDS = [1, 1.25, 1.5, 2] as const;
+/** Playback speeds outside this range are clamped: slower renders a buffer many times the clip, faster has no use. */
+export const SPEED_MIN = 0.25;
+export const SPEED_MAX = 4;
 export const MIX_DEFAULT = 0;
 
 /**
@@ -74,7 +77,8 @@ export function normalizeOutputGainDb(db: number): number {
 }
 
 export function normalizeSpeed(speed: number): number {
-    return Number.isFinite(speed) && speed > 0 ? speed : 1;
+    if (!Number.isFinite(speed) || speed <= 0) return 1;
+    return clamp(speed, SPEED_MIN, SPEED_MAX);
 }
 
 export function outputGainDbToGain(db: number): number {

@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useRef, type CSSProperties } from 'react';
 import type { AudioPlayerCore } from '../core/AudioPlayer';
 import type { SpectrogramOptions } from '../core/spectrogram/SpectrogramView';
-import { Scrubber, type ScrubberHandle } from './Scrubber';
-import { useAudioPlayerState, type UseAudioPlayerResult } from './useAudioPlayer';
-import { useWaveform } from './useWaveform';
+import { mountTimeline, type TimelineOptions } from '../core/timeline/createTimeline';
+import type { UseAudioPlayerResult } from './useAudioPlayer';
 
 // ---------------------------------------------------------------------------
 // <Timeline /> — the card's seek bar on its own, for interfaces of your own
@@ -12,7 +11,8 @@ import { useWaveform } from './useWaveform';
 // Click to seek, drag to loop (with handles), wheel to zoom, Shift + wheel or
 // the overview strip to pan, keyboard for all of it, and a time ruler. It
 // draws the waveform, the spectrogram, or both, and fills the box you give it.
-// Import the stylesheet once; the --rtd-* tokens theme it.
+// Import the stylesheet once; the --rtd-* tokens theme it. Without React the
+// same timeline is createTimeline() from the main entry.
 
 export interface TimelineProps {
     player: AudioPlayerCore | UseAudioPlayerResult;
@@ -22,10 +22,10 @@ export interface TimelineProps {
     waveformStyle?: 'envelope' | 'bars';
     /** Colours and axis of the spectrogram. */
     spectrogram?: SpectrogramOptions;
-    /** 'plain' (default): the wheel zooms. 'modifier': only Ctrl/Cmd + wheel, so the page keeps scrolling. */
+    /** 'modifier' (default): Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. 'plain': the wheel alone zooms. */
     wheelZoom?: 'plain' | 'modifier';
     /**
-     * Zoom and pan with the wheel, a pinch, the keys and the overview strip. Default true.
+     * Zoom and pan with the wheel, the keys and the overview strip. Default true.
      * false: the track always shows the whole clip and the wheel scrolls the page.
      */
     zoom?: boolean;
@@ -36,7 +36,7 @@ export interface TimelineProps {
     /** Accessible name of the seek slider. Default 'Seek'. */
     label?: string;
     /** Shown in the track when nothing is loaded. */
-    emptyText?: ReactNode;
+    emptyText?: string;
     /** Called when the listener moves the playhead (click, drag, keyboard). */
     onSeek?: (seconds: number) => void;
     className?: string;
@@ -49,14 +49,12 @@ function resolveCore(player: AudioPlayerCore | UseAudioPlayerResult): AudioPlaye
         : player as AudioPlayerCore;
 }
 
-const useIsomorphicLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
-
 export function Timeline({
     player,
     display = 'waveform',
     waveformStyle = 'envelope',
     spectrogram,
-    wheelZoom = 'plain',
+    wheelZoom = 'modifier',
     zoom = true,
     ruler = true,
     theme = 'light',
@@ -67,53 +65,51 @@ export function Timeline({
     style,
 }: TimelineProps) {
     const core = resolveCore(player);
-    const state = useAudioPlayerState(core);
-    const pyramid = useWaveform(state, display !== 'spectrogram');
-    const scrubberRef = useRef<ScrubberHandle>(null);
-    const hasAudio = state.clipId !== null;
+    const rootRef = useRef<HTMLDivElement | null>(null);
+    const viewRef = useRef<ReturnType<typeof mountTimeline> | null>(null);
     const onSeekRef = useRef(onSeek);
     onSeekRef.current = onSeek;
-
-    // The playhead is moved from an animation frame while playing, outside React.
-    useIsomorphicLayoutEffect(() => {
-        if (!state.isPlaying) scrubberRef.current?.setTime(hasAudio ? state.currentTime : 0, false);
-    }, [state.currentTime, state.isPlaying, hasAudio]);
+    const options: TimelineOptions = {
+        display,
+        waveformStyle,
+        spectrogram,
+        wheelZoom,
+        zoom,
+        ruler,
+        label,
+        emptyText,
+        onSeek: (seconds) => onSeekRef.current?.(seconds),
+    };
+    const optionsRef = useRef(options);
+    optionsRef.current = options;
 
     useEffect(() => {
-        if (!state.isPlaying) return undefined;
-        let frame = 0;
-        const tick = () => {
-            scrubberRef.current?.setTime(Math.min(core.getCurrentTime(), core.getState().duration), true);
-            frame = requestAnimationFrame(tick);
+        const root = rootRef.current;
+        if (!root) return undefined;
+        const view = mountTimeline(root, core, optionsRef.current);
+        viewRef.current = view;
+        return () => {
+            view.dispose();
+            if (viewRef.current === view) viewRef.current = null;
         };
-        frame = requestAnimationFrame(tick);
-        return () => cancelAnimationFrame(frame);
-    }, [state.isPlaying, core]);
+    }, [core]);
 
-    const onUserSeek = useCallback((seconds: number) => onSeekRef.current?.(seconds), []);
+    const spectrogramKey = JSON.stringify(spectrogram ?? {});
+    useEffect(() => {
+        viewRef.current?.setOptions(optionsRef.current);
+    }, [display, waveformStyle, spectrogramKey, wheelZoom, zoom, ruler, label, emptyText]);
+
+    // The canvases read the theme's colours when they draw.
+    useEffect(() => {
+        viewRef.current?.refreshColors();
+    }, [theme]);
 
     return (
-        <div className={className ? `rtd rtd-timeline ${className}` : 'rtd rtd-timeline'} data-theme={theme} style={style}>
-            <Scrubber
-                ref={scrubberRef}
-                core={core}
-                hasAudio={hasAudio}
-                duration={state.duration}
-                loop={state.loop}
-                pyramid={hasAudio ? pyramid : null}
-                paletteKey={theme}
-                loading={state.status === 'loading'}
-                emptyText={emptyText}
-                resetKey={`${state.clipId ?? ''}:${state.playRequestId}`}
-                onUserSeek={onUserSeek}
-                label={label}
-                display={display}
-                waveformStyle={waveformStyle}
-                spectrogram={spectrogram}
-                wheelZoom={wheelZoom}
-                zoomable={zoom}
-                ruler={ruler}
-            />
-        </div>
+        <div
+            ref={rootRef}
+            className={className ? `rtd rtd-timeline ${className}` : 'rtd rtd-timeline'}
+            data-theme={theme}
+            style={style}
+        />
     );
 }

@@ -126,6 +126,45 @@ test('separation mix plays both stems at full in the middle', async ({ page }) =
     expect(levels[3] / levels[0]).toBeGreaterThan(0.96); expect(levels[3] / levels[0]).toBeLessThan(1.04);
 });
 
+test('dropping or moving the loop while playing keeps the position', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+        const p = h.make(); await p.play(h.buffer(20));
+        p.setLoop({ start: 1, end: 2 }); await h.sleep(2300);
+        const looped = p.getCurrentTime();
+        p.setLoop(null); const dropped = p.getCurrentTime(); await h.sleep(300); const later = p.getCurrentTime();
+        await p.pause(); const paused = p.getCurrentTime(); await p.play(); await h.sleep(200);
+        const resumed = { time: p.getCurrentTime(), playing: p.getState().isPlaying, ended: p.getState().ended };
+        // A loop behind the playhead: both stems jump to its start.
+        p.setLoop({ start: 0.2, end: 0.7 }); await h.sleep(150); const moved = p.getCurrentTime();
+        p.dispose(); return { looped, dropped, later, paused, resumed, moved };
+    });
+    expect(result.looped).toBeGreaterThanOrEqual(1); expect(result.looped).toBeLessThan(2.1);
+    expect(result.dropped).toBeGreaterThanOrEqual(1); expect(result.dropped).toBeLessThan(2.3);
+    expect(result.later).toBeGreaterThan(result.dropped + 0.2); expect(result.later).toBeLessThan(3);
+    expect(result.paused).toBeLessThan(3.5);
+    expect(result.resumed.playing).toBe(true); expect(result.resumed.ended).toBe(false);
+    expect(result.resumed.time).toBeGreaterThan(result.paused); expect(result.resumed.time).toBeLessThan(4);
+    expect(result.moved).toBeGreaterThanOrEqual(0.2); expect(result.moved).toBeLessThan(0.7);
+});
+
+test('a seek at a speed does not render the variant again, even when it does not fit the cache', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+        window.stretchJobs = 0;
+        const base = h.delayedStrategy(60);
+        const strategy = { ...base, createWorker() {
+            const worker = base.createWorker(); const post = worker.postMessage.bind(worker);
+            worker.postMessage = (...args) => { window.stretchJobs += 1; post(...args); }; return worker;
+        } };
+        const p = h.make({ stretcher: strategy, cacheBudgetBytes: 0 }); await p.play(h.buffer(4)); await p.setSpeed(1.5);
+        const afterSpeed = window.stretchJobs;
+        await p.seek(1); await h.sleep(50); await p.seek(2); await h.sleep(50); await p.pause(); await p.play(); await h.sleep(50);
+        const s = p.getState(); const result = { afterSpeed, total: window.stretchJobs, speed: s.processing.speed, playing: s.isPlaying, time: p.getCurrentTime() };
+        p.dispose(); return result;
+    });
+    expect(result.afterSpeed).toBe(1); expect(result.total).toBe(1);
+    expect(result.speed).toBe(1.5); expect(result.playing).toBe(true); expect(result.time).toBeGreaterThan(2);
+});
+
 test('late stem B response cannot attach to another clip', async ({ page }) => {
     const result = await page.evaluate(async () => {
         let resolve; const lateB = new Promise(r => resolve = r);
@@ -153,6 +192,35 @@ test('built-in vocoder works without the Rubber Band entry', async ({ page }) =>
     });
     expect(result.playing).toBe(true); expect(result.speed).toBe(1.5); expect(result.rms).toBeGreaterThan(0.01);
     expect(requests.some(url => /rubberband/i.test(url))).toBe(false);
+});
+
+test('vocoderStretcher({ memory }) renders speeds in the worker, lean and fast', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+        const out = {};
+        for (const memory of ['lean', 'fast']) {
+            const strategy = h.vocoderStretcher({ memory });
+            const p = h.make({ stretcher: strategy }); await p.play(h.buffer(2)); await p.setSpeed(1.5); await h.sleep(120);
+            out[memory] = { id: strategy.id, speed: p.getState().processing.speed, pending: p.getState().pendingSpeed, rms: h.rms(p) > 0.01 };
+            p.dispose();
+        }
+        return { ...out, defaultId: h.vocoderStretcher.id, callable: typeof h.vocoderStretcher };
+    });
+    expect(result).toEqual({
+        lean: { id: 'vocoder:lean', speed: 1.5, pending: null, rms: true },
+        fast: { id: 'vocoder:fast', speed: 1.5, pending: null, rms: true },
+        defaultId: 'vocoder',
+        callable: 'function',
+    });
+});
+
+test('strategy options the worker cannot receive fail the job, not the player', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+        const strategy = { ...h.delayedStrategy(50), options: { notCloneable: () => 1 } };
+        const p = h.make({ stretcher: strategy }); await p.play(h.buffer(2));
+        await Promise.race([p.setSpeed(1.5), h.sleep(1500)]); await h.sleep(100);
+        const s = p.getState(); const result = { playing: s.isPlaying, speed: s.processing.speed, pending: s.pendingSpeed }; p.dispose(); return result;
+    });
+    expect(result).toEqual({ playing: true, speed: 1.5, pending: null });
 });
 
 test('changing speed while play is preparing still starts the requested clip', async ({ page }) => {

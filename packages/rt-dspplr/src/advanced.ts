@@ -22,6 +22,8 @@ export {
 export {
     DEFAULT_PROCESSING,
     DEFAULT_SPEEDS,
+    SPEED_MIN,
+    SPEED_MAX,
     HIGH_PASS_DEFAULT_HZ,
     HIGH_PASS_MAX_HZ,
     COMPRESSION_DEFAULT,
@@ -50,7 +52,10 @@ export {
     vocoderStretcher,
     nativeStretcher,
     type StretchStrategy,
+    type VocoderStretcher,
+    type VocoderStretcherOptions,
 } from './core/stretch/strategies';
+export type { VocoderMemory } from './core/stretch/OfflineStretchCore';
 export {
     serveStretchWorker,
     type StretchImplementation,
@@ -72,6 +77,9 @@ export {
 } from './core/cache/pcmCache';
 
 export { WaveformAnalyzer, type WaveformPyramids } from './core/waveform/WaveformAnalyzer';
+// The timeline driven by hand, as the React card drives it beside its own clock.
+export { TimelineCore, type TimelineCoreInput, type TimelineDisplay } from './core/timeline/TimelineCore';
+export { mountTimeline } from './core/timeline/createTimeline';
 export {
     buildPeakPyramid,
     pickPeakPyramidLevel,

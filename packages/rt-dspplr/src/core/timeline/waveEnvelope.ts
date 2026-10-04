@@ -1,4 +1,4 @@
-import { pickPeakPyramidLevel, type WaveformPeakPyramid } from '../core/waveform/pyramid';
+import { pickPeakPyramidLevel, type WaveformPeakPyramid } from '../waveform/pyramid';
 
 // Envelope-style waveform: for every device-pixel column of the visible
 // sample range, the min/max peak (outer envelope) and the RMS (inner body)

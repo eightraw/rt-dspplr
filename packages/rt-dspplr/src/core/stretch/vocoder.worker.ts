@@ -5,8 +5,9 @@
 import { serveStretchWorker } from './protocol';
 import { stretchMultichannel } from './OfflineStretchCore';
 
-serveStretchWorker(self as never, (channels, sampleRate, speed, transientSensitivity) => stretchMultichannel(channels, {
+serveStretchWorker(self as never, (channels, sampleRate, speed, transientSensitivity, options) => stretchMultichannel(channels, {
     sampleRate,
     rate: 1 / speed,
     transientSensitivity,
+    memory: options.memory === 'fast' || options.memory === 'lean' ? options.memory : 'auto',
 }));

@@ -27,8 +27,8 @@ with their length.
   stem in its own.
 - **Waveform scrubber** that previews the DSP settings: a peak/RMS pyramid
   computed in a worker, drawn as a peak envelope with an RMS layer at
-  device-pixel resolution. Click to seek, drag to loop, wheel to zoom, with
-  a time ruler and an overview of the zoomed window.
+  device-pixel resolution. Click or tap to seek, drag to loop, Ctrl/Cmd + wheel
+  to zoom, with a time ruler and an overview of the zoomed window.
 - **Zero bundler configuration** for the core and React entries. Workers and
   the worklet ship inside the JavaScript and start from Blob URLs.
 - Optional **Rubber Band** stretcher in a separate entry point, for higher
@@ -60,6 +60,7 @@ ESM only. TypeScript types included.
 - [SSR and Next.js](#ssr-and-nextjs)
 - [Browser support](#browser-support)
 - [Sizes](#sizes)
+- [Validation](#validation)
 - [Licensing](#licensing)
 
 ## React quick start
@@ -142,7 +143,7 @@ Construction is free. No AudioContext, node, or worker exists until the first
 | Option | Type | Default | |
 |---|---|---|---|
 | `stretcher` | `StretchStrategy \| 'native'` | `vocoderStretcher` | Time-stretch backend, see [strategies](#time-stretch-strategies). |
-| `speeds` | `number[]` | `[1, 1.25, 1.5, 2]` | Speeds offered by UIs and the default prewarm set. |
+| `speeds` | `number[]` | `[1, 1.25, 1.5, 2]` | Speeds offered by UIs and the default prewarm set, within 0.25–4x (`SPEED_MIN`, `SPEED_MAX`); others are dropped with a warning. |
 | `prewarmSpeeds` | `boolean \| number[]` | `true` | Render speed variants in the background after load. The selected speed always goes first. |
 | `processing` | `Partial<ProcessingState>` | see below | Initial DSP values. |
 | `mixLaw` | `'crossfade' \| 'separation'` | `'crossfade'` | How `mix` sets the stems' gains, see [Two-track mixer](#two-track-mixer). |
@@ -168,19 +169,19 @@ A clip is an `AudioInput` or `{ src, srcB?, id? }`. `id` defaults to the URL.
 | `play(clip?, { startAt? })` | With no argument, resume. With a clip, play it from `startAt` (default 0). Passing the clip that is already loaded restarts it without reloading. |
 | `pause()`, `toggle()`, `stop()` | `pause()` follows `pauseMode`. |
 | `seek(seconds)` | Keeps playing if it was playing. |
-| `setSpeed(speed)` | Keeps the position. Pitch is preserved when the strategy has a worker. |
-| `setLoop({ start, end } \| null)` | In seconds. Snapped to zero crossings. |
+| `setSpeed(speed)` | Keeps the position. Clamped to 0.25–4x. Pitch is preserved when the strategy has a worker. |
+| `setLoop({ start, end } \| null)` | In seconds. Snapped to zero crossings. Changing or dropping the loop while playing keeps the position; a loop set behind the playhead starts from its beginning. |
 | `setHighPass(hz)` | `0` bypasses. UI range 0–500 Hz. |
 | `setCompression(amount)` | 0–1. |
 | `setOutputGain(db)` | -24…+24 dB; `-Infinity` mutes. |
-| `setMix(mix)` | 0 = stem A … 1 = stem B (linear crossfade). Fetches stem B on first use. |
+| `setMix(mix)` | 0 = stem A … 1 = stem B; the gains follow `mixLaw`. Fetches stem B on first use. |
 | `setProcessing(patch)` | Any subset of `ProcessingState`. |
 | `setSourceB(input \| null)` | Install (or remove) stem B for the current clip directly. |
 | `setPauseMode(mode)` | |
 | `getState()` | Immutable snapshot; the same object until something changes. |
 | `subscribe(listener)` | Called on every change; returns an unsubscribe function (`useSyncExternalStore`-compatible). |
 | `on(event, listener)` / `off(...)` | Events below. `on` returns an unsubscribe function. |
-| `getCurrentTime()` | Live position computed from the AudioContext clock (the state is updated about 30 times per second). |
+| `getCurrentTime()` | Live position computed from the AudioContext clock. The state is updated about 30 times per second while the page shows, about four times a second in a background tab. |
 | `analyser`, `audioContext` | Post-DSP `AnalyserNode` for custom meters, and the shared context. |
 | `dispose()` | Stops playback and releases this player's nodes. The shared AudioContext stays open. A disposed player ignores `load`/`play` until `reactivate()` (the React hook does this for StrictMode). Mounted elements stay mounted. |
 
@@ -214,8 +215,8 @@ over: they add a few milliseconds of look-ahead delay and limit softly near
 | Event | Payload |
 |---|---|
 | `statechange` | the new state |
-| `timeupdate` | position in seconds |
-| `ended` | `{ clipId }` |
+| `timeupdate` | position in seconds, about 30 times per second (about four in a background tab) |
+| `ended` | `{ clipId }`; `clipId` is `null` when the clip was unloaded meanwhile |
 | `load` | `{ clipId, duration }` |
 | `error` | `Error` (the clip failed to load or decode) |
 | `bload` | `{ clipId }` |
@@ -286,34 +287,40 @@ below it. The ruler is hidden in this layout.
 | `display` | `'waveform'` | What the seek bar draws: `'waveform'`, `'spectrogram'` (see [Spectrogram](#spectrogram)), or `'both'`: the waveform as an outline over the spectrogram. |
 | `spectrogram` | none | Options of the spectrogram, see [Spectrogram](#spectrogram). |
 | `waveformStyle` | `'envelope'` | `'envelope'`: min/max peak envelope with an inner RMS layer, one column per device pixel. `'bars'`: rounded bars. |
-| `wheelZoom` | `'plain'` | `'plain'`: the wheel over the waveform zooms. `'modifier'`: only Ctrl/Cmd + wheel zooms, so the page keeps scrolling under the pointer. |
-| `zoom` | `true` | `false`: no zoom or pan by any means (wheel, pinch, keys, overview strip). The waveform always shows the whole clip and the wheel scrolls the page; seeking and loops stay. |
+| `wheelZoom` | `'modifier'` | `'modifier'`: Ctrl/Cmd + wheel over the waveform zooms, the wheel alone scrolls the page. `'plain'`: the wheel alone zooms (at 1x, scrolling down still scrolls the page). |
+| `zoom` | `true` | `false`: no zoom or pan by any means (wheel, keys, overview strip). The waveform always shows the whole clip and the wheel scrolls the page; seeking and loops stay. |
 | `ruler` | `true` | Time ruler and zoom overview under the waveform (full layout only). |
 | `layout` | `'auto'` | `'full' \| 'compact' \| 'auto'`. |
 | `compactBreakpoint` | `420` | Width (px) under which `'auto'` is compact. |
 | `theme` | `'light'` | `'dark' \| 'auto'` (follows `prefers-color-scheme`). |
 | `className`, `style` | none | |
 
-**Mouse and touch.** Click the waveform to seek; a click outside an active
-loop also clears it. Drag across the waveform to select a loop, then drag
-its handles to adjust it. The wheel over the waveform (or the ruler)
-zooms around the pointer in 0.5× steps, up to a 0.5 s visible window
-(`wheelZoom="modifier"`: Ctrl/Cmd + wheel only; `zoom={false}`: no zoom
-at all). Shift + wheel or a
-horizontal swipe pans while zoomed; so does dragging or clicking the
-overview strip under the ruler. While playing zoomed in, the view follows
-the playhead. The "× · reset" chip (or `0`) shows the whole clip again. Double-click any slider to
-reset it. The mix slider is disabled (with a tooltip) when the clip has
-no stem B; it stays movable downwards if a value from the previous
-clip is left over. A spinner shows while stem B loads.
+**Mouse.** Click the waveform to seek; a click outside an active loop also
+clears it. Drag across the waveform to select a loop, then drag its handles to
+adjust it. Ctrl/Cmd + wheel over the waveform (or the ruler) zooms around the
+pointer, in proportion to the wheel's travel, down to a 0.5 s visible window;
+the wheel alone scrolls the page (`wheelZoom="plain"`: the wheel alone zooms;
+`zoom={false}`: no zoom at all). A trackpad pinch arrives as Ctrl + wheel and
+zooms too. Shift + wheel or a horizontal wheel pans while zoomed; so does
+dragging or clicking the overview strip under the ruler. While playing zoomed
+in, the view follows the playhead. The "× · reset" chip (or `0`) shows the
+whole clip again. Double-click any slider to reset it. The mix slider is
+disabled (with a tooltip) when the clip has no stem B; it stays movable
+downwards if a value from the previous clip is left over. A spinner shows while
+stem B loads.
+
+**Touch.** A tap seeks. A finger that swipes up or down scrolls the page, as
+anywhere else; a finger that moves sideways across the waveform selects a loop,
+and the handles move the same way. There is no two-finger gesture: zoom with
+the keys, the overview strip or a trackpad.
 
 **Keyboard.** Every control is a native button, choice group or range input,
 or an ARIA slider, with a visible focus ring.
 
 | Focus | Keys |
 |---|---|
-| Waveform | Left/Right (or Down/Up) ±1 s, PageDown/PageUp ±5 s, Home/End, `+`/`-` zoom (×1.5), `0` resets zoom, Esc clears the loop |
-| Loop handle | Left/Right ±0.1 s (Shift ±1 s), PageDown/PageUp ±1 s, Home/End, Esc/Delete clears the loop |
+| Waveform | Left/Right (or Down/Up) ±1 s, PageDown/PageUp ±5 s, Home/End, `+`/`-` (or `=`/`_`) zoom ×1.5, `0` resets zoom, Esc clears the loop |
+| Loop handle | Left/Right ±0.1 s (Shift ±1 s), PageDown/PageUp ±1 s, Home/End, Esc/Delete/Backspace clears the loop |
 | Post FX popover | Esc closes it and returns focus to the Post FX button |
 
 Transitions and animations are switched off under
@@ -357,10 +364,12 @@ createAudioPlayer({
 
 ## Timeline
 
-The card's seek bar on its own, for an interface of your own: click to seek,
-drag to loop (with handles), wheel to zoom, Shift + wheel or the overview strip
-to pan, the keyboard for all of it, and a time ruler. It draws the waveform,
-the spectrogram, or both, and fills the box it is given.
+The card's seek bar on its own, for an interface of your own: click or tap to
+seek, drag to loop (with handles), Ctrl/Cmd + wheel to zoom, Shift + wheel or
+the overview strip to pan, the keyboard for all of it, and a time ruler. It draws the waveform,
+the spectrogram, or both, and fills the box it is given. It is the same
+timeline with React or without: `<Timeline>`, or `createTimeline()` from the
+main entry for any framework or none.
 
 ```tsx
 import { Timeline } from '@saitdigital/rt-dspplr/react';
@@ -377,12 +386,34 @@ import '@saitdigital/rt-dspplr/styles.css';
 | `display` | `'waveform'` | `'waveform'`, `'spectrogram'` or `'both'`. |
 | `waveformStyle` | `'envelope'` | `'envelope'` or `'bars'`. |
 | `spectrogram` | none | Options of the spectrogram, see below. |
-| `wheelZoom` | `'plain'` | `'modifier'`: only Ctrl/Cmd + wheel zooms. |
+| `wheelZoom` | `'modifier'` | `'modifier'`: Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. `'plain'`: the wheel alone zooms. |
 | `zoom` | `true` | `false`: no zoom or pan; the wheel scrolls the page, clicks still seek. |
 | `ruler` | `true` | Time ruler and zoom overview under the track. |
 | `theme` | `'light'` | `'light'`, `'dark'` or `'auto'`. The `--rtd-*` tokens restyle it. |
 | `onSeek` | none | Called when the listener moves the playhead. |
-| `label`, `emptyText` | `'Seek'`, `'No audio loaded'` | Accessible name, and what shows before a clip. |
+| `label`, `emptyText` | `'Seek'`, `'No audio loaded'` | Accessible name, and the text shown before a clip. |
+
+Without React, `createTimeline(container, player, options)` builds the same
+timeline inside `container` and keeps it in step with the player: it computes
+the waveform in a worker, follows the DSP, the mix and the loop, and moves the
+playhead. The options are the props above, except `player`, `className` and
+`style`.
+
+```ts
+import { createAudioPlayer, createTimeline } from '@saitdigital/rt-dspplr';
+import '@saitdigital/rt-dspplr/styles.css';
+
+const root = document.querySelector<HTMLElement>('#player')!;
+const player = createAudioPlayer({ element: root });
+const timeline = createTimeline(root.querySelector<HTMLElement>('.seek')!, player, {
+    display: 'both',
+    theme: 'dark',
+    onSeek: (t) => console.log('seek', t),
+});
+
+timeline.setOptions({ zoom: false });   // any option, at any time
+timeline.dispose();                     // removes it
+```
 
 ## Spectrogram
 
@@ -420,7 +451,7 @@ view.dispose();
 | `palette` | `DEFAULT_SPECTROGRAM_PALETTE` | `{ background, colorA, colorB, colorMix, peak }` as hex colours. The default is a dark panel with orange A, blue B and purple for both. |
 | `floorDb` | `66` | How far below the clip's loudest bin is drawn as background. |
 | `minHz`, `maxHz` | `30`, `16000` | Frequency axis. |
-| `fftSize` | `'auto'` | `'auto'`: 2048 points for the harmonics, 4096 below 300 Hz and 1024 above 3 kHz when zoomed in, blended at the edges. Or one power of two from 256 to 16384. |
+| `fftSize` | `'auto'` | `'auto'`: 2048 points for the harmonics; zoomed in, 4096 below 300 Hz and 1024 above 3 kHz (512 when very close), blended at the edges; a whole long clip uses 4096. Or one power of two from 256 to 16384. |
 
 Levels are relative to the clip's loudest bin, so a quiet stem looks quiet.
 With `mixLaw: 'separation'` the reference is both stems together.
@@ -429,22 +460,46 @@ With `mixLaw: 'separation'` the reference is both stems together.
 
 | Strategy | Import | Quality / cost |
 |---|---|---|
-| `vocoderStretcher` (default) | `@saitdigital/rt-dspplr` | Built-in phase vocoder with transient-aware phase reset. Pure TS, ~5 KB worker, no dependencies. |
+| `vocoderStretcher` (default) | `@saitdigital/rt-dspplr` | Built-in phase vocoder with transient-aware phase reset. Pure TS, ~5 KB worker, no dependencies. Call it to choose its memory use: `vocoderStretcher({ memory })`, see below. |
 | `'native'` / `nativeStretcher` | `@saitdigital/rt-dspplr` | `playbackRate` only: no stretch rendering, pitch follows speed. |
 | `rubberbandStretcher(options?)` | `@saitdigital/rt-dspplr/stretch-rubberband` | Rubber Band R3 ("finer") in a module worker. Best quality, ~265 KB WASM loaded on first use, GPL (see below). |
-| custom | `serveStretchWorker` | Any algorithm. Write a worker with `serveStretchWorker(self, (channels, sampleRate, speed) => …)` and return `{ id, createWorker }`. |
+| custom | `serveStretchWorker` | Any algorithm. Write a worker with `serveStretchWorker(self, (channels, sampleRate, speed, sensitivity, options) => …)` and return `{ id, createWorker, options? }`. `options` are plain, cloneable data handed to the worker with every request. |
+
+The built-in vocoder can hold the whole clip's analysis in memory or go
+through it frame by frame. Both give the same samples, bit for bit:
+
+| `memory` | Memory while rendering | Time |
+|---|---|---|
+| `'auto'` (default) | `'lean'` above 15 s of audio, `'fast'` below | that of the mode it picks |
+| `'lean'` | the output plus a few FFT-sized buffers: +78 MB for 10 min mono | about 5–10% more than `'fast'` |
+| `'fast'` | about 20x the clip's PCM: +2.3 GB for 10 min mono | the baseline: 19 s for 10 min mono |
+
+```ts
+createAudioPlayer({ stretcher: vocoderStretcher({ memory: 'lean' }) });
+```
+
+Measured in Node 20, mono 48 kHz at 1.5x. Each mode is its own strategy with
+its own cache.
 
 Variants are rendered once per (clip, speed, strategy) and cached. The
 selected speed is rendered before the others, and a playback request jumps
 ahead of queued prewarm jobs. Prewarm jobs of a clip are cancelled when the
-player moves to another clip. If no worker can start (strategy `native`, CSP,
-repeated crashes), speed changes fall back to `playbackRate`.
+player moves to another clip. The variant of the current clip at the current
+speed is also held by the player itself, so seeking and restarting at that
+speed never render again, even when the variant is too large for the cache.
+If no worker can start (strategy `native`, CSP, four crashes in a row), speed
+changes fall back to `playbackRate`; a job that a worker never answers is
+abandoned after a watchdog (at least 10 s) and its worker replaced.
 
 Speed preparation is offline, over the whole clip, not a streaming realtime
 stretcher. On `setSpeed`, the old rate keeps playing until the requested
 variant is ready; `state.pendingSpeed` exposes this wait. The latest request
 wins. This avoids an intentional pause but does not promise click-free
-phase continuity between independently stretched buffers.
+phase continuity between independently stretched buffers. The built-in
+vocoder keeps the level of tonal material and speech within half a decibel at
+every speed, and its output lands within a few milliseconds of the source
+time scaled by the speed; noise-like material comes out a few decibels quieter,
+as from any phase vocoder.
 
 ### Rubber Band entry
 
@@ -506,7 +561,8 @@ bundler-specific, so other ESM bundlers should behave the same.
 With a Content-Security-Policy, allow `blob:` in `worker-src` (workers) and
 `script-src` (the AudioWorklet module). If they are blocked, the player still
 works: DSP falls back to native nodes, speed to `playbackRate`, and the
-waveform stays empty. A warning is logged.
+waveform and the spectrogram stay empty. A warning is logged, also when a
+worker fails after it started.
 
 ## Styling and themes
 
@@ -560,17 +616,20 @@ Decoded audio is raw Float32 PCM in the browser's native memory, about
 22 MiB per minute of 48 kHz stereo. One byte-bounded LRU (default 150 MiB,
 shared by all players) holds both decoded clips and rendered speed variants.
 The default three variants can add about 2x the clip's size. Speculative
-prewarming only schedules variants whose estimated combined size plus the
-source fits the cache budget. Explicitly requested variants may exceed the
-budget; they are played without caching.
+prewarming only schedules variants whose estimated size fits beside what the
+cache already holds. Explicitly requested variants may exceed the budget; they
+are played without caching, and the player keeps the one it is playing until
+the clip or the speed changes.
 
 **This is a cache limit, not a cap on total tab memory.** `usedBytes` reports
 cache references only. Active tracks can retain evicted buffers; decode,
 download, waveform workers, stretch workers and their scratch/output buffers
 consume additional memory. Stems A and B each require PCM.
-Eviction never interrupts playback. For large files or constrained devices,
-set `prewarmSpeeds: false`, avoid unnecessary stem B prefetch, and dispose
-unused players. Full-file decoding remains required; this is not a streaming
+Eviction never interrupts playback. Rendering a speed variant needs little
+beyond the variant itself: the built-in vocoder goes through clips longer than
+15 s frame by frame (see [Time-stretch strategies](#time-stretch-strategies)).
+For large files or constrained devices, set `prewarmSpeeds: false`, avoid
+unnecessary stem B prefetch, and dispose unused players. Full-file decoding remains required; this is not a streaming
 player or a solution for arbitrarily long recordings.
 
 ```ts
@@ -594,7 +653,9 @@ AudioWorklet (Chrome 66, Firefox 76, Safari 14.1; native fallback otherwise),
 Web Workers, CSS container queries (2023+ browsers; older ones just skip the
 narrow-width tweaks). The Rubber Band entry needs module workers (Firefox
 114+). Formats: whatever the browser's `decodeAudioData` supports (WAV, MP3,
-AAC/M4A, FLAC everywhere; Ogg/Opus and WebM depend on the browser).
+AAC/M4A, FLAC everywhere; Ogg/Opus and WebM depend on the browser). The shared
+AudioContext runs at 48 kHz unless the first player asks for another
+`sampleRate`; material at another rate is resampled by the browser's decoder.
 
 ## Sizes
 
@@ -610,7 +671,7 @@ included in these sizes or in the npm artifact.
 ## Validation
 
 ```bash
-npm test                  # stretch lengths, shared cache, scheduling, untouched audio at the defaults
+npm test                  # stretch lengths, level and timing, shared cache, scheduling, worker failures, the ruler, untouched audio at the defaults
 npm run typecheck
 npm run test:browser      # build + Chromium AudioContext/worker/React tests (workspace root)
 npm run test:package      # build + npm artifact installed in an isolated consumer (workspace root)
@@ -618,9 +679,12 @@ npm run test:package      # build + npm artifact installed in an isolated consum
 
 Install Chromium once with `npx playwright install chromium`. The automated
 browser suite covers transport cancellation, racing clip/speed requests,
-late stem B responses, multiple players, StrictMode cleanup, real output
-levels and the built-in vocoder. It is not a listening-quality benchmark or
-a claim that Safari, Firefox, mobile devices and all bundlers were tested.
+late stem B responses, loops changed while playing, multiple players,
+StrictMode cleanup, real output levels, the built-in vocoder, and the wheel,
+touch and right-click behaviour. It runs with the browser's autoplay policy
+switched off, so the first play from a click is checked by hand. It is not a
+listening-quality benchmark or a claim that Safari, Firefox, mobile devices and
+all bundlers were tested.
 
 ## Licensing
 
@@ -632,14 +696,19 @@ The player places this for you, styled and ready, in every element it is mounted
 in: the React `<AudioPlayer />` root, `ref={player.ref}` from `useAudioPlayer()`,
 or `createAudioPlayer({ element })` / `player.mount(element)` in any framework, so
 you never have to build a credit of your own. The right-click menu is caught on
-the player's element only; the rest of your page keeps its own. The
-[license](./LICENSE.md) is what requires the credit to stay.
+the player's element only, after your own handlers: a handler inside your
+interface that takes the event wins, and so do links, text fields and selected
+text, which keep the browser's menu; Shift + right-click gives the browser's
+menu anywhere in the player, and the page around the player still sees the
+event. The [license](./LICENSE.md) is what requires the credit to stay.
 
 The ⓘ button lives inside the player's element. Mark an element inside your
 interface with `data-rtd-credit` and the button goes there, in your layout.
-Without one it sits over the element's top-right corner (the element is made
-`position: relative` while mounted if it was static), offset by the
-`--rtd-credit-top` and `--rtd-credit-right` custom properties. `<AudioPlayer />`
+Without one it sits over the element's top-right corner, offset by the
+`--rtd-credit-top` and `--rtd-credit-right` custom properties and stacked by
+`--rtd-credit-z` (default 3). For that the element is made `position: relative`
+while mounted if it was static, which moves anything inside it that is
+positioned against an outer box; give such an interface a `data-rtd-credit` slot. `<AudioPlayer />`
 has its own place for it in the heading row. With `infoButton: 'touch'` the
 button shows only where the primary input cannot hover (phones, tablets), and a
 mouse uses right-click alone.

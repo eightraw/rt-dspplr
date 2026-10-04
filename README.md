@@ -18,7 +18,8 @@ with the framework-independent audio engine. TypeScript types are included.
   A and B is up to you: before and after processing, two mixes of a song, or
   the two parts of a separation, with the original in the middle.
 - **React component:** responsive layouts, light/dark themes and keyboard controls.
-- **Custom interfaces:** a headless engine and a framework-independent author menu.
+- **Custom interfaces:** a headless engine, and the timeline, the spectrogram and the
+  author menu without React, for any framework.
 
 Files are decoded into memory in full. DSP controls operate during playback;
 pitch-preserving speed changes require preparing a rendered variant. This is not

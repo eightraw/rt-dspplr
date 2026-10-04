@@ -59,7 +59,7 @@ export interface AudioPlayerProps {
     /** Secondary text next to the title. */
     meta?: ReactNode;
     /** Shown in the waveform area when nothing is loaded. */
-    emptyText?: ReactNode;
+    emptyText?: string;
     /** Makes the title a button. */
     onTitleClick?: () => void;
     /** Shows an "Auto-next" toggle (e.g. "play the next clip when this one ends"). */
@@ -88,13 +88,13 @@ export interface AudioPlayerProps {
     /** Colours and axis of the spectrogram. */
     spectrogram?: SpectrogramOptions;
     /**
-     * 'plain' (default): the mouse wheel over the waveform zooms around the
-     * pointer. 'modifier': only Ctrl/Cmd + wheel zooms, so the page keeps
-     * scrolling. Shift + wheel or a horizontal wheel pans in both modes.
+     * 'modifier' (default): Ctrl/Cmd + wheel over the waveform zooms around the
+     * pointer, the wheel alone scrolls the page. 'plain': the wheel alone zooms.
+     * Shift + wheel or a horizontal wheel pans in both modes.
      */
     wheelZoom?: 'plain' | 'modifier';
     /**
-     * Zoom and pan with the wheel, a pinch, the keys and the overview strip. Default true.
+     * Zoom and pan with the wheel, the keys and the overview strip. Default true.
      * false: the waveform always shows the whole clip and the wheel scrolls the page.
      */
     zoom?: boolean;
@@ -227,7 +227,7 @@ function AudioPlayerCard({
     waveformStyle = 'envelope',
     display = 'waveform',
     spectrogram,
-    wheelZoom = 'plain',
+    wheelZoom = 'modifier',
     zoom = true,
     ruler = true,
     layout = 'auto',
@@ -282,11 +282,6 @@ function AudioPlayerCard({
     }, [state.isPlaying, core, showTime, compact]);
 
     const onUserSeek = useCallback((t: number) => showTime(t, false), [showTime]);
-
-    // A new clip or a restart drops the loop.
-    useEffect(() => {
-        core.setLoop(null);
-    }, [core, state.clipId, state.playRequestId]);
 
     // `ended` -> onEnded
     const onEndedRef = useRef(onEnded);

@@ -11,6 +11,7 @@ export interface RulerTick {
 
 const SUBDIVISIONS = 3;
 
+/** Seconds between labelled ticks: at most about twelve labels across the visible window. */
 export function majorStepFor(visibleSeconds: number): number {
     if (visibleSeconds <= 0.5) return 0.05;
     if (visibleSeconds <= 1) return 0.1;
@@ -19,15 +20,27 @@ export function majorStepFor(visibleSeconds: number): number {
     if (visibleSeconds <= 10) return 1;
     if (visibleSeconds <= 30) return 2;
     if (visibleSeconds <= 60) return 5;
-    return 10;
+    if (visibleSeconds <= 120) return 10;
+    if (visibleSeconds <= 300) return 30;
+    if (visibleSeconds <= 600) return 60;
+    if (visibleSeconds <= 1200) return 120;
+    if (visibleSeconds <= 1800) return 300;
+    if (visibleSeconds <= 3600) return 600;
+    if (visibleSeconds <= 7200) return 900;
+    return 1800;
 }
 
-function label(seconds: number, step: number): string {
+/** "m:ss", with hundredths below a one-second step, and "h:mm:ss" from one hour on. */
+export function formatTick(seconds: number, step: number): string {
     // Work in integer centiseconds so 1.0 s never prints as 0:00.99.
     const centis = Math.round(seconds * 100);
-    const m = Math.floor(centis / 6000);
-    const s = Math.floor(centis / 100) % 60;
-    const base = `${m}:${String(s).padStart(2, '0')}`;
+    const whole = Math.floor(centis / 100);
+    const h = Math.floor(whole / 3600);
+    const m = Math.floor(whole / 60) % 60;
+    const s = whole % 60;
+    const base = h > 0
+        ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+        : `${m}:${String(s).padStart(2, '0')}`;
     return step < 1 ? `${base}.${String(centis % 100).padStart(2, '0')}` : base;
 }
 
@@ -48,7 +61,7 @@ export function computeTicks(duration: number, offset: number, viewSize: number)
         if (t > end) break;
         if (t < start - 1e-9) continue;
         const major = index % SUBDIVISIONS === 0;
-        ticks.push({ left: ((t - start) / visible) * 100, major, label: major ? label(t, step) : '' });
+        ticks.push({ left: ((t - start) / visible) * 100, major, label: major ? formatTick(t, step) : '' });
     }
     return ticks;
 }

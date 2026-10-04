@@ -4,16 +4,21 @@
 //  1. Stretched output has exactly round(N / speed) frames on both paths
 //     (built-in vocoder and Rubber Band), although the raw output buffers are
 //     longer: wrapping a whole `channel.buffer` would add frames.
-//  2. Speed variants are accounted in the shared PCM byte budget.
-//  3. Prewarm puts the selected speed first, a playback request promotes a
+//     The lean (two-pass) vocoder gives the same samples, bit for bit.
+//  2. The vocoder keeps the input's level at every speed, and its output lands
+//     where the input was, scaled by the speed.
+//  3. Speed variants are accounted in the shared PCM byte budget.
+//  4. Prewarm puts the selected speed first, a playback request promotes a
 //     queued prewarm job, and cancelPrewarm() drops queued jobs.
+//  5. A silent worker is replaced by the watchdog; crashes are forgiven once a
+//     job completes.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { RubberBandInterface } from 'rubberband-wasm';
 import { runStretchRequest, type StretchWorkerRequest } from '../src/core/stretch/protocol';
-import { stretchMultichannel, defaultStretchFftSize } from '../src/core/stretch/OfflineStretchCore';
+import { LEAN_AFTER_SECONDS, stretchChannel, stretchMultichannel, defaultStretchFftSize } from '../src/core/stretch/OfflineStretchCore';
 import { processWithRubberBand } from '../src/stretch-rubberband/rubberbandCore';
 import { StretchService, StretchUnavailableError } from '../src/core/stretch/StretchService';
 import { nativeStretcher, type StretchStrategy } from '../src/core/stretch/strategies';
@@ -83,6 +88,125 @@ async function testLengths(): Promise<void> {
     }
 
     results.push(`(vocoder FFT size at 48 kHz = ${defaultStretchFftSize(SAMPLE_RATE)} frames)`);
+}
+
+// The lean vocoder must give the whole-buffer path's samples exactly.
+function testLeanMatchesFast(): void {
+    const frames = Math.round(SAMPLE_RATE * 2.5);
+    const signal = makeSignal(frames);
+    // Clicks and bursts, so the transient detector has onsets to flag.
+    for (let at = 4000; at < frames; at += 21000) {
+        for (let i = 0; i < 300 && at + i < frames; i += 1) signal[at + i] += 0.8 * Math.exp(-i / 60) * (i % 2 ? 1 : -1);
+    }
+    let compared = 0;
+    for (const speed of [0.75, 1.25, 1.5, 2]) {
+        for (const transientSensitivity of [0.5, 0]) {
+            const options = { sampleRate: SAMPLE_RATE, rate: 1 / speed, transientSensitivity };
+            const fast = stretchChannel(signal, { ...options, memory: 'fast' });
+            const lean = stretchChannel(signal, { ...options, memory: 'lean' });
+            assert.equal(lean.length, fast.length, `lean length at ${speed}x`);
+            for (let i = 0; i < fast.length; i += 1) {
+                if (lean[i] !== fast[i]) assert.fail(`lean differs at sample ${i} of ${speed}x (sensitivity ${transientSensitivity}): ${lean[i]} vs ${fast[i]}`);
+            }
+            compared += fast.length;
+        }
+    }
+    results.push(`lean vocoder: ${compared} samples over 4 speeds, with and without transients, identical to the whole-buffer path`);
+
+    // 'auto' switches at LEAN_AFTER_SECONDS. The paths tell themselves apart by their
+    // output: the whole-buffer one hands back a view past its analysis padding, the
+    // lean one an array of exactly the samples.
+    const pick = (seconds: number) => {
+        const out = stretchChannel(makeSignal(Math.round(SAMPLE_RATE * seconds)), { sampleRate: SAMPLE_RATE, rate: 1 / 1.5 });
+        return out.byteOffset === 0 && out.byteLength === out.buffer.byteLength ? 'lean' : 'fast';
+    };
+    assert.equal(pick(LEAN_AFTER_SECONDS - 1), 'fast', 'auto stays fast below the threshold');
+    assert.equal(pick(LEAN_AFTER_SECONDS + 1), 'lean', 'auto goes lean above the threshold');
+    results.push(`auto: ${LEAN_AFTER_SECONDS - 1} s fast, ${LEAN_AFTER_SECONDS + 1} s lean`);
+}
+
+// Level and timing. Coherent material (a tone, a voice-like harmonic stack) keeps
+// its level within half a decibel at every speed; noise loses a few decibels, as
+// it does in any phase vocoder that sums incoherent grains. The output's
+// envelope lands where the input's was, scaled by the speed, within a few
+// milliseconds (it was off by (fftSize/2)(1/speed − 1): about 20 ms at 2x).
+function testLevelAndTiming(): void {
+    const frames = SAMPLE_RATE * 6;
+    const tone = new Float32Array(frames);
+    const voice = new Float32Array(frames);
+    const noise = new Float32Array(frames);
+    let seed = 7;
+    for (let i = 0; i < frames; i += 1) {
+        const t = i / SAMPLE_RATE;
+        tone[i] = 0.3 * Math.sin(2 * Math.PI * 440 * t);
+        // Syllables: a harmonic stack under an envelope with hard edges every 250 ms.
+        const envelope = (Math.floor(t * 4) % 2 === 0 ? 1 : 0.15) * (0.7 + 0.3 * Math.sin(2 * Math.PI * 1.3 * t));
+        voice[i] = 0.2 * envelope * (Math.sin(2 * Math.PI * 140 * t) + 0.6 * Math.sin(2 * Math.PI * 280 * t)
+            + 0.4 * Math.sin(2 * Math.PI * 420 * t) + 0.3 * Math.sin(2 * Math.PI * 700 * t));
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        noise[i] = 0.3 * (seed / 0x7fffffff - 0.5);
+    }
+    const rms = (x: Float32Array, from: number, to: number) => {
+        let sum = 0;
+        for (let i = from; i < to; i += 1) sum += x[i] * x[i];
+        return Math.sqrt(sum / (to - from));
+    };
+    const decibels = (ratio: number) => 20 * Math.log10(ratio);
+    const follow = (x: Float32Array) => {
+        const out = new Float32Array(x.length);
+        const release = Math.exp(-1 / (SAMPLE_RATE * 0.002));
+        let level = 0;
+        for (let i = 0; i < x.length; i += 1) {
+            level = Math.max(Math.abs(x[i]), level * release);
+            out[i] = level;
+        }
+        return out;
+    };
+    const voiceEnvelope = follow(voice);
+    const skip = 2048;
+    const levels: string[] = [];
+    const shifts: string[] = [];
+    for (const speed of [0.5, 0.75, 1.25, 1.5, 2]) {
+        const rate = 1 / speed;
+        for (const [name, signal, tolerance] of [['tone', tone, 0.5], ['voice', voice, 0.5], ['noise', noise, 6]] as const) {
+            const out = stretchChannel(signal, { sampleRate: SAMPLE_RATE, rate });
+            const delta = decibels(rms(out, skip, out.length - skip) / rms(signal, skip, signal.length - skip));
+            assert.ok(Math.abs(delta) <= tolerance, `${name} at ${speed}x: level changed by ${delta.toFixed(2)} dB`);
+            if (name !== 'noise') levels.push(`${name} ${speed}x ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}`);
+        }
+
+        // The stretched envelope against the input's, laid on the output's timeline.
+        const out = stretchChannel(voice, { sampleRate: SAMPLE_RATE, rate });
+        const outEnvelope = follow(out);
+        const reference = new Float32Array(out.length);
+        for (let i = 0; i < out.length; i += 1) {
+            const position = i / rate;
+            const index = Math.floor(position);
+            reference[i] = index + 1 < voiceEnvelope.length
+                ? voiceEnvelope[index] + (voiceEnvelope[index + 1] - voiceEnvelope[index]) * (position - index)
+                : 0;
+        }
+        const from = Math.floor(out.length * 0.2);
+        const to = Math.floor(out.length * 0.8);
+        let bestLag = 0;
+        let best = -Infinity;
+        for (let lag = -2400; lag <= 2400; lag += 4) {
+            let sum = 0;
+            for (let i = from; i < to; i += 3) {
+                const j = i + lag;
+                if (j >= 0 && j < outEnvelope.length) sum += reference[i] * outEnvelope[j];
+            }
+            if (sum > best) {
+                best = sum;
+                bestLag = lag;
+            }
+        }
+        const ms = (bestLag / SAMPLE_RATE) * 1000;
+        assert.ok(Math.abs(ms) <= 5, `voice at ${speed}x: output shifted by ${ms.toFixed(2)} ms`);
+        shifts.push(`${speed}x ${ms >= 0 ? '+' : ''}${ms.toFixed(1)} ms`);
+    }
+    results.push(`vocoder level: ${levels.join(', ')} dB; noise within 6 dB`);
+    results.push(`vocoder timing: ${shifts.join(', ')}`);
 }
 
 // ---- Fakes for StretchService ------------------------------------------------
@@ -223,23 +347,91 @@ async function testBudgetAndScheduling(): Promise<void> {
     await assert.rejects(native.ensureVariant(fakeContext, source, 1.5), StretchUnavailableError);
     results.push('native strategy: ensureVariant rejects with StretchUnavailableError (Track falls back to playbackRate)');
 
-    // Speculative renders may not fill an already source-sized budget; an
-    // explicit playback request is still permitted and can remain uncached.
+    // Speculative renders must fit beside what the cache already holds: with one
+    // variant in the cache, only the headroom left over is spent on another clip's.
+    const held = getAudioCacheStats().usedBytes;
+    const smallest = Math.round(source.length / 2) * 4;
     const limited = fakeStrategy();
     const limitedService = StretchService.forStrategy(limited.strategy);
-    setAudioCacheBudget(sourceBytes);
+    setAudioCacheBudget(held + smallest - 1);
     limitedService.prewarm(fakeContext, source, [1.25, 1.5, 2], 2);
-    assert.equal(limited.worker.posted.length, 0, 'no room for prewarm alongside source');
-    setAudioCacheBudget(0);
-    const uncached = limitedService.ensureVariant(fakeContext, source, 2);
+    assert.equal(limited.worker.posted.length, 0, 'no room for any variant beside what the cache holds');
+    setAudioCacheBudget(held + smallest);
+    limitedService.prewarm(fakeContext, source, [1.25, 1.5, 2], 2);
+    assert.equal(limited.worker.posted.length, 1, 'the one variant that fits beside the cached one is queued');
+    assert.equal(limited.worker.posted[0].speed, 2);
     limited.worker.finish();
-    assert.equal((await uncached).length, source.length / 2);
+    await tick();
+    // An explicit playback request is still permitted at any budget and can remain uncached.
+    setAudioCacheBudget(0);
+    const uncached = limitedService.ensureVariant(fakeContext, source, 1.5);
+    limited.worker.finish();
+    assert.equal((await uncached).length, Math.round(source.length / 1.5));
     assert.equal(getAudioCacheStats().usedBytes, 0, 'explicit oversized render is not cached');
-    results.push('prewarm respects source + variants estimate; zero-budget explicit playback still works');
+    results.push('prewarm fits the budget beside what the cache holds; zero-budget explicit playback still works');
+    clearAudioCache();
+}
+
+// Dead and crashing workers.
+async function testWorkerFailures(): Promise<void> {
+    clearAudioCache();
+    setAudioCacheBudget(150 * 1024 * 1024);
+    const source = new FakeAudioBuffer(1, SAMPLE_RATE * 2, SAMPLE_RATE) as unknown as AudioBuffer;
+    const finishLatest = (worker: FakeWorker) => {
+        worker.posted.splice(0, worker.posted.length - 1);
+        worker.finish();
+    };
+
+    // A worker that never answers: the watchdog fails the job, the slot is free
+    // again and the next job reaches a fresh worker.
+    const timeout = StretchService.jobTimeoutMs;
+    StretchService.jobTimeoutMs = () => 20;
+    const silent = fakeStrategy();
+    const silentService = StretchService.forStrategy(silent.strategy);
+    await assert.rejects(silentService.ensureVariant(fakeContext, source, 1.5), /timed out/);
+    StretchService.jobTimeoutMs = timeout;
+    assert.ok(silentService.available, 'a timed-out worker is replaced');
+    const next = silentService.ensureVariant(fakeContext, source, 2);
+    assert.equal(silent.worker.posted.at(-1)?.speed, 2, 'the slot takes the next job');
+    finishLatest(silent.worker);
+    assert.equal((await next).length, source.length / 2);
+    results.push('watchdog: a silent worker is replaced and its job fails; the next job runs');
+
+    // Crashes retire a slot after three in a row, but a completed job forgives them.
+    const crash = (worker: FakeWorker) => (worker.onerror as (event: unknown) => void)({ message: 'boom', preventDefault() {} });
+    const flaky = fakeStrategy();
+    const flakyService = StretchService.forStrategy(flaky.strategy);
+    for (const speed of [1.25, 1.5, 1.75]) {
+        const job = flakyService.ensureVariant(fakeContext, source, speed);
+        crash(flaky.worker);
+        await assert.rejects(job, /boom/);
+    }
+    assert.ok(flakyService.available, 'three crashes still leave a worker');
+    const recovered = flakyService.ensureVariant(fakeContext, source, 2);
+    finishLatest(flaky.worker);
+    assert.equal((await recovered).length, source.length / 2);
+    const afterSuccess = flakyService.ensureVariant(fakeContext, source, 3);
+    crash(flaky.worker);
+    await assert.rejects(afterSuccess, /boom/);
+    assert.ok(flakyService.available, 'a completed job reset the crash count: the fourth crash does not retire the slot');
+
+    const doomed = fakeStrategy();
+    const doomedService = StretchService.forStrategy(doomed.strategy);
+    for (const speed of [1.25, 1.5, 1.75, 2]) {
+        const job = doomedService.ensureVariant(fakeContext, source, speed);
+        crash(doomed.worker);
+        await assert.rejects(job);
+    }
+    assert.equal(doomedService.available, false, 'four crashes in a row retire the slot');
+    await assert.rejects(doomedService.ensureVariant(fakeContext, source, 1.5), StretchUnavailableError);
+    results.push('crashes: three in a row keep respawning, a success resets the count, four retire the slot');
     clearAudioCache();
 }
 
 await testLengths();
+testLeanMatchesFast();
+testLevelAndTiming();
 await testBudgetAndScheduling();
+await testWorkerFailures();
 console.log(results.map((line) => `  ok  ${line}`).join('\n'));
 console.log('\nstretch tests passed');

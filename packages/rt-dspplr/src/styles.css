@@ -133,11 +133,6 @@
     outline-offset: 2px;
 }
 
-/* Focused by a click on the seek bar: no keyboard ring until a key is pressed. */
-.rtd [data-pointer]:focus-visible {
-    outline: none;
-}
-
 .rtd-sr-only,
 .rtd-sr-input {
     position: absolute;

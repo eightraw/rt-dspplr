@@ -28,7 +28,7 @@ export type SpectrogramData = Omit<SpectrogramResponse, 'type' | 'viewId' | 'req
 export type SpectrogramRequest = Omit<SpectrogramComputeMessage, 'type' | 'viewId' | 'requestId' | 'loadId'>;
 export type SpectralPyramidRequest = Omit<SpectrogramPyramidMessage, 'type' | 'viewId' | 'requestId' | 'loadId'>;
 
-type Answer = SpectrogramResponse | SpectrogramPyramidResponse;
+type Answer = SpectrogramResponse | SpectrogramPyramidResponse | { type: 'failed' };
 
 interface Shared {
     worker: Worker;
@@ -38,6 +38,21 @@ interface Shared {
 let shared: Shared | null = null;
 let workerFailed = false;
 let nextViewId = 1;
+
+/** The shared worker is gone: every view hears so, and no view starts another. */
+function fail(reason: unknown): void {
+    const failed = shared;
+    shared = null;
+    workerFailed = true;
+    console.warn('[SpectrogramAnalyzer] Spectrogram worker failed; spectrogram disabled', reason);
+    if (!failed) return;
+    try {
+        failed.worker.terminate();
+    } catch {
+        // no-op
+    }
+    for (const view of failed.views.values()) view({ type: 'failed' });
+}
 
 function join(viewId: number, onMessage: (message: Answer) => void): Worker | null {
     if (!shared) {
@@ -52,10 +67,15 @@ function join(viewId: number, onMessage: (message: Answer) => void): Worker | nu
             return null;
         }
         const views = new Map<number, (message: Answer) => void>();
-        worker.onmessage = (event: MessageEvent<Answer>) => {
+        worker.onmessage = (event: MessageEvent<Exclude<Answer, { type: 'failed' }>>) => {
             const message = event.data;
             if (message) views.get(message.viewId)?.(message);
         };
+        worker.onerror = (event) => {
+            event.preventDefault?.();
+            fail(event.message || event.error);
+        };
+        worker.onmessageerror = () => fail('message could not be read');
         shared = { worker, views };
     }
     shared.views.set(viewId, onMessage);
@@ -173,6 +193,14 @@ export class SpectrogramAnalyzer {
     }
 
     private _receive(message: Answer): void {
+        if (message.type === 'failed') {
+            // Nothing more will arrive: let go of the worker so the view does not wait.
+            this._worker = null;
+            this._loaded = false;
+            this._busy = false;
+            this._waiting = null;
+            return;
+        }
         if (message.type === 'pyramid') {
             if (message.loadId !== this._loadId || message.requestId !== this._pyramidId) return;
             this._loaded = false;

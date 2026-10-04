@@ -15,6 +15,8 @@ export interface StretchWorkerRequest {
     transientSensitivity: number;
     /** One Float32 PCM ArrayBuffer per channel (transferred). */
     channels: ArrayBuffer[];
+    /** The strategy's own settings (`StretchStrategy.options`), passed through as they are. */
+    options?: Readonly<Record<string, unknown>>;
 }
 
 export interface StretchWorkerResponse {
@@ -40,6 +42,7 @@ export type StretchImplementation = (
     sampleRate: number,
     speed: number,
     transientSensitivity: number,
+    options: Readonly<Record<string, unknown>>,
 ) => Float32Array[] | Promise<Float32Array[]>;
 
 /**
@@ -65,7 +68,7 @@ export async function runStretchRequest(
     implementation: StretchImplementation,
 ): Promise<{ response: StretchWorkerResponse; transfer: ArrayBuffer[] }> {
     const source = request.channels.map((buffer) => new Float32Array(buffer));
-    const stretched = await implementation(source, request.sampleRate, request.speed, request.transientSensitivity);
+    const stretched = await implementation(source, request.sampleRate, request.speed, request.transientSensitivity, request.options ?? {});
     const length = stretched[0]?.length ?? 0;
     const channels = stretched.map(exactChannelBuffer);
     return {

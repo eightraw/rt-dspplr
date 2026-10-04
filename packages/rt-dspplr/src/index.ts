@@ -22,6 +22,8 @@ export {
 export {
     DEFAULT_PROCESSING,
     DEFAULT_SPEEDS,
+    SPEED_MIN,
+    SPEED_MAX,
     HIGH_PASS_DEFAULT_HZ,
     HIGH_PASS_MAX_HZ,
     COMPRESSION_DEFAULT,
@@ -50,7 +52,10 @@ export {
     vocoderStretcher,
     nativeStretcher,
     type StretchStrategy,
+    type VocoderStretcher,
+    type VocoderStretcherOptions,
 } from './core/stretch/strategies';
+export type { VocoderMemory } from './core/stretch/OfflineStretchCore';
 export {
     serveStretchWorker,
     type StretchImplementation,
@@ -78,5 +83,11 @@ export {
     type SpectrogramPalette,
     type SpectrogramColorMode,
 } from './core/spectrogram/paint';
+
+export {
+    createTimeline,
+    type TimelineOptions,
+    type TimelineView,
+} from './core/timeline/createTimeline';
 
 export type { LoopRange } from './core/engine/Track';

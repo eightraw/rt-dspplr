@@ -404,7 +404,9 @@ function buildProcessedPyramid(processing: WaveformProcessing): WaveformPeakPyra
     }
 
     finalizeBasePeakArrays(minPeaks, maxPeaks);
-    const rmsPeaks = finalizeRms(rmsSq, channelData.length || 1);
+    // The mix runs over as many channels as the wider stem has; dividing by A's
+    // alone read a mono A with a stereo B 3 dB too loud.
+    const rmsPeaks = finalizeRms(rmsSq, (mixesB ? Math.max(channelData.length, channelDataB.length) : channelData.length) || 1);
 
     // --- Phase 2: Apply dynamics at bin rate ---
     const compAmount = clamp(processing.compression, 0, 1);

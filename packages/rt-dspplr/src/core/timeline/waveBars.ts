@@ -1,4 +1,4 @@
-import { pickPeakPyramidLevel, type WaveformPeakPyramid } from '../core/waveform/pyramid';
+import { pickPeakPyramidLevel, type WaveformPeakPyramid } from '../waveform/pyramid';
 
 // Bar-style waveform: the visible sample range is split into evenly spaced
 // columns, each drawn as a rounded vertical bar mirrored around the centre.

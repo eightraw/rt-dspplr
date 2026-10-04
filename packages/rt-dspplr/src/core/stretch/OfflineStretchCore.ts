@@ -4,9 +4,26 @@
 //
 // Offline, whole-buffer processing: STFT with a periodic Hann window, phase
 // advance per bin from the measured instantaneous frequency, phase reset on
-// spectral-flux transients (keeps onsets crisp), overlap-add with a
-// normalised synthesis window. Pure TypeScript, no dependencies, so it can run
-// in any worker. Quality is below a dedicated library such as Rubber Band.
+// spectral-flux transients (keeps onsets crisp), overlap-add normalised by the
+// window power actually laid down. Pure TypeScript, no dependencies, so it can
+// run in any worker. Quality is below a dedicated library such as Rubber Band.
+
+/**
+ * How the vocoder holds the clip while it works.
+ * - 'fast': every analysis frame in memory at once, about 20x the channel's
+ *   PCM while it runs. Quickest.
+ * - 'lean': two passes over the clip, nothing kept but the input, the output
+ *   and a few FFT-sized buffers. Same samples, bit for bit, somewhat slower.
+ * - 'auto' (default): 'lean' for channels longer than LEAN_AFTER_SECONDS.
+ *
+ * Measured in Node 20, mono 48 kHz at 1.5x: 30 s takes 0.9 s and +147 MB fast,
+ * 1.0 s and +5 MB lean; 10 min takes 19 s and +2.3 GB fast, 20 s and +78 MB lean
+ * (the lean figure is the output itself).
+ */
+export type VocoderMemory = 'auto' | 'fast' | 'lean';
+
+/** Channels longer than this are stretched the lean way under 'auto'. */
+export const LEAN_AFTER_SECONDS = 15;
 
 export interface StretchOptions {
     sampleRate: number;
@@ -14,6 +31,7 @@ export interface StretchOptions {
     transientSensitivity?: number;
     nFft?: number;
     hopLength?: number;
+    memory?: VocoderMemory;
 }
 
 interface HalfSpectrum {
@@ -50,35 +68,36 @@ function periodicHann(size: number): Float64Array {
     return window;
 }
 
-function synthesisWindow(analysisWindow: Float64Array, hopLength: number): Float64Array {
-    const size = analysisWindow.length;
-    const normalizer = new Float64Array(size);
-    const span = Math.ceil(size / hopLength) + 1;
+/**
+ * Where the stretched audio begins in the overlap-added output. Frame k is
+ * analysed at k·hop of the padded input and placed at k·synthesisHop, so the
+ * source sample t (padded position fftSize + t) lands at
+ * t·rate + (fftSize/2)·(1 + rate): the frame centres move with the hop ratio,
+ * the half-frame offset does not. Trimming a plain fftSize instead left the
+ * output early or late by (fftSize/2)·(1 − rate), about 20 ms at 2x.
+ */
+function outputOffset(fftSize: number, rate: number): number {
+    return Math.round((fftSize / 2) * (1 + rate));
+}
 
-    for (let offsetIndex = -span; offsetIndex <= span; offsetIndex += 1) {
-        const start = offsetIndex * hopLength;
-        const visibleStart = Math.max(0, start);
-        const visibleEnd = Math.min(size, start + size);
-        const windowStart = Math.max(0, -start);
-        const width = visibleEnd - visibleStart;
+/**
+ * The overlap-add is divided by the sum of the squared synthesis window laid
+ * down at each output sample, which depends on the synthesis hop. A window
+ * pre-normalised for the analysis hop scaled the output by hop/synthesisHop,
+ * that is by the speed: +6 dB at 2x, −6 dB at 0.5x.
+ */
+function normalise(windowSum: number): number {
+    return windowSum < 1e-8 ? 1 : windowSum;
+}
 
-        if (width <= 0) {
-            continue;
-        }
-
-        for (let sampleIndex = 0; sampleIndex < width; sampleIndex += 1) {
-            const value = analysisWindow[windowStart + sampleIndex];
-            normalizer[visibleStart + sampleIndex] += value * value;
-        }
-    }
-
-    const output = new Float64Array(size);
-    for (let index = 0; index < size; index += 1) {
-        const norm = normalizer[index] < 1e-8 ? 1 : normalizer[index];
-        output[index] = analysisWindow[index] / norm;
-    }
-
-    return output;
+/**
+ * Output position of frame k: its analysis position scaled by the rate, rounded
+ * per frame. A single rounded synthesis hop (hop·rate to the nearest sample)
+ * would make the clip play up to 0.1% slow or fast and drift away from the
+ * position the player computes: 0.6 s over ten minutes at 1.25x.
+ */
+function synthesisStart(frameIndex: number, hopLength: number, rate: number): number {
+    return Math.round(frameIndex * hopLength * rate);
 }
 
 function fftInPlace(real: Float64Array, imag: Float64Array, inverse: boolean): void {
@@ -227,32 +246,37 @@ function detectTransients(frames: HalfSpectrum[], sensitivity: number): Uint8Arr
         flux[frameIndex] = total;
     }
 
-    const windowSize = Math.max(5, Math.floor(count / 20));
-    const threshold = new Float64Array(count);
-    const scale = 1.5 / sensitivity;
+    flagTransientPeaks(flux, sensitivity, flags);
+    return flags;
+}
 
-    for (let frameIndex = 0; frameIndex < count; frameIndex += 1) {
-        const start = Math.max(0, frameIndex - windowSize);
-        const end = Math.min(count, frameIndex + windowSize + 1);
-        let total = 0;
-        for (let index = start; index < end; index += 1) {
-            total += flux[index];
-        }
-        threshold[frameIndex] = ((end - start) > 0 ? total / (end - start) : 0) * scale;
+/**
+ * Flag the frames whose spectral flux is a local peak above the mean flux of
+ * their surroundings (5% of the clip each side). The window means come from one
+ * running total, so the pass is linear in the frame count.
+ */
+function flagTransientPeaks(flux: Float64Array, sensitivity: number, flags: Uint8Array): void {
+    const count = flux.length;
+    const windowSize = Math.max(5, Math.floor(count / 20));
+    const scale = 1.5 / sensitivity;
+    const running = new Float64Array(count + 1);
+    for (let index = 0; index < count; index += 1) {
+        running[index + 1] = running[index] + flux[index];
     }
 
     for (let frameIndex = 1; frameIndex < count - 1; frameIndex += 1) {
+        const start = Math.max(0, frameIndex - windowSize);
+        const end = Math.min(count, frameIndex + windowSize + 1);
+        const threshold = ((running[end] - running[start]) / (end - start)) * scale;
         const value = flux[frameIndex];
         if (
-            value > threshold[frameIndex]
+            value > threshold
             && value >= flux[frameIndex - 1]
             && value >= flux[frameIndex + 1]
         ) {
             flags[frameIndex] = 1;
         }
     }
-
-    return flags;
 }
 
 function wrapPhase(value: number): number {
@@ -263,7 +287,7 @@ function phaseVocoder(
     frames: HalfSpectrum[],
     transientFlags: Uint8Array,
     hopLength: number,
-    synthesisHop: number,
+    rate: number,
     fftSize: number,
 ): HalfSpectrum[] {
     if (frames.length === 0) {
@@ -290,6 +314,9 @@ function phaseVocoder(
         const frame = frames[frameIndex];
         const re = new Float64Array(bins);
         const im = new Float64Array(bins);
+        const advance = frameIndex > 0
+            ? synthesisStart(frameIndex, hopLength, rate) - synthesisStart(frameIndex - 1, hopLength, rate)
+            : 0;
 
         for (let binIndex = 0; binIndex < bins; binIndex += 1) {
             const real = frame.re[binIndex];
@@ -302,7 +329,7 @@ function phaseVocoder(
             } else if (frameIndex > 0) {
                 const delta = wrapPhase(phase - previousPhase[binIndex] - (omega[binIndex] * hopLength));
                 const trueFrequency = omega[binIndex] + (delta / hopLength);
-                phaseAccumulator[binIndex] += trueFrequency * synthesisHop;
+                phaseAccumulator[binIndex] += trueFrequency * advance;
             }
 
             re[binIndex] = magnitude * Math.cos(phaseAccumulator[binIndex]);
@@ -319,23 +346,31 @@ function phaseVocoder(
 function synthesisOverlapAdd(
     frames: HalfSpectrum[],
     fftSize: number,
-    synthesisHop: number,
-    synthesisWin: Float64Array,
+    hopLength: number,
+    rate: number,
+    window: Float64Array,
     minLength: number,
 ): Float32Array {
-    const totalLength = Math.max(minLength, (frames.length * synthesisHop) + fftSize);
+    const totalLength = Math.max(minLength, synthesisStart(frames.length, hopLength, rate) + fftSize);
     const output = new Float64Array(totalLength);
+    const windowSum = new Float64Array(totalLength);
 
     for (let frameIndex = 0; frameIndex < frames.length; frameIndex += 1) {
         const grain = inverseRealFft(frames[frameIndex], fftSize);
-        const start = frameIndex * synthesisHop;
+        const start = synthesisStart(frameIndex, hopLength, rate);
 
         for (let sampleIndex = 0; sampleIndex < fftSize; sampleIndex += 1) {
-            output[start + sampleIndex] += grain[sampleIndex] * synthesisWin[sampleIndex];
+            const weight = window[sampleIndex];
+            output[start + sampleIndex] += grain[sampleIndex] * weight;
+            windowSum[start + sampleIndex] += weight * weight;
         }
     }
 
-    return Float32Array.from(output);
+    const result = new Float32Array(totalLength);
+    for (let index = 0; index < totalLength; index += 1) {
+        result[index] = output[index] / normalise(windowSum[index]);
+    }
+    return result;
 }
 
 function resampleToLength(input: Float32Array, targetLength: number): Float32Array {
@@ -388,10 +423,15 @@ export function stretchChannel(channel: Float32Array, options: StretchOptions): 
     }
 
     const hopLength = options.hopLength ?? (fftSize >> 2);
-    const synthesisHop = Math.max(1, Math.round(hopLength * rate));
     const transientSensitivity = options.transientSensitivity ?? 0.5;
     const analysisWindow = periodicHann(fftSize);
-    const synthesisWin = synthesisWindow(analysisWindow, hopLength);
+    const targetLength = Math.max(1, Math.round(channel.length * rate));
+    const offset = outputOffset(fftSize, rate);
+
+    const memory = options.memory ?? 'auto';
+    if (memory === 'lean' || (memory === 'auto' && channel.length > LEAN_AFTER_SECONDS * options.sampleRate)) {
+        return stretchChannelLean(channel, rate, fftSize, hopLength, transientSensitivity, analysisWindow, targetLength, offset);
+    }
 
     const padding = fftSize;
     const padded = new Float64Array(channel.length + padding + padding + fftSize);
@@ -401,15 +441,156 @@ export function stretchChannel(channel: Float32Array, options: StretchOptions): 
 
     const frames = analysisFrames(padded, fftSize, hopLength, analysisWindow);
     const transients = detectTransients(frames, transientSensitivity);
-    const stretchedFrames = phaseVocoder(frames, transients, hopLength, synthesisHop, fftSize);
+    const stretchedFrames = phaseVocoder(frames, transients, hopLength, rate, fftSize);
 
-    const expectedLength = Math.ceil(channel.length * rate) + fftSize;
-    let output = synthesisOverlapAdd(stretchedFrames, fftSize, synthesisHop, synthesisWin, expectedLength);
-    output = output.subarray(padding);
+    let output = synthesisOverlapAdd(stretchedFrames, fftSize, hopLength, rate, analysisWindow, targetLength + offset);
+    output = output.subarray(offset);
 
-    const targetLength = Math.max(1, Math.round(channel.length * rate));
     const trimmed = output.length > targetLength ? output.subarray(0, targetLength) : output;
     return trimmed.length === targetLength ? trimmed : resampleToLength(trimmed, targetLength);
+}
+
+/**
+ * The same stretch as the whole-buffer path, frame by frame. Pass one keeps only
+ * the spectral flux of each frame, for the transient flags; pass two takes each
+ * frame's spectrum again, advances its phases and overlap-adds the grain into a
+ * ring one FFT long (with the window power beside it), which is emptied into the
+ * output as samples complete. The arithmetic and its order are the whole-buffer
+ * path's, so are the samples.
+ */
+function stretchChannelLean(
+    channel: Float32Array,
+    rate: number,
+    fftSize: number,
+    hopLength: number,
+    transientSensitivity: number,
+    analysisWindow: Float64Array,
+    targetLength: number,
+    offset: number,
+): Float32Array {
+    const padding = fftSize;
+    const paddedLength = channel.length + padding + padding + fftSize;
+    const count = paddedLength >= fftSize ? Math.floor((paddedLength - fftSize) / hopLength) + 1 : 0;
+    const bins = (fftSize >> 1) + 1;
+    const real = new Float64Array(fftSize);
+    const imag = new Float64Array(fftSize);
+
+    // The windowed frame at `position` of the zero-padded input, transformed in place.
+    const spectrumAt = (position: number) => {
+        for (let sampleIndex = 0; sampleIndex < fftSize; sampleIndex += 1) {
+            const source = position + sampleIndex - padding;
+            const sample = source >= 0 && source < channel.length ? channel[source] : 0;
+            real[sampleIndex] = sample * analysisWindow[sampleIndex];
+        }
+        imag.fill(0);
+        fftInPlace(real, imag, false);
+    };
+
+    // Pass one: transients, from the flux between neighbouring frames.
+    const flags = new Uint8Array(count);
+    if (count >= 2 && transientSensitivity > 0) {
+        const flux = new Float64Array(count);
+        let previous = new Float64Array(bins);
+        let current = new Float64Array(bins);
+        for (let frameIndex = 0; frameIndex < count; frameIndex += 1) {
+            spectrumAt(frameIndex * hopLength);
+            for (let binIndex = 0; binIndex < bins; binIndex += 1) {
+                current[binIndex] = (real[binIndex] * real[binIndex]) + (imag[binIndex] * imag[binIndex]);
+            }
+            if (frameIndex > 0) {
+                let total = 0;
+                for (let binIndex = 0; binIndex < bins; binIndex += 1) {
+                    const delta = current[binIndex] - previous[binIndex];
+                    if (delta > 0) {
+                        total += delta;
+                    }
+                }
+                flux[frameIndex] = total;
+            }
+            const swap = previous;
+            previous = current;
+            current = swap;
+        }
+
+        flagTransientPeaks(flux, transientSensitivity, flags);
+    }
+
+    // Pass two: phase vocoder and overlap-add.
+    const totalLength = Math.max(targetLength + offset, synthesisStart(count, hopLength, rate) + fftSize);
+    const keptLength = Math.min(totalLength - offset, targetLength);
+    const output = new Float32Array(keptLength);
+    const ring = new Float64Array(fftSize);
+    const windowSum = new Float64Array(fftSize);
+    let flushed = 0;
+    const flushTo = (end: number) => {
+        for (; flushed < end; flushed += 1) {
+            const slot = flushed % fftSize;
+            const kept = flushed - offset;
+            if (kept >= 0 && kept < keptLength) output[kept] = ring[slot] / normalise(windowSum[slot]);
+            ring[slot] = 0;
+            windowSum[slot] = 0;
+        }
+    };
+
+    const omega = new Float64Array(bins);
+    for (let binIndex = 0; binIndex < bins; binIndex += 1) {
+        omega[binIndex] = (2 * Math.PI * binIndex) / fftSize;
+    }
+    const previousPhase = new Float64Array(bins);
+    const phaseAccumulator = new Float64Array(bins);
+    const outRe = new Float64Array(bins);
+    const outIm = new Float64Array(bins);
+    let previousStart = 0;
+
+    for (let frameIndex = 0; frameIndex < count; frameIndex += 1) {
+        const start = synthesisStart(frameIndex, hopLength, rate);
+        const advance = start - previousStart;
+        previousStart = start;
+        spectrumAt(frameIndex * hopLength);
+        for (let binIndex = 0; binIndex < bins; binIndex += 1) {
+            const realPart = real[binIndex];
+            const imaginary = imag[binIndex];
+            const magnitude = Math.hypot(realPart, imaginary);
+            const phase = Math.atan2(imaginary, realPart);
+
+            if (frameIndex === 0 || flags[frameIndex]) {
+                phaseAccumulator[binIndex] = phase;
+            } else {
+                const delta = wrapPhase(phase - previousPhase[binIndex] - (omega[binIndex] * hopLength));
+                const trueFrequency = omega[binIndex] + (delta / hopLength);
+                phaseAccumulator[binIndex] += trueFrequency * advance;
+            }
+
+            outRe[binIndex] = magnitude * Math.cos(phaseAccumulator[binIndex]);
+            outIm[binIndex] = magnitude * Math.sin(phaseAccumulator[binIndex]);
+            previousPhase[binIndex] = phase;
+        }
+
+        // Inverse transform of the half spectrum, mirrored, into the same scratch arrays.
+        real.fill(0);
+        imag.fill(0);
+        for (let index = 0; index < bins; index += 1) {
+            real[index] = outRe[index];
+            imag[index] = outIm[index];
+        }
+        for (let index = 1; index < bins - 1; index += 1) {
+            const mirrorIndex = fftSize - index;
+            real[mirrorIndex] = outRe[index];
+            imag[mirrorIndex] = -outIm[index];
+        }
+        fftInPlace(real, imag, true);
+
+        flushTo(start);
+        for (let sampleIndex = 0; sampleIndex < fftSize; sampleIndex += 1) {
+            const weight = analysisWindow[sampleIndex];
+            const slot = (start + sampleIndex) % fftSize;
+            ring[slot] += real[sampleIndex] * weight;
+            windowSum[slot] += weight * weight;
+        }
+    }
+    flushTo(totalLength);
+
+    return keptLength === targetLength ? output : resampleToLength(output, targetLength);
 }
 
 export function stretchMultichannel(
