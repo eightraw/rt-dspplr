@@ -8,6 +8,7 @@ export {
     type ClipInfo,
     type ClipInput,
     type ClipSource,
+    type ManifestClip,
     type LoaderB,
     type StatusB,
     type LoadOptions,
@@ -133,3 +134,36 @@ export { SpectrogramAnalyzer, type SpectrogramData, type SpectrogramRequest } fr
 export { paintSpectrogram, type SpectrogramLook } from './core/spectrogram/paint';
 export { sampleSpectralPyramid } from './core/spectrogram/sample';
 export type { SpectralPyramid, SpectralLevel } from './core/spectrogram/protocol';
+
+// Prepared long recordings (`play({ manifest })`), as in the main entry. The
+// formats are in `@saitdigital/rt-dspplr/format`; the playback internals
+// (segment store, scheduler, stream engine) are not part of the public API.
+export type { SourceKind, SourceCapabilities, StemSummary } from './core/sources/types';
+export type { PreparedOverview, WindowAudio, StreamStats, SegmentedOptions } from './core/sources/SegmentedSource';
+export type {
+    AudioManifest,
+    ManifestSegment,
+    ManifestPeakLevel,
+    ManifestLoudness,
+    ManifestStem,
+    ManifestStems,
+} from './core/stream/manifest';
+export type { TimelinePlayer } from './core/timeline/TimelineCore';
+
+// DSP plugins, as in the main entry. EXPERIMENTAL: may change in minor releases before 1.0.
+export {
+    validateParam,
+    resolveParams,
+    paramToUnit,
+    unitToParam,
+    type DspPlugin,
+    type PluginParam,
+    type PluginParams,
+    type PluginInstance,
+    type PluginRealtime,
+    type PluginPreview,
+    type PluginPreviewProcess,
+    type EffectState,
+    type PreviewCoverage,
+} from './core/effects/types';
+export { highPassPlugin, dynamicsPlugin } from './core/effects/builtins';

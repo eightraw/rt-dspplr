@@ -1,0 +1,248 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/eightraw/rt-dspplr/blob/main/packages/rt-dspplr/schema/manifest.schema.json",
+  "title": "RT-DSPPLR prepared-audio manifest",
+  "description": "manifest.json of a prepared recording (formatVersion 1-3). Normative text: docs/manifest.md. Unknown properties are allowed and ignored by players.",
+  "type": "object",
+  "required": [
+    "format",
+    "formatVersion",
+    "analyzerVersion",
+    "id",
+    "createdAt",
+    "duration",
+    "sampleRate",
+    "sourceSampleRate",
+    "channels",
+    "frames",
+    "source",
+    "resample",
+    "segments",
+    "peaks",
+    "loudness"
+  ],
+  "properties": {
+    "format": { "const": "rtd-audio-manifest" },
+    "formatVersion": { "type": "integer", "minimum": 1, "maximum": 3 },
+    "analyzerVersion": { "type": "string" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "id": { "type": "string", "description": "sha256:<hex> of the source file's bytes" },
+    "createdAt": { "type": "string" },
+    "duration": { "type": "number", "minimum": 0, "description": "seconds: frames / sampleRate" },
+    "sampleRate": { "$ref": "#/$defs/positiveInteger", "description": "Hz, of segments, peaks and analyses" },
+    "sourceSampleRate": { "$ref": "#/$defs/positiveInteger" },
+    "channels": { "$ref": "#/$defs/positiveInteger" },
+    "frames": { "$ref": "#/$defs/count" },
+    "source": {
+      "type": "object",
+      "required": ["name", "bytes", "encoding", "bitsPerSample", "frames"],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "bytes": { "$ref": "#/$defs/count" },
+        "encoding": { "type": "string" },
+        "bitsPerSample": { "$ref": "#/$defs/positiveInteger" },
+        "frames": { "$ref": "#/$defs/count" }
+      }
+    },
+    "resample": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["from", "to"],
+          "properties": {
+            "from": { "$ref": "#/$defs/positiveInteger" },
+            "to": { "$ref": "#/$defs/positiveInteger" },
+            "method": { "type": "string" },
+            "passbandHz": { "type": "number" },
+            "stopbandHz": { "type": "number" },
+            "stopbandDb": { "type": "number" }
+          }
+        }
+      ]
+    },
+    "segments": { "$ref": "#/$defs/segments" },
+    "peaks": { "$ref": "#/$defs/peaks" },
+    "loudness": { "$ref": "#/$defs/loudness" },
+    "bands": { "$ref": "#/$defs/bands" },
+    "spectrogram": { "$ref": "#/$defs/spectrogram" },
+    "stems": {
+      "type": "object",
+      "description": "v3: named stems on the source's grid. Keys are opaque, host-chosen ids; 'b' is the default key.",
+      "propertyNames": { "$ref": "#/$defs/stemKey" },
+      "additionalProperties": { "$ref": "#/$defs/stem" }
+    }
+  },
+  "$defs": {
+    "count": { "type": "integer", "minimum": 0 },
+    "positiveInteger": { "type": "integer", "minimum": 1 },
+    "stemKey": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+      "not": { "enum": ["a", "A"] },
+      "description": "1-32 of [A-Za-z0-9_-], starting with a letter or digit; 'a' is reserved for the source. Keys must not collide case-insensitively (not expressible here; checked by assertManifest)."
+    },
+    "segment": {
+      "type": "object",
+      "required": ["index", "startFrame", "frames", "url", "bytes"],
+      "properties": {
+        "index": { "$ref": "#/$defs/count" },
+        "startFrame": { "$ref": "#/$defs/count" },
+        "frames": { "$ref": "#/$defs/count" },
+        "url": { "type": "string", "description": "relative to the manifest's URL" },
+        "bytes": { "$ref": "#/$defs/count" },
+        "sha256": { "type": "string" }
+      }
+    },
+    "segments": {
+      "type": "object",
+      "required": ["codec", "framesPerSegment", "list"],
+      "properties": {
+        "codec": { "const": "wav-pcm16" },
+        "framesPerSegment": { "$ref": "#/$defs/positiveInteger" },
+        "list": { "type": "array", "items": { "$ref": "#/$defs/segment" } }
+      }
+    },
+    "peaks": {
+      "type": "object",
+      "required": ["url", "bytes", "format", "version", "levels"],
+      "properties": {
+        "url": { "type": "string" },
+        "bytes": { "$ref": "#/$defs/count" },
+        "format": { "const": "rtd-peaks" },
+        "version": { "$ref": "#/$defs/positiveInteger" },
+        "encoding": { "const": "int16-min-max-rms" },
+        "levels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["framesPerPeak", "peaks", "byteOffset", "byteLength"],
+            "properties": {
+              "framesPerPeak": { "$ref": "#/$defs/positiveInteger" },
+              "peaks": { "$ref": "#/$defs/count" },
+              "byteOffset": { "$ref": "#/$defs/count" },
+              "byteLength": { "$ref": "#/$defs/count" }
+            }
+          }
+        }
+      }
+    },
+    "loudness": {
+      "type": "object",
+      "required": ["peak", "peakDb", "rmsDb", "gatedRmsDb", "perChannel"],
+      "properties": {
+        "peak": { "type": "number" },
+        "peakDb": { "type": "number" },
+        "rmsDb": { "type": "number" },
+        "gatedRmsDb": { "type": "number" },
+        "perChannel": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": { "peakDb": { "type": "number" }, "rmsDb": { "type": "number" } }
+          }
+        }
+      }
+    },
+    "bands": {
+      "type": "object",
+      "required": ["url", "bytes", "format", "version"],
+      "properties": {
+        "url": { "type": "string" },
+        "bytes": { "$ref": "#/$defs/count" },
+        "format": { "const": "rtd-bands" },
+        "version": { "$ref": "#/$defs/positiveInteger" },
+        "framesPerBin": { "$ref": "#/$defs/positiveInteger" },
+        "bins": { "$ref": "#/$defs/count" },
+        "cutoffsHz": { "type": "array", "items": { "type": "number" } }
+      }
+    },
+    "spectrogram": {
+      "type": "object",
+      "required": ["url", "bytes", "format", "version"],
+      "properties": {
+        "url": { "type": "string" },
+        "bytes": { "$ref": "#/$defs/count" },
+        "format": { "const": "rtd-spectrogram" },
+        "version": { "$ref": "#/$defs/positiveInteger" },
+        "rows": { "$ref": "#/$defs/positiveInteger" },
+        "minHz": { "type": "number" },
+        "maxHz": { "type": "number" },
+        "topDb": { "type": "number" },
+        "rangeDb": { "type": "number" },
+        "levels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "framesPerColumn": { "$ref": "#/$defs/positiveInteger" },
+              "columns": { "$ref": "#/$defs/count" },
+              "byteOffset": { "$ref": "#/$defs/count" },
+              "byteLength": { "$ref": "#/$defs/count" }
+            }
+          }
+        }
+      }
+    },
+    "stem": {
+      "type": "object",
+      "required": ["status", "updatedAt"],
+      "properties": {
+        "status": { "enum": ["processing", "ready", "failed"] },
+        "label": { "type": "string", "minLength": 1, "maxLength": 120, "description": "human name for interfaces; never interpreted" },
+        "error": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "aSourceId": { "type": "string" },
+        "processor": {
+          "type": "object",
+          "required": ["id", "version"],
+          "properties": {
+            "id": { "type": "string" },
+            "version": { "type": "string" },
+            "params": { "type": "object" },
+            "durationMs": { "type": "number" }
+          }
+        },
+        "id": { "type": "string" },
+        "source": {
+          "type": "object",
+          "properties": {
+            "name": { "type": ["string", "null"] },
+            "bytes": { "$ref": "#/$defs/count" },
+            "sampleRate": { "$ref": "#/$defs/positiveInteger" },
+            "channels": { "$ref": "#/$defs/positiveInteger" },
+            "frames": { "$ref": "#/$defs/count" },
+            "bandwidthHz": { "type": "number" }
+          }
+        },
+        "alignment": {
+          "type": "object",
+          "properties": {
+            "offsetFrames": { "type": "integer" },
+            "offsetMs": { "type": "number" },
+            "confidence": { "type": "number" },
+            "windows": { "$ref": "#/$defs/count" },
+            "agreeing": { "$ref": "#/$defs/count" }
+          }
+        },
+        "correlation": {
+          "type": "object",
+          "properties": {
+            "global": { "type": "number" },
+            "perSegment": { "type": "array", "items": { "type": "number" } }
+          }
+        },
+        "mixLaw": { "enum": ["crossfade", "equal-power"] },
+        "loudnessDeltaDb": { "type": "number" },
+        "gainDb": { "type": "number" },
+        "loudness": { "$ref": "#/$defs/loudness" },
+        "segments": { "$ref": "#/$defs/segments" },
+        "peaks": { "$ref": "#/$defs/peaks" },
+        "bands": { "$ref": "#/$defs/bands" },
+        "spectrogram": { "$ref": "#/$defs/spectrogram" }
+      },
+      "if": { "properties": { "status": { "const": "ready" } } },
+      "then": { "required": ["segments", "peaks"] }
+    }
+  }
+}

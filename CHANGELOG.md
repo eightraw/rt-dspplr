@@ -1,6 +1,130 @@
 # Changelog
 
-## 0.3.0
+Two packages are released from this repository: `@saitdigital/rt-dspplr` (the
+player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0).
+
+## @saitdigital/rt-dspplr 0.4.0
+
+### Long recordings (prepared files)
+
+- `play({ manifest })` (or a URL ending in `.json`) plays a recording prepared with
+  `@saitdigital/rt-dspplr-prepare` segment by segment, on the same player core as
+  whole clips: one `createAudioPlayer()`, one state, the same React card,
+  `<Timeline>` and `createTimeline()`. Switching between a whole clip and a
+  prepared one on one player stops and unloads the other source.
+- The manifest, the peaks and the coarse spectrogram (a few hundred KB to about
+  1.5 MB) make the timeline, ruler, zoom, pan, waveform, DSP preview and
+  spectrogram usable over the whole duration at once. Audio is fetched around the
+  playhead; decoded audio stays near 60 s (`segmented.cacheSeconds`). A 60-minute
+  file: UI and first audio in about 130 ms locally, 360 MB of browser memory
+  (whole-file mode: 3.9 s and 2.8 GB).
+- Playback runs in an AudioWorklet stream engine: sample-exact across segments and
+  loop wraps, a held playhead on underruns (silence, then the same sample), smoothed
+  volume and A/B mix. Speed keeps the pitch through a realtime stretcher
+  (Signalsmith Stretch, MIT, a lazy chunk of about 100 KB, 44 KB gzipped) when the manifest rate equals the
+  context rate; otherwise pitch follows speed and the card says so. The
+  AudioBufferSourceNode scheduler remains the fallback (`segmented: { engine: false }`).
+- The waveform previews the DSP everywhere: approximated in the overview from the
+  stored peaks and bands, exact in a decoded window for views up to 20 s. The
+  spectrogram draws the stored overview and refines from decoded segments when
+  zoomed in. Both apply the high-pass, the dynamics and plugins at paint time.
+- `state.sourceKind`, `state.capabilities` (`canPreservePitch`, `canMixStemB`,
+  `stems`, `exactWaveformPreview`, `spectrogram`, `loopSnapping`),
+  `state.manifest`, `state.stem`, `state.prepared`, `state.buffering`; the
+  `sourceupdate` event; `getManifest()`, `getPeakPyramid()`, `getStreamStats()`,
+  `setView()` (the timeline calls it), `getWindowAudio()`, `refreshManifest()`.
+- **Named stems.** A manifest's `stems` is a map of host-chosen keys (1–32 of
+  `[A-Za-z0-9_-]`, `a` reserved, `b` the default) to time-aligned derivatives of
+  the recording, each with an optional `label`. The knob blends A with one stem at a
+  time: `play({ manifest, stem })`, `player.setStem(key)`; `capabilities.stems`
+  lists the ready ones (`{ key, label }`). The card shows a stem selector
+  (`label ?? key`) only when there is more than one. A stem's segments are fetched
+  only while the knob is above 0 and let go about 10 s after it is back at 0.
+  Manifests with only `stems.b` play as before. The library never interprets keys
+  or labels.
+- Stems are read as published: no polling unless `segmented.pollStemsMs` is set;
+  `refreshManifest()` applies a newer `revision`.
+- `player.setVolume(linear)` and `state.volume`: a fader after the effects, smoothed.
+
+### File formats, manifest specification and schema
+
+- New entry `@saitdigital/rt-dspplr/format`: the manifest types, `assertManifest()`,
+  `manifestProblem()`, the stem key rules (`STEM_KEY_PATTERN`, `isStemKey`,
+  `assertStemKey`, `DEFAULT_STEM_KEY`), and the readers and writers of peaks.bin,
+  bands.bin, spectrogram.bin and the WAV segments. Pure code (no DOM, no Node APIs),
+  in a chunk of its own; the prepare package imports it instead of carrying a copy.
+  The analysis kernels shared with prepare (`frameRows`, `planBands`, `quantizeRows`,
+  `computeHighPassCoefficients`) are exported there as experimental.
+- `docs/manifest.md` specifies the manifest (fields, types, units, versions 1–3) and
+  the compatibility policy: a player reads every `formatVersion` up to its own,
+  ignores unknown optional fields, and refuses an unknown major version.
+- The JSON Schema (draft 2020-12) ships as `@saitdigital/rt-dspplr/manifest.schema.json`.
+  `assertManifest()` now checks the same rules (it used to check only a few fields);
+  a test keeps the two in agreement on fixtures, on prepared folders and on 50 broken
+  manifests.
+
+### DSP plugins (experimental)
+
+- Every effect is a plugin in one chain per player, the built-ins included
+  (`rtd.highpass`, `rtd.dynamics`): `player.effects.add / remove / move / bypass /
+  setParam`, a parameter schema the card's Post FX panel renders, `nodes` or
+  `worklet` realtime processing, `magnitudeResponse()` / `process()` previews in the
+  waveform and the spectrogram, `state.previewCoverage`, crash isolation
+  (`effecterror`). Chain order: source (A/B mix → stretch) → effects → volume →
+  analyser. Example: `examples/plugins/three-band-eq.js`.
+- **The plugin API is experimental** (`@experimental` in the types) and may change
+  in minor releases before 1.0.
+
+### Changed
+
+- `./advanced` keeps the 0.3.0 surface (Track, Mixer, AudioEngine, BufferLoader,
+  StretchService, WaveformAnalyzer, TimelineCore / mountTimeline, peak-pyramid and
+  spectrogram helpers, DSP building blocks) and adds the types and plugin API of the
+  main entry. The new streaming machinery stays internal; the file formats are in
+  `./format`.
+- The package contains no Node-only code (checked at build time). Preparing long
+  recordings is a separate package, `@saitdigital/rt-dspplr-prepare`.
+- Play and resume no longer reset the timeline's zoom and pan; only another clip does.
+- `THIRD_PARTY_NOTICES.md` ships in the package with the Signalsmith Stretch MIT
+  notice (also embedded in its chunk); the build checks both.
+
+## @saitdigital/rt-dspplr-prepare 0.1.0
+
+First release: the prepare step for long recordings. Node ≥ 20.19, ESM.
+
+- `prepareAudio(input, options)` and the `rtd-prepare` CLI read a recording once,
+  as a stream (a path, a ReadableStream or an async iterable), and write
+  fixed-length 16-bit WAV segments (sample-exact), multi-level peaks, loudness,
+  bands.bin (high-pass preview energies) and spectrogram.bin (overview), and the
+  manifest last, atomically. Rates above 48 kHz are resampled by default.
+- Analyses run on a `worker_threads` pool (`concurrency`, default cores − 1); the
+  output is byte-identical for any thread count. 60 min mono in about 4 s on 11
+  threads, about 0.5 GB peak RSS (`concurrency: 4`: under 300 MB).
+- **Named stems** in the same call and the same manifest:
+  `stems: { [key]: { input | processor, label? } }`. Each stem is aligned to A by
+  FFT cross-correlation (offset compensated, confidence recorded), downmixed,
+  resampled on the pool (bit-identical to the streaming resampler), written on A's
+  grid under `<key>/` with its own overview files, and paired with A (correlation,
+  mix law, loudness delta as information only, opt-in `gainDb`). Keys are
+  validated (pattern, `a` reserved, case-insensitive collisions). A stem that does
+  not line up fails the job, or with `onLowConfidence: 'warn'` is recorded as
+  failed; the message explains that output which changes timing is not a stem and
+  belongs in a clip of its own. CLI: `--stem <key>=<file>`, `--label <key>=<text>`.
+- **Stem processors (experimental)**: `commandProcessor`, `dockerProcessor`
+  (network none by default), `httpProcessor` (streamed raw or multipart),
+  `functionProcessor`; they run beside A's own work, with timeouts, cancellation,
+  errors that name the processor, `onProcessorError: 'skip'`, and provenance in the
+  manifest. The API may change in minor releases before 1.0.
+- `attachStem(target, key, input, { label })` adds or replaces a stem on a prepared
+  folder (same code, same bytes, `revision + 1`); `markStem()` for hosts that
+  publish before a stem exists.
+- Storage: `outDir`, or any `{ putObject, getObject? }`; `memoryStorage()`.
+- Progress `stage: 'a' | 'processor' | 'stem'` with the stem key;
+  `job.stats.timings.stems[key]`.
+- The formats come from `@saitdigital/rt-dspplr/format` (a dependency, `^0.4.0`):
+  one implementation for the writer and the reader.
+
+## @saitdigital/rt-dspplr 0.3.0
 
 - The wheel zooms in proportion to its travel, and the event is taken from the
   page only when the zoom changes: at the whole clip, scrolling down scrolls the
@@ -52,6 +176,6 @@
   `<AudioPlayer />` keeps it in its heading row, and in the compact row.
 - No layout-effect warnings from the scrubber during server rendering.
 
-## 0.2.0
+## @saitdigital/rt-dspplr 0.2.0
 
 - First release.

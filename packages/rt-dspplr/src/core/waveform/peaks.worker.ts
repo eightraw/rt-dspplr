@@ -10,13 +10,14 @@ import {
     type WaveformPeakPyramid,
 } from './pyramid';
 import { LIMITER_CEILING_DB, mixGains } from '../controls';
-import {
-    dbToGain,
-    gainToDb,
-    computeCompressorParams,
-    computeCompressorTimeConstants,
-    computeGainReductionDb,
-} from '../dsp/compression';
+import { dbToGain } from '../dsp/compression';
+import { applyDynamicsAtBinRate } from './dynamicsPreview';
+import { downsampleGains, type GainTrack } from './gainTrack';
+import { createStageRunner } from './previewStages';
+import type { PreviewStage } from '../effects/preview';
+
+/** The gain track is kept per 256 frames (8 bins): enough for any spectrogram column. */
+const GAIN_FACTOR = 8;
 import {
     HIGH_PASS_SECTION_Q,
     clampHighPassHz,
@@ -47,12 +48,14 @@ type BufferReadyResponse = {
     requestId: number;
     sourcePyramid: WaveformPeakPyramid;
     processedPyramid: WaveformPeakPyramid;
+    gain: GainTrack | null;
 };
 
 type ProcessedReadyResponse = {
     type: 'processedReady';
     requestId: number;
     pyramid: WaveformPeakPyramid;
+    gain: GainTrack | null;
 };
 
 type WorkerResponse = BufferReadyResponse | ProcessedReadyResponse;
@@ -280,74 +283,6 @@ function getChannelSample(channels: Float32Array[], channelIndex: number, sample
 // Phase 2 — apply dynamics (comp + gain + limiter) at BIN RATE
 // ---------------------------------------------------------------------------
 
-function applyDynamicsAtBinRate(
-    minPeaks: Float32Array,
-    maxPeaks: Float32Array,
-    rmsPeaks: Float32Array,
-    compAmount: number,
-    outputGain: number,
-    ceilingGain: number,
-): void {
-    const binCount = minPeaks.length;
-
-    if (compAmount <= 0 && outputGain === 1) {
-        for (let i = 0; i < binCount; i += 1) {
-            if (maxPeaks[i] > ceilingGain) { maxPeaks[i] = ceilingGain; }
-            if (minPeaks[i] < -ceilingGain) { minPeaks[i] = -ceilingGain; }
-            if (rmsPeaks[i] > ceilingGain) { rmsPeaks[i] = ceilingGain; }
-        }
-        return;
-    }
-
-    const binRate = currentSampleRate / BASE_BIN_SIZE;
-    const tc = computeCompressorTimeConstants(binRate);
-    const params = computeCompressorParams(compAmount);
-
-    let detectorEnvelope = 0;
-    let appliedGain = 1;
-
-    for (let i = 0; i < binCount; i += 1) {
-        const absPeak = Math.max(
-            minPeaks[i] < 0 ? -minPeaks[i] : minPeaks[i],
-            maxPeaks[i] < 0 ? -maxPeaks[i] : maxPeaks[i],
-        );
-
-        // Envelope follower
-        if (absPeak > detectorEnvelope) {
-            detectorEnvelope = detectorEnvelope * tc.envAttack + absPeak * (1 - tc.envAttack);
-        } else {
-            detectorEnvelope = detectorEnvelope * tc.envRelease + absPeak * (1 - tc.envRelease);
-        }
-
-        // Compute gain reduction (downward only)
-        let targetGain = 1;
-        if (compAmount > 0) {
-            const envDb = gainToDb(detectorEnvelope);
-            const reductionDb = computeGainReductionDb(envDb, params);
-            targetGain = dbToGain(reductionDb);
-        }
-
-        // Smooth gain changes
-        if (targetGain < appliedGain) {
-            appliedGain = targetGain + (appliedGain - targetGain) * tc.gainAttack;
-        } else {
-            appliedGain = targetGain + (appliedGain - targetGain) * tc.gainRelease;
-        }
-
-        // Apply compression + output gain, then clamp to ceiling
-        const totalGain = appliedGain * outputGain;
-        let lo = minPeaks[i] * totalGain;
-        let hi = maxPeaks[i] * totalGain;
-        let rms = rmsPeaks[i] * totalGain;
-        if (hi > ceilingGain) { hi = ceilingGain; }
-        if (lo < -ceilingGain) { lo = -ceilingGain; }
-        if (rms > ceilingGain) { rms = ceilingGain; }
-        minPeaks[i] = lo;
-        maxPeaks[i] = hi;
-        rmsPeaks[i] = rms;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Public pyramid builders
 // ---------------------------------------------------------------------------
@@ -366,7 +301,49 @@ function buildSourcePyramid(): WaveformPeakPyramid {
     return buildPeakPyramid(minPeaks, maxPeaks, rmsPeaks, BASE_BIN_SIZE, currentLength);
 }
 
+/** The dynamics gain of the last processed pyramid, per 256 frames (see gainTrack.ts). */
+let lastGain: GainTrack | null = null;
+
+/** Peaks through the preview stages, chunk by chunk (no copy of the whole clip). */
+function computeStagedPeaks(
+    minPeaks: Float32Array,
+    maxPeaks: Float32Array,
+    rmsSq: Float32Array,
+    stages: PreviewStage[],
+    gainA: number,
+    gainB: number,
+): Float32Array | null {
+    const channelCount = Math.max(channelData.length, gainB !== 0 ? channelDataB.length : 0) || 1;
+    const runner = createStageRunner(stages, channelCount, currentLength, BASE_BIN_SIZE * GAIN_FACTOR);
+    const CHUNK = 32768;
+    const chunk = Array.from({ length: channelCount }, () => new Float32Array(CHUNK));
+    for (let from = 0; from < currentLength; from += CHUNK) {
+        const n = Math.min(CHUNK, currentLength - from);
+        const view = chunk.map((c) => c.subarray(0, n));
+        for (let ch = 0; ch < channelCount; ch += 1) {
+            const out = view[ch];
+            for (let i = 0; i < n; i += 1) {
+                const a = getChannelSample(channelData, ch, from + i);
+                out[i] = gainB !== 0 ? a * gainA + getChannelSample(channelDataB, ch, from + i) * gainB : a * gainA;
+            }
+        }
+        runner.run(view, currentSampleRate);
+        for (let ch = 0; ch < channelCount; ch += 1) {
+            const x = view[ch];
+            for (let i = 0; i < n; i += 1) {
+                const y = x[i];
+                const bin = ((from + i) / BASE_BIN_SIZE) | 0;
+                if (y < minPeaks[bin]) minPeaks[bin] = y;
+                if (y > maxPeaks[bin]) maxPeaks[bin] = y;
+                rmsSq[bin] += y * y;
+            }
+        }
+    }
+    return runner.levelRatio;
+}
+
 function buildProcessedPyramid(processing: WaveformProcessing): WaveformPeakPyramid {
+    lastGain = null;
     const { minPeaks, maxPeaks, rmsSq } = createBasePeakArrays();
 
     if (channelData.length === 0 || currentSampleRate <= 0 || currentLength <= 0) {
@@ -381,7 +358,11 @@ function buildProcessedPyramid(processing: WaveformProcessing): WaveformPeakPyra
     const [gainA, gainB] = mixGains(processing.mix ?? 0, processing.mixLaw);
     const mixesB = channelDataB.length > 0 && (gainA !== 1 || gainB !== 0);
 
-    if (hpEnabled) {
+    let levelRatio: Float32Array | null = null;
+    if (processing.stages && processing.stages.length > 0) {
+        // Plugins with a process() preview: every sample-level stage in chain order.
+        levelRatio = computeStagedPeaks(minPeaks, maxPeaks, rmsSq, processing.stages, mixesB ? gainA : 1, mixesB ? gainB : 0);
+    } else if (hpEnabled) {
         if (mixesB) {
             computeMixedHighPassFilteredPeaks(minPeaks, maxPeaks, rmsSq, processing.highPassHz, gainA, gainB);
         } else {
@@ -413,7 +394,12 @@ function buildProcessedPyramid(processing: WaveformProcessing): WaveformPeakPyra
     const outGain = Math.max(0, processing.outputGain);
     const ceilingGain = dbToGain(LIMITER_CEILING_DB);
 
-    applyDynamicsAtBinRate(minPeaks, maxPeaks, rmsPeaks, compAmount, outGain, ceilingGain);
+    const gains = new Float32Array(rmsPeaks.length);
+    applyDynamicsAtBinRate(minPeaks, maxPeaks, rmsPeaks, compAmount, outGain, ceilingGain, currentSampleRate / BASE_BIN_SIZE, undefined, gains);
+    const gainValues = downsampleGains(gains, GAIN_FACTOR);
+    // The measured level change of plugins without a magnitude response joins the column gain.
+    if (levelRatio) for (let i = 0; i < gainValues.length; i += 1) gainValues[i] *= levelRatio[i] ?? 1;
+    lastGain = { binSize: BASE_BIN_SIZE * GAIN_FACTOR, startFrame: 0, values: gainValues, outputGain: outGain };
     finalizeBasePeakArrays(minPeaks, maxPeaks);
 
     return buildPeakPyramid(minPeaks, maxPeaks, rmsPeaks, BASE_BIN_SIZE, currentLength);
@@ -450,6 +436,7 @@ workerScope.onmessage = (event: MessageEvent<WorkerMessage>) => {
             requestId: message.requestId,
             sourcePyramid,
             processedPyramid,
+            gain: lastGain,
         };
         const transfers = [
             ...collectTransfers(sourcePyramid.levels),
@@ -465,6 +452,7 @@ workerScope.onmessage = (event: MessageEvent<WorkerMessage>) => {
             type: 'processedReady',
             requestId: message.requestId,
             pyramid,
+            gain: lastGain,
         };
         workerScope.postMessage(response as WorkerResponse, collectTransfers(pyramid.levels));
     }

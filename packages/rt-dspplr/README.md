@@ -8,7 +8,9 @@ Free to use under a one-page [license](./LICENSE.md), see [Licensing](#licensing
 A web audio player with real-time DSP, pitch-preserving speed controls,
 looping and an interactive waveform. Available as a headless engine and a
 ready React component. Audio files are decoded in full; memory use scales
-with their length.
+with their length. Long recordings can instead be prepared once on the server
+and played segment by segment with `play({ manifest })`, see
+[Long recordings](#long-recordings-prepared-files).
 
 - **Pitch-preserving speed** (1.25x, 1.5x, 2x...). Variants are rendered
   off the main thread. Playback continues at the applied speed while a new
@@ -51,6 +53,8 @@ ESM only. TypeScript types included.
 - [API: core](#api-core)
 - [API: React](#api-react)
 - [Two-track mixer](#two-track-mixer)
+- [Long recordings (prepared files)](#long-recordings-prepared-files)
+- [DSP plugins (effects)](#dsp-plugins-effects)
 - [Timeline](#timeline)
 - [Spectrogram](#spectrogram)
 - [Time-stretch strategies](#time-stretch-strategies)
@@ -159,6 +163,9 @@ Construction is free. No AudioContext, node, or worker exists until the first
 
 `AudioInput` is `string` (URL) `| ArrayBuffer` (encoded bytes) `| Blob | AudioBuffer`.
 A clip is an `AudioInput` or `{ src, srcB?, id? }`. `id` defaults to the URL.
+`{ manifest, stem?, id? }` (or a URL ending in `.json`) plays a prepared recording
+segment by segment, see [Long recordings](#long-recordings-prepared-files); what a
+source can do is reported in `state.capabilities`.
 
 ### Methods
 
@@ -174,9 +181,12 @@ A clip is an `AudioInput` or `{ src, srcB?, id? }`. `id` defaults to the URL.
 | `setHighPass(hz)` | `0` bypasses. UI range 0–500 Hz. |
 | `setCompression(amount)` | 0–1. |
 | `setOutputGain(db)` | -24…+24 dB; `-Infinity` mutes. |
+| `setVolume(linear)` | Volume before the post-FX chain (1 = unity), smoothed so a fader move never clicks: a 20 ms ramp in the stream engine for prepared clips, a 5 ms time constant for whole clips. In `state.volume`. |
 | `setMix(mix)` | 0 = stem A … 1 = stem B; the gains follow `mixLaw`. Fetches stem B on first use. |
 | `setProcessing(patch)` | Any subset of `ProcessingState`. |
-| `setSourceB(input \| null)` | Install (or remove) stem B for the current clip directly. |
+| `setSourceB(input \| null)` | Install (or remove) stem B for the current clip directly (whole clips). |
+| `setStem(key \| null)` | Prepared clips: which of the manifest's stems the A⇄B knob blends with (`null`: the default). Returns `false` when there is no such stem. |
+| `refreshManifest()` | Prepared clips: re-read the manifest; a newer `revision` (a stem attached later) applies without a reload. |
 | `setPauseMode(mode)` | |
 | `getState()` | Immutable snapshot; the same object until something changes. |
 | `subscribe(listener)` | Called on every change; returns an unsubscribe function (`useSyncExternalStore`-compatible). |
@@ -205,7 +215,9 @@ over: they add a few milliseconds of look-ahead delay and limit softly near
 | `loop` | Active loop range (snapped) or `null`. |
 | `processing` | Applied `ProcessingState`; speed stays at the audible rate during preparation. |
 | `pendingSpeed` | Requested speed being prepared, or `null`. Stop/pause/seek/new clip cancel the pending switch. |
-| `statusB` | `'unavailable' \| 'idle' \| 'loading' \| 'ready' \| 'error'`. |
+| `statusB` | `'unavailable' \| 'idle' \| 'loading' \| 'ready' \| 'error'` (and `'processing'` for prepared clips with polling). |
+| `sourceKind`, `capabilities` | `'buffer'` (whole clip) or `'segmented'` (prepared); what the source can do: `canPreservePitch`, `canMixStemB`, `stems` (a prepared clip's ready stems: `{ key, label }[]`), `exactWaveformPreview`, `spectrogram`, `loopSnapping`. |
+| `manifest`, `stem`, `prepared`, `buffering` | Prepared clips: the manifest, the active blend stem's key, the overview data as it arrives, waiting for a segment. |
 | `mixLaw` | The `mixLaw` option. |
 | `buffer`, `bufferB`, `audioContext` | Decoded audio, for custom visualisations. |
 | `startedAt`, `playbackStartPoint`, `playRequestId`, `pauseMode` | For smooth playheads and "restart" detection. |
@@ -227,8 +239,16 @@ The main entry also exports processing defaults and control mappings,
 
 Low-level classes and analysis helpers are available only through
 `@saitdigital/rt-dspplr/advanced`: `Track`, `Mixer`, `AudioEngine`, `BufferLoader`,
-`StretchService`, `WaveformAnalyzer`, peak-pyramid helpers and DSP building
-blocks. This advanced surface may change between minor releases before 1.0.
+`StretchService`, `WaveformAnalyzer`, `TimelineCore` / `mountTimeline`, peak-pyramid
+helpers, spectrogram analysis and painting, and DSP building blocks. This advanced
+surface may change between minor releases before 1.0. The playback internals of
+prepared clips (segment store, scheduler, stream engine) are not exported.
+
+`@saitdigital/rt-dspplr/format` holds the prepared-file formats as pure code that
+runs in browsers, workers and Node: the manifest types, `assertManifest()`, stem key
+rules (`isStemKey`, `STEM_KEY_PATTERN`), and the readers and writers of peaks.bin,
+bands.bin, spectrogram.bin and the WAV segments. The JSON Schema of the manifest is
+`@saitdigital/rt-dspplr/manifest.schema.json`.
 
 ## API: React
 
@@ -339,6 +359,8 @@ preview and the spectrogram follow the same gains.
   aligned tracks keep their level, 50% included. For two versions of one
   recording. Different recordings are not loudness-matched; misaligned or
   phase-inverted tracks can still cancel.
+- `mixLaw: 'equal-power'`: gains `cos` / `sin` of the knob. Keeps the level of
+  two *uncorrelated* tracks; on a correlated pair it bumps the middle by 3 dB.
 - `mixLaw: 'separation'`: for stems that add up to the original, such as the
   two parts of a separation. Both play at full in the middle, so 0.5 is the
   original, and each fades out towards the far end: 0 is stem A alone, 1 is
@@ -363,6 +385,106 @@ createAudioPlayer({
     },
 });
 ```
+
+## Long recordings (prepared files)
+
+A whole file is decoded before it plays, which is instant for a voice note and
+heavy for an hour. For long recordings, prepare them once on the server with
+**[@saitdigital/rt-dspplr-prepare](https://github.com/eightraw/rt-dspplr/tree/main/packages/rt-dspplr-prepare#readme)** (Node, CLI and
+API). It writes a folder: a manifest, overview files (peaks, high-pass bands,
+spectrogram) and fixed-length WAV segments. The player opens it in milliseconds and
+fetches audio around the playhead only (decoded audio stays near 60 s):
+
+```bash
+npx rtd-prepare talk.wav public/media/talk --stem b=talk.b.wav --label b="Noise reduction"
+```
+
+```ts
+await player.play({ manifest: '/media/talk/manifest.json' });
+// React: the same card, on a manifest
+const p = useAudioPlayer();
+useEffect(() => { void p.load({ manifest }); }, [manifest]);
+<AudioPlayer player={p} display="both" />
+```
+
+- The waveform, the DSP preview and the spectrogram cover the whole recording at
+  once (approximate in the overview, exact in a decoded window of up to 20 s).
+- Speed keeps the pitch through a realtime stretcher in the stream engine
+  (AudioWorklet) when the manifest's rate equals the context's; otherwise pitch
+  follows speed and `capabilities.canPreservePitch` says so (the card shows it).
+- Options under `segmented`: `cacheSeconds`, `prefetchSegments`, `engine`,
+  `realtimeStretch`, `pollStemsMs`. `player.getStreamStats()` reports cache,
+  fetches and latencies.
+
+**Named stems.** A manifest can carry several stems, each a time-aligned derivative
+of A (the same timeline) made on the server: `stems: { b, v1, … }`. Keys are opaque
+ids the host chooses (`b` is the default); a stem may carry a `label` for interfaces.
+The knob blends A with **one stem at a time**: `play({ manifest, stem: 'v1' })`, or
+`player.setStem('v1')` while playing; `state.stem` is the active one and
+`capabilities.stems` lists the ready ones. The React card shows a stem selector
+(`label ?? key`) only when there is more than one. A stem's segments are fetched only
+while the knob is above 0. Output that changes timing (re-timed or re-synthesised
+audio) is not a stem: publish it as a clip of its own.
+
+The manifest format, its versions and its compatibility policy are specified in
+[docs/manifest.md](https://github.com/eightraw/rt-dspplr/blob/main/docs/manifest.md).
+
+## DSP plugins (effects)
+
+> **Experimental.** The plugin API (`player.effects`, `DspPlugin` and its
+> helpers) may change in minor releases before 1.0.
+
+Every sound effect is a plugin in one chain per player, the built-ins included:
+`rtd.highpass` (the high-pass) and `rtd.dynamics` (compressor, output gain and
+ceiling as one plugin, because the gain sits between the compressor and the
+limiter). `setHighPass`, `setCompression` and `setOutputGain` drive them.
+
+Signal chain: **source (A/B mix → realtime stretch) → effects → volume → analyser → output.**
+
+- The mix is first because the effects process what you hear: one compressor on the
+  blend, not two compressors that are summed.
+- The stretch comes before the effects so that a compressor's or a filter's time
+  constants stay in real time at any speed. The stretcher also sees the dry signal,
+  without a limiter's pumping. The engine mixes A and B before it stretches them, so
+  there is one stretcher, not two that drift apart.
+- Volume is a post-insert fader. It never changes how hard the compressor works.
+  The analyser and the meters sit after it.
+
+```ts
+import { threeBandEq } from './three-band-eq.js';   // examples/plugins/three-band-eq.js
+
+const id = player.effects.add(threeBandEq, { params: { high: -12 } });
+player.effects.setParam(id, 'low', 6);       // validated against the schema (clamped; unknown id throws)
+player.effects.bypass(id, true);             // wet/dry crossfade, click-free
+player.effects.move(id, 0);
+player.effects.remove(id);
+player.getState().effects;                   // [{ id, plugin, params, bypassed, error }]
+player.getState().previewCoverage;           // { waveform, spectrogram, overview, missing: [names] }
+```
+
+A plugin (`DspPlugin`) is plain data plus functions:
+
+- `id`, `name`, `version`, and `params`: `[{ id, label, unit, min, max, default,
+  scale: 'linear' | 'log', step, format }]`. The card's Post FX panel renders sliders
+  from this schema.
+- `realtime`: either `{ kind: 'nodes', create(ctx, params) → { input, output,
+  setParam(id, value, timeConstant), dispose } }` with any Web Audio nodes, or
+  `{ kind: 'worklet', processorName, moduleUrl | moduleCode }`, where every param
+  becomes an AudioParam.
+- `preview` (optional; what you hear is what the waveform and the spectrogram show):
+  - `magnitudeResponse(params, freqs, sampleRate) → dB[]` for linear effects (EQ,
+    filters). The spectrogram applies it per row at paint time, and the prepared overview
+    of the waveform approximates from it.
+  - `process(channels, sampleRate, params, state)` is a self-contained function, run in
+    the preview workers on the clip's audio, for the waveform (exact in the decoded
+    window).
+  - An effect without a preview still plays. `previewCoverage.missing` names it, and
+    the card says "Not in the preview: …".
+- `latencyFrames`: reported in `state.effectsLatencyFrames`.
+
+**Crash isolation**: a plugin that throws in `create()`, or whose worklet processor
+throws, is bypassed. The `effecterror` event and `effects[i].error` report it, and
+playback goes on. A preview function that throws is left out of the preview.
 
 ## Timeline
 
@@ -553,9 +675,14 @@ WASM fails to load at runtime, each job falls back to the built-in vocoder.
 
 ## Bundlers, workers, CSP
 
-The core and React entries contain four small scripts as strings: the
+The core and React entries contain six small scripts as strings: the
 dynamics AudioWorklet (~2 KB), the vocoder worker (~5 KB), the waveform
-peaks worker (~5 KB) and the spectrogram worker (~7 KB). Each is started from
+peaks worker (~5 KB), the spectrogram worker (~7 KB), the overview
+preview worker of prepared clips (~3 KB) and the stream engine AudioWorklet
+of prepared clips (~6 KB). The realtime stretcher of prepared clips
+(Signalsmith Stretch, MIT, ~100 KB of WASM; its notice is in the chunk and in
+THIRD_PARTY_NOTICES.md) is a separate chunk, loaded by a
+dynamic `import()` only when a prepared clip plays. Each is started from
 a `blob:` URL the first time it is needed. No extra files, loaders, or `new URL()` patterns are involved. The
 same build is verified in Vite (dev and build) and webpack 5. Nothing in it is
 bundler-specific, so other ESM bundlers should behave the same.
@@ -631,9 +758,10 @@ Eviction never interrupts playback. Rendering a speed variant needs little
 beyond the variant itself: the built-in vocoder goes through clips longer than
 15 s frame by frame (see [Time-stretch strategies](#time-stretch-strategies)).
 For large files or constrained devices, set `prewarmSpeeds: false`, avoid
-unnecessary stem B prefetch, and dispose unused players. Full-file decoding
-remains required; this is not a streaming player or a solution for arbitrarily
-long recordings.
+unnecessary stem B prefetch, and dispose unused players. Whole clips are
+decoded in full. For long recordings, the prepared (manifest)
+source keeps only about a minute of decoded audio around the playhead; see
+[Long recordings](#long-recordings-prepared-files).
 
 ```ts
 import { setAudioCacheBudget, getAudioCacheStats, clearAudioCache } from '@saitdigital/rt-dspplr';
@@ -674,7 +802,7 @@ included in these sizes or in the npm artifact.
 ## Validation
 
 ```bash
-npm test                  # stretch lengths, level and timing, shared cache, scheduling, worker failures, the ruler, untouched audio at the defaults
+npm test                  # stretch lengths, level and timing, shared cache, scheduling, worker failures, the ruler, untouched audio at the defaults, the manifest schema against assertManifest()
 npm run typecheck
 npm run test:browser      # build + Chromium AudioContext/worker/React tests (workspace root)
 npm run test:package      # build + npm artifact installed in an isolated consumer (workspace root)

@@ -15,6 +15,7 @@ import type {
     AudioPlayerOptions,
 } from '../core/AudioPlayer';
 import { DEFAULT_SPEEDS } from '../core/controls';
+import { clipIdentity } from '../core/timeline/createTimeline';
 import type { SpectrogramOptions } from '../core/spectrogram/SpectrogramView';
 import { MixSlider, SoundPanel, SpeedSegments } from './controls';
 import { clamp, fileNameFromUrl, formatClock } from './format';
@@ -250,7 +251,7 @@ function AudioPlayerCard({
     const compact = layout === 'compact' || (layout === 'auto' && width > 0 && width < compactBreakpoint);
     const scheme = useSystemScheme(theme === 'auto');
     const paletteKey = theme === 'auto' ? `auto-${scheme}` : theme;
-    const pyramid = useWaveform(state, display !== 'spectrogram');
+    const pyramid = useWaveform(core, display !== 'spectrogram');
 
     const scrubberRef = useRef<ScrubberHandle>(null);
     const elapsedRef = useRef<HTMLSpanElement>(null);
@@ -399,7 +400,7 @@ function AudioPlayerCard({
             paletteKey={paletteKey}
             loading={state.status === 'loading'}
             emptyText={emptyText}
-            resetKey={`${state.clipId ?? ''}:${state.playRequestId}`}
+            resetKey={clipIdentity(state)}
             onUserSeek={onUserSeek}
             label={titleText ? `Seek in ${titleText}` : 'Seek'}
             display={display}
@@ -437,6 +438,7 @@ function AudioPlayerCard({
             value={state.processing.speed}
             pending={state.pendingSpeed}
             onChange={(next) => void core.setSpeed(next)}
+            pitchNote={state.clipId !== null && !state.capabilities.canPreservePitch}
         />
     );
 

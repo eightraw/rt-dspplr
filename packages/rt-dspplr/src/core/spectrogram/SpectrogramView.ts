@@ -3,6 +3,10 @@ import type { AudioPlayerCore, AudioPlayerState } from '../AudioPlayer';
 import { SpectrogramAnalyzer, type SpectrogramData } from './SpectrogramAnalyzer';
 import type { SpectralPyramid } from './protocol';
 import { sampleSpectralPyramid } from './sample';
+import { createPreparedSpectrogram } from './PreparedSpectrogramView';
+import { applyDspToSpectrogram } from './dspPaint';
+import { previewSettings } from '../effects/preview';
+import { subscribeDspPreview, type DspPreview } from '../waveform/followWaveform';
 import {
     DEFAULT_SPECTROGRAM_PALETTE,
     paintSpectrogram,
@@ -66,7 +70,7 @@ function normalizeFftSize(size: number): number {
 }
 
 /** FFT lengths for a view, from how many samples each column of pixels spans. */
-function chooseFft(option: number | 'auto' | undefined, samplesPerColumn: number) {
+export function chooseFft(option: number | 'auto' | undefined, samplesPerColumn: number) {
     if (typeof option === 'number') return { fftSize: normalizeFftSize(option) };
     // A whole clip: one FFT length for every row.
     if (samplesPerColumn >= 512) return { fftSize: samplesPerColumn > 2048 ? 4096 : 2048 };
@@ -81,9 +85,54 @@ function chooseFft(option: number | 'auto' | undefined, samplesPerColumn: number
     };
 }
 
+type SpectrogramPlayer = Pick<AudioPlayerCore, 'getState' | 'subscribe'>
+    & Partial<Pick<AudioPlayerCore, 'on' | 'setView' | 'getWindowAudio'>>;
+
+/**
+ * A spectrogram of the player's clip on `canvas`. A whole clip is analysed
+ * in the worker; a prepared clip draws its precomputed overview at once and
+ * refines zoomed-in views from its decoded segments. The view follows the
+ * player from one kind of clip to the other.
+ */
 export function createSpectrogram(
     canvas: HTMLCanvasElement,
-    player: AudioPlayerCore,
+    player: SpectrogramPlayer,
+    initialOptions: SpectrogramOptions = {},
+): SpectrogramView {
+    let options = initialOptions;
+    let range: { start: number; end: number } | null = null;
+    let kind = player.getState().sourceKind === 'segmented' ? 'segmented' : 'buffer';
+    const make = () => (kind === 'segmented'
+        ? createPreparedSpectrogram(canvas, player, options)
+        : createBufferSpectrogram(canvas, player, options));
+    let inner = make();
+    const unsubscribe = player.subscribe(() => {
+        const next = player.getState().sourceKind === 'segmented' ? 'segmented' : 'buffer';
+        if (next === kind) return;
+        kind = next;
+        inner.dispose();
+        inner = make();
+        inner.setRange(range);
+    });
+    return {
+        setRange(next) {
+            range = next;
+            inner.setRange(next);
+        },
+        setOptions(next) {
+            options = next;
+            inner.setOptions(next);
+        },
+        dispose() {
+            unsubscribe();
+            inner.dispose();
+        },
+    };
+}
+
+function createBufferSpectrogram(
+    canvas: HTMLCanvasElement,
+    player: Pick<AudioPlayerCore, 'getState' | 'subscribe'>,
     initialOptions: SpectrogramOptions = {},
 ): SpectrogramView {
     let options = initialOptions;
@@ -95,6 +144,25 @@ export function createSpectrogram(
     let disposed = false;
     let last: { buffer: AudioBuffer | null; bufferB: AudioBuffer | null } = { buffer: null, bufferB: null };
     let lastMix = Number.NaN;
+    let lastDsp = '';
+    // The DSP preview (gain track) shared with the waveform: the spectrogram shows what is heard.
+    let preview: DspPreview | null = null;
+    const offPreview = subscribeDspPreview(player, (next) => {
+        preview = next;
+        schedulePaint();
+    });
+    const dspSlots = { data: null as SpectrogramData | null, whole: null as SpectrogramData | null, sampled: null as SpectrogramData | null };
+    /** The data with high-pass, dynamics and output gain applied (see dspPaint.ts). */
+    function dsp(d: SpectrogramData, slot: keyof typeof dspSlots, minHz: number, maxHz: number): SpectrogramData {
+        const state = player.getState();
+        const out = applyDspToSpectrogram(d, { state, preview, timelineRate: state.buffer?.sampleRate ?? 48000, minHz, maxHz }, dspSlots[slot]);
+        if (out !== d) dspSlots[slot] = out;
+        return out;
+    }
+    const axis = () => {
+        const rate = player.getState().buffer?.sampleRate ?? 48000;
+        return { minHz: options.minHz ?? 30, maxHz: Math.min(options.maxHz ?? 16000, rate / 2) };
+    };
     // The part of the clip asked for last; the picture on hand may still be of another.
     let shown: { start: number; end: number } | null = null;
     let visible = typeof IntersectionObserver !== 'function';
@@ -207,7 +275,7 @@ export function createSpectrogram(
         if (!image || image.width !== data.columns || image.height !== data.rows) {
             image = new ImageData(data.columns, data.rows);
         }
-        paintSpectrogram(image, data, gains, current, referenceOf(data));
+        paintSpectrogram(image, dsp(data, 'data', axis().minHz, axis().maxHz), gains, current, referenceOf(data));
         const want = shown ?? { start: data.start, end: data.end };
         const sameRange = Math.abs(want.start - data.start) < 1e-6 && Math.abs(want.end - data.end) < 1e-6;
         if (sameRange && image.width === canvas.width && image.height === canvas.height) {
@@ -224,7 +292,7 @@ export function createSpectrogram(
             if (!wholeImage || wholeImage.width !== whole.columns || wholeImage.height !== whole.rows) {
                 wholeImage = new ImageData(whole.columns, whole.rows);
             }
-            paintSpectrogram(wholeImage, whole, gains, current, referenceOf(whole));
+            paintSpectrogram(wholeImage, dsp(whole, 'whole', axis().minHz, axis().maxHz), gains, current, referenceOf(whole));
             drawPart(context, wholeScratch, wholeImage, whole, want);
         }
         drawPart(context, scratch, image, data, want);
@@ -246,7 +314,7 @@ export function createSpectrogram(
         }
         if (!image || image.width !== width || image.height !== source.rows) image = new ImageData(width, source.rows);
         const reference = state.mixLaw === 'separation' ? sampled.referenceSum : sampled.referenceMax;
-        paintSpectrogram(image, sampled, mixGains(state.processing.mix, state.mixLaw), current, reference);
+        paintSpectrogram(image, dsp(sampled, 'sampled', source.minHz, source.maxHz), mixGains(state.processing.mix, state.mixLaw), current, reference);
         scratch.width = width;
         scratch.height = source.rows;
         scratch.getContext('2d')?.putImageData(image, 0, 0);
@@ -305,6 +373,11 @@ export function createSpectrogram(
                 staleBuffers = true;
                 sync();
             }
+        }
+        const dspKey = previewSettings(state).key;
+        if (dspKey !== lastDsp) {
+            lastDsp = dspKey;
+            schedulePaint();
         }
         if (state.processing.mix !== lastMix) {
             lastMix = state.processing.mix;
@@ -368,6 +441,7 @@ export function createSpectrogram(
             sight?.disconnect();
             if (resizeTimer) clearTimeout(resizeTimer);
             if (frame) canvas.ownerDocument.defaultView?.cancelAnimationFrame(frame);
+            offPreview();
             analyzer.dispose();
         },
     };

@@ -93,7 +93,9 @@ test('one worker serves every spectrogram, and one off screen computes nothing',
         window.Worker = Real;
         return { workers, painted };
     });
-    expect(result.workers).toBe(1);
+    // One spectrogram worker for all five views, plus one peaks worker: the DSP preview
+    // (the gain the spectrogram applies per column) is computed once per player.
+    expect(result.workers).toBe(2);
     // The viewport is 720 px tall and views start computing 200 px before they show.
     expect(result.painted).toEqual([true, true, false, false, false]);
 });

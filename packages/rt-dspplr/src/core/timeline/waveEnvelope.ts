@@ -25,6 +25,7 @@ export function resolveColumns(
 
     const bins = level.maxPeaks.length;
     const binSize = Math.max(1, level.binSize);
+    const base = level.startBin ?? 0;
     const span = Math.max(1, endSample - startSample) / count;
     const min = new Float32Array(count);
     const max = new Float32Array(count);
@@ -32,8 +33,8 @@ export function resolveColumns(
 
     for (let x = 0; x < count; x += 1) {
         const from = startSample + x * span;
-        const first = Math.min(bins - 1, Math.max(0, Math.floor(from / binSize)));
-        const last = Math.min(bins, Math.max(first + 1, Math.ceil((from + span) / binSize)));
+        const first = Math.min(bins - 1, Math.max(0, Math.floor(from / binSize - base)));
+        const last = Math.min(bins, Math.max(first + 1, Math.ceil((from + span) / binSize - base)));
         let lo = Infinity;
         let hi = -Infinity;
         let r = 0;

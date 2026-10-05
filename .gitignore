@@ -11,6 +11,8 @@ dist
 examples/demo/storage/clips/*
 !examples/demo/storage/clips/.gitkeep
 !examples/demo/storage/clips/README.md
+# Long-audio experiment: generated recordings and their prepared folders
+examples/demo/storage/long/
 
 # Browser test output
 test-results/

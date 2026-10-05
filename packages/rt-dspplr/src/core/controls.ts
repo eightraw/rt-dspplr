@@ -39,13 +39,16 @@ export interface ProcessingState {
  * - `crossfade`: A at `1 - mix`, B at `mix`. For two versions of one recording.
  * - `separation`: both at full in the middle, one fading out towards each end.
  *   For stems that add up to the original: 0 = A alone, 0.5 = the original, 1 = B alone.
+ * - `equal-power`: cos/sin, keeping the level of two UNcorrelated stems (+3 dB at the
+ *   middle for correlated ones, which is why prepared dry/wet pairs default to crossfade).
  */
-export type MixLaw = 'crossfade' | 'separation';
+export type MixLaw = 'crossfade' | 'separation' | 'equal-power';
 
 /** Gains of stem A and stem B for a mix position. */
 export function mixGains(mix: number, law: MixLaw = 'crossfade'): [number, number] {
     const x = Math.min(1, Math.max(0, Number.isFinite(mix) ? mix : 0));
     if (law === 'separation') return [Math.min(1, 2 * (1 - x)), Math.min(1, 2 * x)];
+    if (law === 'equal-power') return [Math.cos((x * Math.PI) / 2), Math.sin((x * Math.PI) / 2)];
     return [1 - x, x];
 }
 

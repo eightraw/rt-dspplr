@@ -1,6 +1,7 @@
 import createPeaksWorker from './peaks.worker.ts?inline-worker';
 import type { WaveformPeakPyramid } from './pyramid';
 import type { WaveformProcessing } from './types';
+import type { GainTrack } from './gainTrack';
 
 // ---------------------------------------------------------------------------
 // WaveformAnalyzer — main-thread handle for the peak pyramid worker
@@ -17,6 +18,8 @@ export interface WaveformPyramids {
     source: WaveformPeakPyramid | null;
     /** Peaks after the DSP preview (what the listener hears). */
     processed: WaveformPeakPyramid | null;
+    /** The dynamics gain over time behind `processed` (for the spectrogram). */
+    gain?: GainTrack | null;
 }
 
 type BufferReadyMessage = {
@@ -24,12 +27,14 @@ type BufferReadyMessage = {
     requestId: number;
     sourcePyramid: WaveformPeakPyramid;
     processedPyramid: WaveformPeakPyramid;
+    gain: GainTrack | null;
 };
 
 type ProcessedReadyMessage = {
     type: 'processedReady';
     requestId: number;
     pyramid: WaveformPeakPyramid;
+    gain: GainTrack | null;
 };
 
 type WaveformWorkerMessage = BufferReadyMessage | ProcessedReadyMessage;
@@ -72,14 +77,14 @@ export class WaveformAnalyzer {
 
             if (message.type === 'bufferReady') {
                 if (message.requestId === this._loadRequestId) {
-                    this._pyramids = { source: message.sourcePyramid, processed: message.processedPyramid };
+                    this._pyramids = { source: message.sourcePyramid, processed: message.processedPyramid, gain: message.gain };
                     this._onUpdate(this._pyramids);
                 }
                 return;
             }
 
             if (message.requestId === this._processedRequestId) {
-                this._pyramids = { ...this._pyramids, processed: message.pyramid };
+                this._pyramids = { ...this._pyramids, processed: message.pyramid, gain: message.gain };
                 this._onUpdate(this._pyramids);
             }
         };

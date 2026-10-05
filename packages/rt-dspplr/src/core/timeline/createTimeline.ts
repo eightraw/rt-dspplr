@@ -1,10 +1,7 @@
-import type { AudioPlayerCore, AudioPlayerState } from '../AudioPlayer';
-import { outputGainDbToGain } from '../controls';
+import type { AudioPlayerState } from '../AudioPlayer';
 import type { SpectrogramOptions } from '../spectrogram/SpectrogramView';
-import { WaveformAnalyzer } from '../waveform/WaveformAnalyzer';
-import type { WaveformPeakPyramid } from '../waveform/pyramid';
-import type { WaveformProcessing } from '../waveform/types';
-import { TimelineCore, type TimelineDisplay } from './TimelineCore';
+import { followWaveform } from '../waveform/followWaveform';
+import { TimelineCore, type TimelineDisplay, type TimelinePlayer } from './TimelineCore';
 
 // ---------------------------------------------------------------------------
 // createTimeline — the seek bar of the React card, for any framework.
@@ -50,48 +47,13 @@ export interface TimelineView {
     dispose(): void;
 }
 
-/** Peak pyramids of the player's clip, recomputed in a worker as the DSP changes. */
-function followWaveform(player: AudioPlayerCore, onPyramid: (pyramid: WaveformPeakPyramid | null) => void): () => void {
-    let latest: { source: WaveformPeakPyramid | null; processed: WaveformPeakPyramid | null } = { source: null, processed: null };
-    const analyzer = new WaveformAnalyzer((pyramids) => {
-        latest = pyramids;
-        onPyramid(latest.processed ?? latest.source);
-    });
-    const processingOf = (state: AudioPlayerState): WaveformProcessing => ({
-        highPassHz: state.processing.highPassHz,
-        compression: state.processing.compression,
-        outputGain: outputGainDbToGain(state.processing.outputGainDb),
-        mix: state.processing.mix,
-        mixLaw: state.mixLaw,
-    });
-    let buffers: { a: AudioBuffer | null; b: AudioBuffer | null; clip: string | null } = { a: null, b: null, clip: null };
-    let applied: WaveformProcessing | null = null;
-    const same = (a: WaveformProcessing | null, b: WaveformProcessing) => a !== null
-        && a.highPassHz === b.highPassHz && a.compression === b.compression && a.outputGain === b.outputGain
-        && a.mix === b.mix && a.mixLaw === b.mixLaw;
-    const sync = () => {
-        const state = player.getState();
-        const processing = processingOf(state);
-        // While the next clip loads the buffer is briefly null: the previous
-        // waveform stays until the new one is analysed.
-        if (state.buffer && (state.buffer !== buffers.a || state.bufferB !== buffers.b || state.clipId !== buffers.clip)) {
-            buffers = { a: state.buffer, b: state.bufferB, clip: state.clipId };
-            applied = processing;
-            analyzer.setBuffers(state.buffer, state.bufferB, processing);
-        } else if (!same(applied, processing)) {
-            applied = processing;
-            analyzer.setProcessing(processing);
-        }
-    };
-    const unsubscribe = player.subscribe(sync);
-    sync();
-    return () => {
-        unsubscribe();
-        analyzer.dispose();
-    };
+
+/** What identifies the clip a timeline shows: a new value resets its view. */
+export function clipIdentity(state: AudioPlayerState): string {
+    return `${state.clipId ?? ''}|${state.src ?? ''}|${state.sourceKind ?? ''}`;
 }
 
-export function createTimeline(container: HTMLElement, player: AudioPlayerCore, options: TimelineOptions = {}): TimelineView {
+export function createTimeline(container: HTMLElement, player: TimelinePlayer, options: TimelineOptions = {}): TimelineView {
     const doc = container.ownerDocument;
     const root = doc.createElement('div');
     root.className = 'rtd rtd-timeline';
@@ -122,7 +84,7 @@ export function createTimeline(container: HTMLElement, player: AudioPlayerCore, 
  * The timeline inside an element you made yourself (the React `<Timeline>` uses this
  * for its own root). Theme attributes and classes on that element stay yours.
  */
-export function mountTimeline(root: HTMLElement, player: AudioPlayerCore, options: TimelineOptions = {}): Omit<TimelineView, 'element'> {
+export function mountTimeline(root: HTMLElement, player: TimelinePlayer, options: TimelineOptions = {}): Omit<TimelineView, 'element'> {
     let current: TimelineOptions = { ...options };
     const inputOf = (state: AudioPlayerState) => ({
         hasAudio: state.clipId !== null,
@@ -169,7 +131,9 @@ export function mountTimeline(root: HTMLElement, player: AudioPlayerCore, option
 
     // The playhead: from the state while stopped, from the clock every frame while playing.
     let frame = 0;
-    let clipKey = `${state.clipId ?? ''}:${state.playRequestId}`;
+    // The view (zoom, pan, a draft loop) belongs to the clip: it is reset only when
+    // another clip comes, never by play, pause, seek, speed, loops or a restart.
+    let clipKey = clipIdentity(state);
     const tick = () => {
         const s = player.getState();
         timeline.setTime(Math.min(player.getCurrentTime(), s.duration), true);
@@ -178,7 +142,7 @@ export function mountTimeline(root: HTMLElement, player: AudioPlayerCore, option
     const onState = () => {
         const s = player.getState();
         timeline.update(inputOf(s));
-        const key = `${s.clipId ?? ''}:${s.playRequestId}`;
+        const key = clipIdentity(s);
         if (key !== clipKey) {
             clipKey = key;
             timeline.resetView();

@@ -9,6 +9,7 @@ export type {
     AudioInput,
     ClipInput,
     ClipSource,
+    ManifestClip,
     AudioPlayerCore,
     AudioPlayerOptions,
     AudioPlayerState,

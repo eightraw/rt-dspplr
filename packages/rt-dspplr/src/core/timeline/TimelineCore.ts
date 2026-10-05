@@ -1,4 +1,11 @@
 import type { AudioPlayerCore } from '../AudioPlayer';
+
+/**
+ * What the timeline needs from a player: the classic AudioPlayerCore, or any
+ * player with the same transport surface (the stream player).
+ */
+export type TimelinePlayer = Pick<AudioPlayerCore, 'getState' | 'subscribe' | 'getCurrentTime' | 'seek' | 'setLoop'>
+    & Partial<Pick<AudioPlayerCore, 'on' | 'setView' | 'getWindowAudio'>>;
 import type { LoopRange } from '../engine';
 import { createSpectrogram, type SpectrogramOptions, type SpectrogramView } from '../spectrogram/SpectrogramView';
 import type { WaveformPeakPyramid } from '../waveform/pyramid';
@@ -75,6 +82,11 @@ export interface TimelineCoreInput {
     wheelZoom: 'plain' | 'modifier';
     zoomable: boolean;
     ruler: boolean;
+    /**
+     * Told the visible range (seconds) and the track's width (CSS px) whenever
+     * either changes. The stream player uses it to refine deep zooms.
+     */
+    onView?: (startSeconds: number, endSeconds: number, widthPx: number) => void;
 }
 
 type Drag =
@@ -109,7 +121,7 @@ export class TimelineCore {
     /** Shown in the track before a clip, holding `emptyText`. */
     private readonly _empty: HTMLDivElement;
 
-    private readonly _core: AudioPlayerCore;
+    private readonly _core: TimelinePlayer;
     private readonly _onUserSeek: (seconds: number) => void;
     private _input: TimelineCoreInput;
 
@@ -146,7 +158,7 @@ export class TimelineCore {
     private _disposed = false;
     private readonly _off: Array<() => void> = [];
 
-    constructor(element: HTMLElement, core: AudioPlayerCore, input: TimelineCoreInput, onUserSeek: (seconds: number) => void = () => {}) {
+    constructor(element: HTMLElement, core: TimelinePlayer, input: TimelineCoreInput, onUserSeek: (seconds: number) => void = () => {}) {
         this._core = core;
         this._input = input;
         this._onUserSeek = onUserSeek;
@@ -239,6 +251,7 @@ export class TimelineCore {
                 const h = this._track.clientHeight;
                 if (w === this._size.w && h === this._size.h) return;
                 this._size = { w, h };
+                this._notifyView();
                 this._draw();
                 this._render();
             });
@@ -373,7 +386,18 @@ export class TimelineCore {
         this._empty.textContent = this._input.emptyText;
     }
 
+    private _notifyView(): void {
+        const { duration, onView } = this._input;
+        if (duration <= 0) return;
+        const start = this._offset * duration;
+        const end = (this._offset + this._viewSize) * duration;
+        // A prepared clip decodes the segments of short views for the exact previews.
+        this._core.setView?.(start, end);
+        onView?.(start, end, this._size.w);
+    }
+
     private _applyRange(): void {
+        this._notifyView();
         const duration = this._input.duration;
         this._spectro?.setRange(this._zoom > 1 && duration > 0
             ? { start: this._offset * duration, end: (this._offset + this._viewSize) * duration }
