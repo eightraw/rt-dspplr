@@ -32,6 +32,7 @@
   ],
   "files": [
     "dist",
+    "bin",
     "README.md",
     "LICENSE.md"
   ],
@@ -60,6 +61,12 @@
       "types": "./dist/types/advanced.d.ts",
       "import": "./dist/advanced.js",
       "default": "./dist/advanced.js"
+    },
+    "./prepare": {
+      "types": "./dist/types/prepare/index.d.ts",
+      "node": "./dist/prepare.js",
+      "import": "./dist/prepare.js",
+      "default": "./dist/prepare.js"
     }
   },
   "typesVersions": {
@@ -72,11 +79,14 @@
       ],
       "advanced": [
         "./dist/types/advanced.d.ts"
+      ],
+      "prepare": [
+        "./dist/types/prepare/index.d.ts"
       ]
     }
   },
   "scripts": {
-    "build": "node build/clean.mjs && vite build && node build/build-rubberband.mjs && tsc -p tsconfig.build.json && node build/fix-dts-extensions.mjs && node build/copy-assets.mjs && node build/check-dist.mjs",
+    "build": "node build/clean.mjs && vite build && node build/build-rubberband.mjs && node build/build-prepare.mjs && tsc -p tsconfig.build.json && node build/fix-dts-extensions.mjs && node build/copy-assets.mjs && node build/check-dist.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "test": "node build/test-node.mjs",
     "prepack": "npm run build",
@@ -102,7 +112,11 @@
     "esbuild": "^0.25.0",
     "react": "^18.3.1",
     "rubberband-wasm": "^3.3.0",
+    "signalsmith-stretch": "^1.3.2",
     "typescript": "~5.6.2",
     "vite": "~6.4.1"
+  },
+  "bin": {
+    "rtd-prepare": "./bin/rtd-prepare.mjs"
   }
 }

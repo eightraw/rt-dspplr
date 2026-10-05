@@ -8,7 +8,9 @@ Free to use under a one-page [license](./LICENSE.md), see [Licensing](#licensing
 A web audio player with real-time DSP, pitch-preserving speed controls,
 looping and an interactive waveform. Available as a headless engine and a
 ready React component. Audio files are decoded in full; memory use scales
-with their length.
+with their length. Long recordings can instead be prepared once (`./prepare`)
+and played segment by segment with `play({ manifest })` (experimental, see
+[docs/long-audio-experiment.md](../../docs/long-audio-experiment.md)).
 
 - **Pitch-preserving speed** (1.25x, 1.5x, 2x...). Variants are rendered
   off the main thread. Playback continues at the applied speed while a new
@@ -159,6 +161,10 @@ Construction is free. No AudioContext, node, or worker exists until the first
 
 `AudioInput` is `string` (URL) `| ArrayBuffer` (encoded bytes) `| Blob | AudioBuffer`.
 A clip is an `AudioInput` or `{ src, srcB?, id? }`. `id` defaults to the URL.
+Experimental: `{ manifest, id? }` (or a URL ending in `.json`) plays a recording
+prepared with `@saitdigital/rt-dspplr/prepare` segment by segment; what that source
+cannot do (pitch-preserving speed, stem B) is reported in `state.capabilities`.
+See [docs/long-audio-experiment.md](../../docs/long-audio-experiment.md).
 
 ### Methods
 
@@ -174,6 +180,7 @@ A clip is an `AudioInput` or `{ src, srcB?, id? }`. `id` defaults to the URL.
 | `setHighPass(hz)` | `0` bypasses. UI range 0–500 Hz. |
 | `setCompression(amount)` | 0–1. |
 | `setOutputGain(db)` | -24…+24 dB; `-Infinity` mutes. |
+| `setVolume(linear)` | Volume before the post-FX chain (1 = unity), smoothed so a fader move never clicks: a 20 ms ramp in the stream engine for prepared clips, a 5 ms time constant for whole clips. In `state.volume`. |
 | `setMix(mix)` | 0 = stem A … 1 = stem B; the gains follow `mixLaw`. Fetches stem B on first use. |
 | `setProcessing(patch)` | Any subset of `ProcessingState`. |
 | `setSourceB(input \| null)` | Install (or remove) stem B for the current clip directly. |
@@ -339,6 +346,8 @@ preview and the spectrogram follow the same gains.
   aligned tracks keep their level, 50% included. For two versions of one
   recording. Different recordings are not loudness-matched; misaligned or
   phase-inverted tracks can still cancel.
+- `mixLaw: 'equal-power'`: gains `cos` / `sin` of the knob. Keeps the level of
+  two *uncorrelated* tracks; on a correlated pair it bumps the middle by 3 dB.
 - `mixLaw: 'separation'`: for stems that add up to the original, such as the
   two parts of a separation. Both play at full in the middle, so 0.5 is the
   original, and each fades out towards the far end: 0 is stem A alone, 1 is
@@ -363,6 +372,157 @@ createAudioPlayer({
     },
 });
 ```
+
+### Stem B on prepared clips (server-processed dry/wet)
+
+For a prepared recording, stem B is a processed version of A (denoised,
+restored, enhanced). It is made **on the server, before the file is
+published**. The flow is: the server processes A → `prepareAudio` prepares A
+and B → the manifest is published. One manifest per file, written once. The
+player reads it as published: either B is in it, or it is not. B never "arrives
+later".
+
+```ts
+import { prepareAudio, dockerProcessor, commandProcessor, httpProcessor, functionProcessor } from '@saitdigital/rt-dspplr/prepare';
+
+// A ready-made B ...
+await prepareAudio('call.wav', { outDir, stems: { b: { input: 'call.denoised.wav' } } }).done;
+// ... or a processor that makes B from A (here: ffmpeg's denoiser in a container without network)
+await prepareAudio('call.wav', {
+    outDir,
+    stems: { b: { processor: dockerProcessor({ image: 'my-ffmpeg', entrypoint: 'ffmpeg',
+        args: ['-i', '{in}', '-af', 'afftdn', '{out}'], id: 'afftdn', version: '1' }) } },
+}).done;
+```
+
+`stems.b` takes exactly one of `input` (a path, a byte-stream factory, or
+`{ channels, sampleRate }`) and `processor`.
+
+**Stem processors** play the same part on the server that the player's plugins
+play in the browser. A processor has this shape:
+
+```ts
+interface StemProcessor {
+    id: string; version: string; params?: Record<string, unknown>; timeoutMs?: number;
+    run(input: { path, stream(), sampleRate, channels, frames, tmpDir, signal, onProgress? }):
+        Promise<{ path } | { stream } | { channels: Float32Array[]; sampleRate }>;
+}
+```
+
+- **Input.** `path` is A's file: the input itself, or a temporary copy when A came as
+  a stream. The scratch folder `tmpDir` is removed afterwards.
+- **Output.** It can be at any rate, any channel count, any length, and in any
+  format the decoder hook reads.
+- **Adapters**, each with a timeout, cancellation and errors that name the
+  processor:
+  - `commandProcessor({ command, args: ['{in}', '{out}'] })` runs any CLI.
+  - `httpProcessor({ url, method, headers, field, timeoutMs })` POSTs A, either as the
+    raw body or as multipart under `field`, and reads B from the response.
+  - `dockerProcessor({ image, args, entrypoint, network: 'none' })`: A is mounted
+    read-only at `/in`, `{out}` is under `/work`, and the container is killed on cancel.
+  - `functionProcessor(fn, { id, version })` wraps a function.
+- **Concurrency.** The processor runs beside A's own segments and analyses. It starts
+  as soon as A's format is known.
+- **Timings** are in `job.stats.timings`: `{ aMs, processorMs, processorWaitMs, stemMs }`.
+- **Provenance.** `stems.b.processor = { id, version, params, durationMs }` and
+  `stems.b.aSourceId` (A's sha256) let a host detect a stale B (a new model or
+  version) and reprocess.
+- **Failure.** The job fails. With `onProcessorError: 'skip'`, A is published alone,
+  the error is recorded in `stems.b` (status 'failed'), and `job.stats.warnings`
+  says so.
+
+Then prepare **aligns and adapts** B:
+
+- **Alignment.** Normalised FFT cross-correlation on 8 windows of 2 s, searching
+  ±1 s (`maxOffsetSeconds`). Only those windows are resampled. The median lag of
+  the windows that agree (within ±2 frames) is compensated, and `confidence` is
+  their median peak.
+  - A low confidence fails the job, or with `onLowConfidence: 'warn'` A is published
+    alone with the refusal and the measured alignment recorded.
+  - `offsetFrames` skips the measurement.
+- **Format.** B is converted once: downmixed when A is mono, resampled to A's rate
+  on the worker pool (bit-identical for any thread count), mapped onto A's
+  channels, and padded or trimmed to A's length. It is cut on A's segment grid,
+  with its own peaks, bands and spectrogram under `b/`. `source.bandwidthHz` records
+  how high B reaches (a 16 kHz enhancer: about 7–8 kHz).
+- **Level.** B is **never** loudness-matched. `loudnessDeltaDb` (B − A, gated RMS) is
+  information only. `gainDb` (default 0) is an explicit, opt-in trim.
+- **Mix law.** It comes from the measured zero-lag correlation. `crossfade` (linear)
+  is used for a correlated pair (ρ ≥ 0.5): the level stays put at every knob position.
+  `equal-power` is used when the pair is decorrelated. The player's `mixLaw` option
+  overrides it.
+
+**In the player**:
+- With B in the manifest, the knob is enabled (`capabilities.canMixStemB`,
+  `statusB 'ready'`). B's segments are fetched only while the knob is above 0.
+  Moving the knob prefetches them, and they are let go about 10 s after it is
+  back at 0.
+- Without B, the knob is disabled (`statusB 'unavailable'`). There is no
+  "processing" state.
+- The waveform and the spectrogram (overview and decoded window) draw the blend
+  with the same gains.
+
+`attachStem(dir, 'b', input)` is a secondary server-side utility. It adds B to a
+folder that is already prepared, using the same code as `prepareAudio`, and
+rewrites the manifest atomically with `revision` + 1. A host that replaces a
+published manifest can call `player.refreshManifest()`. Nothing polls by
+default. Hosts that publish before B exists can opt in with
+`segmented.pollStemsMs` and `markStem(dir, 'b', 'processing')`. Only then do the
+player and the card show "processing…".
+
+## DSP plugins (effects)
+
+Every sound effect is a plugin in one chain per player, the built-ins included:
+`rtd.highpass` (the high-pass) and `rtd.dynamics` (compressor, output gain and
+ceiling as one plugin, because the gain sits between the compressor and the
+limiter). `setHighPass`, `setCompression` and `setOutputGain` drive them.
+
+Signal chain: **source (A/B mix → realtime stretch) → effects → volume → analyser → output.**
+
+- The mix is first because the effects process what you hear: one compressor on the
+  blend, not two compressors that are summed.
+- The stretch comes before the effects so that a compressor's or a filter's time
+  constants stay in real time at any speed. The stretcher also sees the dry signal,
+  without a limiter's pumping. The engine mixes A and B before it stretches them, so
+  there is one stretcher, not two that drift apart.
+- Volume is a post-insert fader. It never changes how hard the compressor works.
+  The analyser and the meters sit after it.
+
+```ts
+import { threeBandEq } from './three-band-eq.js';   // examples/plugins/three-band-eq.js
+
+const id = player.effects.add(threeBandEq, { params: { high: -12 } });
+player.effects.setParam(id, 'low', 6);       // validated against the schema (clamped; unknown id throws)
+player.effects.bypass(id, true);             // wet/dry crossfade, click-free
+player.effects.move(id, 0);
+player.effects.remove(id);
+player.getState().effects;                   // [{ id, plugin, params, bypassed, error }]
+player.getState().previewCoverage;           // { waveform, spectrogram, overview, missing: [names] }
+```
+
+A plugin (`DspPlugin`) is plain data plus functions:
+
+- `id`, `name`, `version`, and `params`: `[{ id, label, unit, min, max, default,
+  scale: 'linear' | 'log', step, format }]`. The card's Post FX panel renders sliders
+  from this schema.
+- `realtime`: either `{ kind: 'nodes', create(ctx, params) → { input, output,
+  setParam(id, value, timeConstant), dispose } }` with any Web Audio nodes, or
+  `{ kind: 'worklet', processorName, moduleUrl | moduleCode }`, where every param
+  becomes an AudioParam.
+- `preview` (optional; the owner's rule is that whatever you hear, you also see):
+  - `magnitudeResponse(params, freqs, sampleRate) → dB[]` for linear effects (EQ,
+    filters). The spectrogram applies it per row at paint time, and the prepared overview
+    of the waveform approximates from it.
+  - `process(channels, sampleRate, params, state)` is a self-contained function, run in
+    the preview workers on the clip's audio, for the waveform (exact in the decoded
+    window).
+  - An effect without a preview still plays. `previewCoverage.missing` names it, and
+    the card says "Not in the preview: …".
+- `latencyFrames`: reported in `state.effectsLatencyFrames`.
+
+**Crash isolation**: a plugin that throws in `create()`, or whose worklet processor
+throws, is bypassed. The `effecterror` event and `effects[i].error` report it, and
+playback goes on. A preview function that throws is left out of the preview.
 
 ## Timeline
 
@@ -553,9 +713,13 @@ WASM fails to load at runtime, each job falls back to the built-in vocoder.
 
 ## Bundlers, workers, CSP
 
-The core and React entries contain four small scripts as strings: the
+The core and React entries contain six small scripts as strings: the
 dynamics AudioWorklet (~2 KB), the vocoder worker (~5 KB), the waveform
-peaks worker (~5 KB) and the spectrogram worker (~7 KB). Each is started from
+peaks worker (~5 KB), the spectrogram worker (~7 KB), the overview
+preview worker of prepared clips (~3 KB) and the stream engine AudioWorklet
+of prepared clips (~6 KB). The realtime stretcher of prepared clips
+(Signalsmith Stretch, MIT, ~100 KB of WASM) is a separate chunk, loaded by a
+dynamic `import()` only when a prepared clip plays. Each is started from
 a `blob:` URL the first time it is needed. No extra files, loaders, or `new URL()` patterns are involved. The
 same build is verified in Vite (dev and build) and webpack 5. Nothing in it is
 bundler-specific, so other ESM bundlers should behave the same.
@@ -631,9 +795,10 @@ Eviction never interrupts playback. Rendering a speed variant needs little
 beyond the variant itself: the built-in vocoder goes through clips longer than
 15 s frame by frame (see [Time-stretch strategies](#time-stretch-strategies)).
 For large files or constrained devices, set `prewarmSpeeds: false`, avoid
-unnecessary stem B prefetch, and dispose unused players. Full-file decoding
-remains required; this is not a streaming player or a solution for arbitrarily
-long recordings.
+unnecessary stem B prefetch, and dispose unused players. Whole clips are
+decoded in full. For long recordings, the experimental prepared (manifest)
+source keeps only about a minute of decoded audio around the playhead; see
+[docs/long-audio-experiment.md](../../docs/long-audio-experiment.md).
 
 ```ts
 import { setAudioCacheBudget, getAudioCacheStats, clearAudioCache } from '@saitdigital/rt-dspplr';
@@ -674,7 +839,7 @@ included in these sizes or in the npm artifact.
 ## Validation
 
 ```bash
-npm test                  # stretch lengths, level and timing, shared cache, scheduling, worker failures, the ruler, untouched audio at the defaults
+npm test                  # stretch lengths, level and timing, shared cache, scheduling, worker failures, the ruler, untouched audio at the defaults, the prepare step (WAV reader, resampler, segments, peaks, bands, spectrogram)
 npm run typecheck
 npm run test:browser      # build + Chromium AudioContext/worker/React tests (workspace root)
 npm run test:package      # build + npm artifact installed in an isolated consumer (workspace root)

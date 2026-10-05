@@ -980,3 +980,26 @@
         background-position: 50% 0;
     }
 }
+
+/* Speed on a source that cannot keep the pitch (a prepared, segmented clip). */
+.rtd-pitch-note {
+    align-self: center;
+    padding: 0 6px;
+    font-size: 11px;
+    color: var(--rtd-danger);
+    white-space: nowrap;
+}
+
+/* Post FX: third-party effects, rendered from their schema. */
+.rtd-sound-plugin { border-top: 1px solid var(--rtd-border); padding-top: 8px; margin-top: 4px; }
+.rtd-sound-plugin-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin-bottom: 4px; }
+.rtd-sound-plugin-name { font-weight: 600; }
+.rtd-sound-plugin-bypass { display: inline-flex; gap: 4px; align-items: center; color: var(--rtd-text-muted); }
+.rtd-sound-plugin-error { color: var(--rtd-danger); }
+.rtd-sound-note[data-preview-missing] { color: var(--rtd-danger); }
+
+.rtd-mixer-note {
+    color: var(--rtd-text-muted);
+    font-size: 11px;
+    white-space: nowrap;
+}

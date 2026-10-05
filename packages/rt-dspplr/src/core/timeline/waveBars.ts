@@ -29,13 +29,14 @@ export function computeBarHeights(
 
     const binSize = Math.max(1, level.binSize);
     const lastBin = level.maxPeaks.length - 1;
+    const base = level.startBin ?? 0;
     const span = (endSample - startSample) / barCount;
 
     for (let i = 0; i < barCount; i += 1) {
         const from = startSample + i * span;
         const to = from + span;
-        const firstBin = Math.min(lastBin, Math.max(0, Math.floor(from / binSize)));
-        const endBin = Math.min(level.maxPeaks.length, Math.max(firstBin + 1, Math.ceil(to / binSize)));
+        const firstBin = Math.min(lastBin, Math.max(0, Math.floor(from / binSize - base)));
+        const endBin = Math.min(level.maxPeaks.length, Math.max(firstBin + 1, Math.ceil(to / binSize - base)));
         let peak = 0;
         let rms = 0;
         for (let b = firstBin; b < endBin; b += 1) {

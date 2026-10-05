@@ -1,0 +1,59 @@
+/* Long-audio example page. The timelines are styled by the package's styles.css. */
+:root {
+    --long-bg: #f6f6f4;
+    --long-panel: #ffffff;
+    --long-line: #e4e4e0;
+    --long-text: #1c1d1f;
+    --long-muted: #62656b;
+    --long-accent: #0f766e;
+    color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --long-bg: #111315;
+        --long-panel: #17191c;
+        --long-line: #2b2f34;
+        --long-text: #e7e9ec;
+        --long-muted: #9ba3ad;
+        --long-accent: #2dd4bf;
+    }
+}
+body {
+    margin: 0;
+    background: var(--long-bg);
+    color: var(--long-text);
+    font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+#app { max-width: 1280px; margin: 0 auto; padding: 16px; }
+.long-header h1 { font-size: 20px; margin: 8px 0 4px; }
+.long-muted { color: var(--long-muted); }
+.long-list { list-style: none; padding: 0; margin: 16px 0; display: grid; gap: 6px; }
+.long-item {
+    display: flex; gap: 8px; align-items: center; padding: 8px 12px;
+    background: var(--long-panel); border: 1px solid var(--long-line); border-radius: 8px;
+}
+.long-item-info { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.long-btn {
+    font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--long-line); background: var(--long-panel); color: var(--long-text);
+}
+.long-btn:disabled { opacity: 0.45; cursor: default; }
+.long-btn-accent { border-color: var(--long-accent); color: var(--long-accent); }
+.long-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 480px), 1fr)); gap: 16px; }
+.long-panel {
+    background: var(--long-panel); border: 1px solid var(--long-line); border-radius: 10px; padding: 12px;
+    min-width: 0;
+}
+.long-panel-title { font-size: 15px; margin: 0 0 8px; }
+.long-seek { height: 110px; }
+.long-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+.long-select { font: inherit; padding: 4px; }
+.long-range { width: 90px; }
+.long-label { color: var(--long-muted); font-size: 12px; }
+.long-time { margin-left: auto; font-variant-numeric: tabular-nums; }
+.long-metrics { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; font-size: 13px; }
+.long-metrics dt { color: var(--long-muted); }
+.long-metrics dd { margin: 0; font-variant-numeric: tabular-nums; }
+.long-spec { height: 90px; margin-top: 6px; }
+.long-toggle { display: block; margin: 12px 0 0; color: var(--long-muted); cursor: pointer; }
+.long-card { min-width: 0; }

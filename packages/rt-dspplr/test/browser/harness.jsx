@@ -62,10 +62,16 @@ function TimelinePage(props) {
     useEffect(() => { window.timelinePlayer = player.player; void player.load(buffer()); }, [player.player]);
     return <div ref={player.ref}><div style={{ height: 120 }}><Timeline player={player} {...props} /></div><div style={{ height: 3000 }} /></div>;
 }
+function CardPage({ clip, options }) {
+    const player = useAudioPlayer({ prewarmSpeeds: false, ...options });
+    useEffect(() => { window.cardPlayer = player.player; void player.load(clip); }, [player.player, clip]);
+    return <div style={{ width: 720 }}><AudioPlayer player={player} title="Card" /></div>;
+}
 window.h = { ...api, advanced, sleep, buffer, wav, slowBlob, delayedStrategy, make, rms,
     mountMenu(layout, options) { const root = createRoot(document.getElementById('root')); root.render(<AudioPlayer layout={layout} title="Example" options={options} />); return root; },
     renderMenu(root, layout) { root.render(<AudioPlayer layout={layout} title="Example" />); },
     mountCustom() { const root = createRoot(document.getElementById('root')); root.render(<StrictMode><CustomPlayer /></StrictMode>); return root; },
     mountTimeline(props) { const root = createRoot(document.getElementById('root')); root.render(<TimelinePage {...props} />); return root; },
+    mountCard(clip, options) { const root = createRoot(document.getElementById('root')); root.render(<CardPage clip={clip} options={options} />); return root; },
     mountStrict() { const root = createRoot(document.getElementById('root')); root.render(<StrictMode><StrictPlayer clip={buffer()} /></StrictMode>); return root; },
 };

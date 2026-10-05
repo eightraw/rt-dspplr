@@ -1,6 +1,7 @@
 import { defineConfig } from '@playwright/test';
 export default defineConfig({
     testDir: './test/browser',
+    globalSetup: './test/browser/long-fixtures.mjs',
     timeout: 20000,
     workers: 1,
     use: { baseURL: 'http://127.0.0.1:4179', launchOptions: { args: ['--autoplay-policy=no-user-gesture-required'] } },

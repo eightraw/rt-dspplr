@@ -9,7 +9,11 @@
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.node.json && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
-    "samples": "bash scripts/make-samples.sh"
+    "samples": "bash scripts/make-samples.sh",
+    "long:gen": "node scripts/long/gen-test-wavs.mjs",
+    "long:gen:quick": "node scripts/long/gen-test-wavs.mjs --quick",
+    "long:prepare": "node scripts/long/prepare-all.mjs",
+    "long:stems": "node scripts/long/make-stems.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

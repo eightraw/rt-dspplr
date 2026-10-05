@@ -12,6 +12,7 @@ import {
     formatPercentLabel,
     mixGains,
 } from '../core/controls';
+import { paramToUnit, unitToParam, type EffectState, type PluginParam } from '../core/effects/types';
 import { formatSpeed } from './format';
 import { IconSpinner } from './icons';
 
@@ -20,16 +21,26 @@ import { IconSpinner } from './icons';
 
 // ---- Speed -----------------------------------------------------------------
 
-export function SpeedSegments({ speeds, value, onChange, disabled, pending }: {
+export function SpeedSegments({ speeds, value, onChange, disabled, pending, pitchNote }: {
     speeds: readonly number[];
     value: number;
     onChange: (speed: number) => void;
     disabled?: boolean;
     pending?: number | null;
+    /** The source cannot keep the pitch (a prepared clip): say so, visibly. */
+    pitchNote?: boolean;
 }) {
     const name = useId();
+    const shifted = !!pitchNote && Math.abs(value - 1) >= 0.001;
     return (
-        <div className="rtd-seg" role="radiogroup" aria-label="Playback speed" aria-busy={pending != null}>
+        <div
+            className="rtd-seg"
+            role="radiogroup"
+            aria-label={pitchNote ? 'Playback speed (pitch follows speed)' : 'Playback speed'}
+            aria-busy={pending != null}
+            data-pitch-shift={pitchNote ? (shifted ? 'on' : 'off') : undefined}
+            title={pitchNote ? 'This recording plays segment by segment: speed changes shift the pitch.' : undefined}
+        >
             <span className="rtd-sr-only" role="status">{pending != null ? `Preparing ${formatSpeed(pending)}` : ''}</span>
             {speeds.map((speed) => {
                 const checked = Math.abs(speed - value) < 0.001;
@@ -48,6 +59,7 @@ export function SpeedSegments({ speeds, value, onChange, disabled, pending }: {
                     </label>
                 );
             })}
+            {shifted ? <span className="rtd-pitch-note" aria-hidden="true">pitch ±</span> : null}
         </div>
     );
 }
@@ -60,13 +72,15 @@ export function MixSlider({ core, state }: { core: AudioPlayerCore; state: Audio
     const [gainA, gainB] = mixGains(mix, state.mixLaw);
     const valueText = gainB <= 0 ? 'Stem A only' : gainA <= 0 ? 'Stem B only'
         : `Stem A ${Math.round(gainA * 100)}%, stem B ${Math.round(gainB * 100)}%`;
-    const available = state.statusB !== 'unavailable';
+    const available = state.statusB !== 'unavailable' && state.statusB !== 'processing';
     // Without stem B the slider stays usable only to bring a value
     // left over from the previous clip back down.
     const disabled = state.clipId === null || (!available && mix <= 0);
     const hint = state.clipId === null
         ? 'Load a clip first'
-        : !available
+        : state.statusB === 'processing'
+            ? 'Processed stem is being prepared on the server…'
+            : !available
             ? 'No stem B for this clip'
             : state.statusB === 'error'
                 ? 'Stem B could not be loaded; stem A keeps playing'
@@ -99,8 +113,9 @@ export function MixSlider({ core, state }: { core: AudioPlayerCore; state: Audio
             />
             <span className="rtd-mixer-end" aria-hidden="true">Stem B</span>
             <span className="rtd-mixer-status" aria-live="polite">
-                {state.statusB === 'loading' ? <IconSpinner /> : state.statusB === 'error' ? '!' : null}
+                {state.statusB === 'loading' || state.statusB === 'processing' ? <IconSpinner /> : state.statusB === 'error' ? '!' : null}
             </span>
+            {state.statusB === 'processing' ? <span className="rtd-mixer-note" data-stem-processing="">processing…</span> : null}
             <span id={`${id}-hint`} className="rtd-sr-only">{hint}</span>
         </div>
     );
@@ -193,8 +208,15 @@ export function SoundPanel({ core, state }: { core: AudioPlayerCore; state: Audi
                 onChange={(step) => core.setOutputGain(stepToOutputDb(step))}
                 onReset={() => core.setOutputGain(OUTPUT_DEFAULT_DB)}
             />
+            {state.effects.filter((e) => !e.plugin.builtin).map((effect) => (
+                <PluginRows key={effect.id} core={core} effect={effect} />
+            ))}
             <div className="rtd-sound-foot">
-                <span className="rtd-sound-note">Previewed on the waveform</span>
+                <span className="rtd-sound-note" data-preview-missing={state.previewCoverage.missing.length > 0 || undefined}>
+                    {state.previewCoverage.missing.length > 0
+                        ? `Not in the preview: ${state.previewCoverage.missing.join(', ')}`
+                        : 'Previewed on the waveform and the spectrogram'}
+                </span>
                 <button
                     type="button"
                     className="rtd-btn rtd-btn-quiet"
@@ -208,6 +230,58 @@ export function SoundPanel({ core, state }: { core: AudioPlayerCore; state: Audi
                     Reset
                 </button>
             </div>
+        </div>
+    );
+}
+
+// ---- Third-party effects: rows from each plugin's schema ---------------------------
+
+const UNIT_STEPS = 1000;
+
+function formatParam(spec: PluginParam, value: number): string {
+    if (spec.format) return spec.format(value);
+    const digits = Math.abs(value) >= 100 ? 0 : Math.abs(value) >= 10 ? 1 : 2;
+    return `${value.toFixed(digits)}${spec.unit ? ` ${spec.unit}` : ''}`;
+}
+
+function PluginRows({ core, effect }: { core: AudioPlayerCore; effect: EffectState }) {
+    const id = useId();
+    const { plugin } = effect;
+    return (
+        <div className="rtd-sound-plugin" data-plugin={plugin.id} data-error={effect.error ? '' : undefined}>
+            <div className="rtd-sound-plugin-head">
+                <span className="rtd-sound-plugin-name">{plugin.name}</span>
+                {effect.error
+                    ? <span className="rtd-sound-plugin-error" title={effect.error}>failed · bypassed</span>
+                    : (
+                        <label className="rtd-sound-plugin-bypass" htmlFor={id}>
+                            <input
+                                id={id}
+                                type="checkbox"
+                                checked={!effect.bypassed}
+                                onChange={(event: ChangeEvent<HTMLInputElement>) => core.effects.bypass(effect.id, !event.currentTarget.checked)}
+                            />
+                            on
+                        </label>
+                    )}
+            </div>
+            {plugin.params.map((spec) => {
+                const value = effect.params[spec.id] ?? spec.default;
+                const linearStep = spec.scale !== 'log' && spec.step && spec.step > 0;
+                return (
+                    <SoundRow
+                        key={spec.id}
+                        label={spec.label}
+                        readout={formatParam(spec, value)}
+                        min={0}
+                        max={linearStep ? Math.round((spec.max - spec.min) / spec.step!) : UNIT_STEPS}
+                        step={1}
+                        value={linearStep ? Math.round((value - spec.min) / spec.step!) : Math.round(paramToUnit(spec, value) * UNIT_STEPS)}
+                        onChange={(pos) => core.effects.setParam(effect.id, spec.id, linearStep ? spec.min + pos * spec.step! : unitToParam(spec, pos / UNIT_STEPS))}
+                        onReset={() => core.effects.setParam(effect.id, spec.id, spec.default)}
+                    />
+                );
+            })}
         </div>
     );
 }

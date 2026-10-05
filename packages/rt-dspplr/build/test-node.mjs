@@ -8,7 +8,18 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = path.join(root, 'node_modules', '.cache', 'rtd-test');
 fs.mkdirSync(outDir, { recursive: true });
 
-for (const name of ['stretch', 'dynamics', 'ruler']) {
+// prepare's worker_threads entry, next to the bundled tests (the pool looks for it there).
+await build({
+    entryPoints: [path.join(root, 'src/prepare/worker.ts')],
+    outfile: path.join(outDir, 'prepare-worker.mjs'),
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+    logLevel: 'warning',
+});
+
+for (const name of ['stretch', 'dynamics', 'ruler', 'prepare']) {
     const outFile = path.join(outDir, `${name}.test.mjs`);
     await build({
         entryPoints: [path.join(root, `test/${name}.test.ts`)],

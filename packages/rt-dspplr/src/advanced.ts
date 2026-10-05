@@ -8,6 +8,7 @@ export {
     type ClipInfo,
     type ClipInput,
     type ClipSource,
+    type ManifestClip,
     type LoaderB,
     type StatusB,
     type LoadOptions,
@@ -133,3 +134,50 @@ export { SpectrogramAnalyzer, type SpectrogramData, type SpectrogramRequest } fr
 export { paintSpectrogram, type SpectrogramLook } from './core/spectrogram/paint';
 export { sampleSpectralPyramid } from './core/spectrogram/sample';
 export type { SpectralPyramid, SpectralLevel } from './core/spectrogram/protocol';
+
+// Prepared long recordings: `play({ manifest })` on any player. Prepare them with
+// `@saitdigital/rt-dspplr/prepare` (Node) or `rtd-prepare`.
+export type { SourceKind, SourceCapabilities } from './core/sources/types';
+export type { PreparedOverview, WindowAudio, StreamStats, SegmentedOptions } from './core/sources/SegmentedSource';
+/** @deprecated aliases of the first long-audio experiment */
+export {
+    StreamPlayerCore,
+    createStreamPlayer,
+    type StreamClip,
+    type StreamClipInput,
+    type StreamPlayerOptions,
+    type StreamPlayerState,
+} from './core/stream/StreamPlayer';
+export { SegmentScheduler, type ScheduledSegment, type LoopFrames } from './core/stream/SegmentScheduler';
+export { SegmentStore, type SegmentDecode, type SegmentStoreOptions, type SegmentStoreStats } from './core/stream/SegmentStore';
+export { decodePeaksFile, encodePeaksFile, peaksToPyramid, mergeLevel, type PeaksFile, type PeakLevelData } from './core/stream/peaksFile';
+export { parseWavFile, parseWavHeader, wavHeader16, type WavFormat } from './core/stream/wavFormat';
+export { assertManifest, MANIFEST_FORMAT_VERSION, ANALYZER_VERSION, type AudioManifest, type ManifestSegment } from './core/stream/manifest';
+export type { TimelinePlayer } from './core/timeline/TimelineCore';
+export { BufferSource, type BufferSourceSettings } from './core/sources/BufferSource';
+export { SegmentedSource, WINDOW_MAX_SECONDS } from './core/sources/SegmentedSource';
+export type { PlaybackSource, SourceHost, SourceOutput } from './core/sources/types';
+export { EffectChain } from './core/effects/EffectChain';
+export { decodeBandsFile, highPassEnergyRatio, type BandsFile } from './core/stream/bandsFile';
+export { decodeSpectrogramFile, toSpectralPyramid, type SpectrogramFile } from './core/stream/spectrogramFile';
+export { approximateProcessedPyramid } from './core/waveform/approxPreview';
+export { followWaveform } from './core/waveform/followWaveform';
+export { resolveColumns } from './core/timeline/waveEnvelope';
+export { subscribeDspPreview, type DspPreview, type PreviewPlayer } from './core/waveform/followWaveform';
+export { applyDspToSpectrogram, highPassResponse, rowFrequencies } from './core/spectrogram/dspPaint';
+export { gainOver, type GainTrack } from './core/waveform/gainTrack';
+export { StreamEngine, loadStreamEngine, stretchAvailable, type EngineReport, type StreamEngineOptions } from './core/engine/StreamEngine';
+export {
+    validateParam,
+    resolveParams,
+    paramToUnit,
+    unitToParam,
+    type DspPlugin,
+    type PluginParam,
+    type PluginParams,
+    type PluginInstance,
+    type EffectState,
+    type PreviewCoverage,
+} from './core/effects/types';
+export { highPassPlugin, dynamicsPlugin } from './core/effects/builtins';
+export { previewSettings, previewCoverage, previewCode, type PreviewSettings, type PreviewStage } from './core/effects/preview';

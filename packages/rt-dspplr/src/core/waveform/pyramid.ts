@@ -1,5 +1,12 @@
 export interface WaveformPeakLevel {
     binSize: number;
+    /**
+     * A partial level (the stream player's live detail of the segments on
+     * screen) starts at this bin; its arrays then cover bins
+     * [startBin, startBin + length); it may be fractional (bins aligned to
+     * the window's first frame). Absent: the level covers the clip.
+     */
+    startBin?: number;
     minPeaks: Float32Array;
     maxPeaks: Float32Array;
     rmsPeaks: Float32Array;
@@ -99,8 +106,17 @@ export function pickPeakPyramidLevel<Level extends { binSize: number } = Wavefor
     const visibleSamples = Math.max(1, safeEnd - safeStart);
     const desiredBins = Math.max(1, targetBins);
 
-    let selectedLevel = pyramid.levels[0];
-    for (const level of pyramid.levels) {
+    // Partial levels (startBin set) are used only when they cover the range.
+    const covers = (level: Level) => {
+        const first = (level as { startBin?: number }).startBin;
+        if (first === undefined) return true;
+        const length = (level as { maxPeaks?: ArrayLike<number> }).maxPeaks?.length ?? 0;
+        return first * level.binSize <= safeStart && (first + length) * level.binSize >= safeEnd;
+    };
+    const usable = pyramid.levels.filter(covers);
+    if (usable.length === 0) return null;
+    let selectedLevel = usable[0];
+    for (const level of usable) {
         selectedLevel = level;
         const visibleBins = visibleSamples / Math.max(1, level.binSize);
         if (visibleBins <= desiredBins) {

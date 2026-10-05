@@ -14,6 +14,22 @@ import type {
     SpectrogramResponse,
     SpectrogramUnloadMessage,
 } from './protocol';
+import {
+    REFERENCE_FFT,
+    type Fft,
+    fftOf,
+    loadFrame,
+    transform,
+    type RowPlan,
+    rowValue,
+    type Band,
+    planBands,
+    PYRAMID_MIN_HOP,
+    PYRAMID_MAX_FRAMES,
+    PYRAMID_BANDS,
+    framesOfStem,
+    halve,
+} from './spectral';
 
 type WorkerMessage = SpectrogramLoadMessage | SpectrogramComputeMessage | SpectrogramPyramidMessage | SpectrogramUnloadMessage;
 
@@ -21,9 +37,6 @@ const workerScope = self as unknown as {
     onmessage: ((event: MessageEvent<WorkerMessage>) => void) | null;
     postMessage(message: unknown, transfer?: Transferable[]): void;
 };
-
-/** FFT length used for the clip-wide reference level. */
-const REFERENCE_FFT = 2048;
 
 interface Clip {
     loadId: number;
@@ -37,188 +50,6 @@ interface Clip {
 
 /** What each view on the page has loaded. */
 const clips = new Map<number, Clip>();
-
-// ---- FFT ---------------------------------------------------------------------
-//
-// A real FFT of size N through one complex FFT of size N/2, with a Hann
-// window. Tables are kept per size, since a multi-resolution request uses two.
-
-interface Fft {
-    size: number;
-    half: number;
-    /** Brings magnitudes to the scale of a 2048-point FFT, so bands of different lengths meet. */
-    norm: number;
-    hann: Float32Array;
-    bitReverse: Uint32Array;
-    cos: Float32Array;
-    sin: Float32Array;
-    splitCos: Float32Array;
-    splitSin: Float32Array;
-    re: Float32Array;
-    im: Float32Array;
-    frame: Float32Array;
-    spectrum: Float32Array;
-}
-
-const ffts = new Map<number, Fft>();
-
-function fftOf(size: number): Fft {
-    const known = ffts.get(size);
-    if (known) return known;
-    const half = size >> 1;
-    const hann = new Float32Array(size);
-    // Symmetric Hann window, zero at both ends.
-    for (let n = 0; n < size; n += 1) hann[n] = 0.5 - 0.5 * Math.cos((2 * Math.PI * n) / (size - 1));
-    const bits = Math.log2(half);
-    const bitReverse = new Uint32Array(half);
-    for (let i = 0; i < half; i += 1) {
-        let r = 0;
-        for (let b = 0; b < bits; b += 1) r |= ((i >> b) & 1) << (bits - 1 - b);
-        bitReverse[i] = r;
-    }
-    const cos = new Float32Array(half >> 1);
-    const sin = new Float32Array(half >> 1);
-    for (let i = 0; i < half >> 1; i += 1) {
-        cos[i] = Math.cos((2 * Math.PI * i) / half);
-        sin[i] = Math.sin((2 * Math.PI * i) / half);
-    }
-    const splitCos = new Float32Array(half + 1);
-    const splitSin = new Float32Array(half + 1);
-    for (let k = 0; k <= half; k += 1) {
-        splitCos[k] = Math.cos((2 * Math.PI * k) / size);
-        splitSin[k] = Math.sin((2 * Math.PI * k) / size);
-    }
-    const fft: Fft = {
-        size, half, norm: REFERENCE_FFT / size, hann, bitReverse, cos, sin, splitCos, splitSin,
-        re: new Float32Array(half),
-        im: new Float32Array(half),
-        frame: new Float32Array(size),
-        spectrum: new Float32Array(half + 1),
-    };
-    ffts.set(size, fft);
-    return fft;
-}
-
-const FROM_INT16 = 1 / 32767;
-
-/** Load the frame of `stem` centred on sample `centre` (zeros outside the clip). */
-function loadFrame(fft: Fft, stem: Int16Array, centre: number): void {
-    const start = Math.round(centre - fft.size / 2);
-    const frame = fft.frame;
-    for (let n = 0; n < fft.size; n += 1) {
-        const at = start + n;
-        frame[n] = at >= 0 && at < stem.length ? stem[at] * FROM_INT16 : 0;
-    }
-}
-
-/** |X[k]| for k = 0 … N/2 of the windowed frame, into `fft.spectrum`. */
-function transform(fft: Fft): Float32Array {
-    const { half, norm, hann, bitReverse, re, im, frame, cos, sin, splitCos, splitSin, spectrum } = fft;
-    for (let n = 0; n < half; n += 1) {
-        const j = bitReverse[n];
-        re[j] = frame[2 * n] * hann[2 * n];
-        im[j] = frame[2 * n + 1] * hann[2 * n + 1];
-    }
-    for (let size = 2; size <= half; size <<= 1) {
-        const step = half / size;
-        const span = size >> 1;
-        for (let start = 0; start < half; start += size) {
-            for (let k = 0; k < span; k += 1) {
-                const c = cos[k * step];
-                const s = -sin[k * step];
-                const a = start + k;
-                const b = a + span;
-                const tr = re[b] * c - im[b] * s;
-                const ti = re[b] * s + im[b] * c;
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
-            }
-        }
-    }
-    for (let k = 0; k <= half; k += 1) {
-        const a = k % half;
-        const b = (half - k) % half;
-        const er = (re[a] + re[b]) * 0.5;
-        const ei = (im[a] - im[b]) * 0.5;
-        const or = (re[a] - re[b]) * 0.5;
-        const oi = (im[a] + im[b]) * 0.5;
-        // (odd part) / i, times e^(-2πik/N)
-        const tr = oi;
-        const ti = -or;
-        const c = splitCos[k];
-        const s = splitSin[k];
-        const xr = er + tr * c + ti * s;
-        const xi = ei + ti * c - tr * s;
-        spectrum[k] = Math.sqrt(xr * xr + xi * xi) * norm;
-    }
-    return spectrum;
-}
-
-// ---- Frequency rows ------------------------------------------------------------
-//
-// Rows on a geometric scale; a row wider than two bins takes the loudest of them,
-// so a thin harmonic cannot fall between rows, and a narrower one is
-// interpolated in dB between the two nearest bins.
-
-interface RowPlan {
-    lo: Int32Array;
-    hi: Int32Array;
-    below: Int32Array;
-    weight: Float32Array;
-    /** Centre of each output row in Hz (row 0 = top). */
-    hz: Float32Array;
-}
-
-function planRows(fft: Fft, sampleRate: number, rows: number, minHz: number, maxHz: number): RowPlan {
-    const bins = fft.half + 1;
-    const plan: RowPlan = {
-        lo: new Int32Array(rows),
-        hi: new Int32Array(rows),
-        below: new Int32Array(rows),
-        weight: new Float32Array(rows),
-        hz: new Float32Array(rows),
-    };
-    const toBin = fft.size / sampleRate;
-    const ratio = maxHz / minHz;
-    for (let r = 0; r < rows; r += 1) {
-        const centreHz = minHz * Math.pow(ratio, rows > 1 ? r / (rows - 1) : 0);
-        const centre = centreHz * toBin;
-        const lowEdge = minHz * Math.pow(ratio, r / rows) * toBin;
-        const highEdge = minHz * Math.pow(ratio, (r + 1) / rows) * toBin;
-        const lo = Math.floor(lowEdge);
-        const hi = Math.ceil(highEdge);
-        // Row 0 of the output is the top of the picture, the highest frequency.
-        const row = rows - 1 - r;
-        plan.hz[row] = centreHz;
-        if (hi - lo >= 2) {
-            plan.lo[row] = Math.min(lo, bins - 1);
-            plan.hi[row] = Math.min(hi, bins);
-            plan.below[row] = -1;
-        } else {
-            const below = Math.max(0, Math.min(Math.floor(centre), bins - 2));
-            plan.below[row] = below;
-            plan.weight[row] = centre - below;
-        }
-    }
-    return plan;
-}
-
-function rowValue(spectrum: Float32Array, plan: RowPlan, row: number): number {
-    const below = plan.below[row];
-    if (below < 0) {
-        let value = 0;
-        for (let bin = plan.lo[row]; bin < plan.hi[row]; bin += 1) {
-            if (spectrum[bin] > value) value = spectrum[bin];
-        }
-        return value;
-    }
-    const k = plan.weight[row];
-    const db = 20 * Math.log10(spectrum[below] + 1e-9) * (1 - k)
-        + 20 * Math.log10(spectrum[below + 1] + 1e-9) * k;
-    return Math.pow(10, db / 20);
-}
 
 // ---- Requests -------------------------------------------------------------------
 
@@ -328,51 +159,6 @@ function fillRows(
     }
 }
 
-/** A quarter of an octave on each side of a band edge is a blend of the two bands. */
-const BLEND = Math.pow(2, 0.25);
-
-interface Band {
-    fft: Fft;
-    plan: RowPlan;
-    /** Rows this band draws (its own range plus the blends at its edges). */
-    rows: Int32Array;
-}
-
-/**
- * Bands of the frequency axis, each with its own FFT: long windows for the
- * bass, where a harmonic needs the frequency resolution, short ones for the
- * top, where attacks need the time resolution.
- */
-function planBands(
-    sampleRate: number,
-    rows: number,
-    minHz: number,
-    maxHz: number,
-    bands: { fftSize: number; fromHz: number }[],
-): { bands: Band[]; weights: Float32Array[] } {
-    const planned: Band[] = [];
-    const weights: Float32Array[] = [];
-    bands.forEach((band, index) => {
-        const fft = fftOf(band.fftSize);
-        const plan = planRows(fft, sampleRate, rows, minHz, maxHz);
-        const low = index === 0 ? 0 : band.fromHz;
-        const high = index === bands.length - 1 ? Infinity : bands[index + 1].fromHz;
-        const weight = new Float32Array(rows);
-        const own: number[] = [];
-        for (let row = 0; row < rows; row += 1) {
-            const hz = plan.hz[row];
-            // 1 inside the band, fading to 0 across a blend region at each edge.
-            const up = low <= 0 ? 1 : Math.min(1, Math.max(0, Math.log(hz / (low / BLEND)) / Math.log(BLEND * BLEND)));
-            const down = high === Infinity ? 1 : Math.min(1, Math.max(0, Math.log((high * BLEND) / hz) / Math.log(BLEND * BLEND)));
-            weight[row] = Math.min(up, down);
-            if (weight[row] > 0) own.push(row);
-        }
-        planned.push({ fft, plan, rows: Int32Array.from(own) });
-        weights.push(weight);
-    });
-    return { bands: planned, weights };
-}
-
 /** One stem into `out`, band by band, each row the weighted sum of the bands that draw it. */
 function computeStem(
     stem: Int16Array,
@@ -444,65 +230,6 @@ function compute(clip: Clip, message: SpectrogramComputeMessage): void {
 // three bands, stored as 8-bit levels below the clip's loudest bin, then
 // halved level by level keeping the louder of each pair. Every zoom, pan and
 // size afterwards is a lookup on the main thread.
-
-const PYRAMID_MIN_HOP = 512;
-const PYRAMID_MAX_FRAMES = 8192;
-const PYRAMID_BANDS = [
-    { fftSize: 4096, fromHz: 0 },
-    { fftSize: 2048, fromHz: 300 },
-    { fftSize: 1024, fromHz: 3000 },
-];
-
-function framesOfStem(
-    stem: Int16Array,
-    frames: number,
-    hop: number,
-    layout: { bands: Band[]; weights: Float32Array[] },
-    rows: number,
-    topDb: number,
-    rangeDb: number,
-): Uint8Array {
-    const out = new Uint8Array(frames * rows);
-    const sum = new Float32Array(rows);
-    const floorDb = topDb - rangeDb;
-    const scale = 255 / rangeDb;
-    for (let frame = 0; frame < frames; frame += 1) {
-        const centre = (frame + 0.5) * hop;
-        sum.fill(0);
-        layout.bands.forEach((band, index) => {
-            loadFrame(band.fft, stem, centre);
-            const spectrum = transform(band.fft);
-            const weight = layout.weights[index];
-            for (const row of band.rows) sum[row] += weight[row] * rowValue(spectrum, band.plan, row);
-        });
-        const base = frame * rows;
-        for (let row = 0; row < rows; row += 1) {
-            const level = (20 * Math.log10(sum[row] + 1e-12) - floorDb) * scale;
-            out[base + row] = level <= 0 ? 0 : level >= 255 ? 255 : Math.round(level);
-        }
-    }
-    return out;
-}
-
-/** The next level up: each frame the louder of two, row by row. */
-function halve(level: SpectralLevel, rows: number): SpectralLevel {
-    const frames = Math.ceil(level.frames / 2);
-    const pool = (source: Uint8Array) => {
-        const out = new Uint8Array(frames * rows);
-        for (let frame = 0; frame < frames; frame += 1) {
-            const left = 2 * frame * rows;
-            const right = left + rows;
-            const hasRight = 2 * frame + 1 < level.frames;
-            for (let row = 0; row < rows; row += 1) {
-                const a = source[left + row];
-                const b = hasRight ? source[right + row] : 0;
-                out[frame * rows + row] = a > b ? a : b;
-            }
-        }
-        return out;
-    };
-    return { binSize: level.binSize * 2, frames, a: pool(level.a), b: level.b ? pool(level.b) : null };
-}
 
 function buildPyramid(viewId: number, clip: Clip, message: SpectrogramPyramidMessage): void {
     const a = clip.stemA;

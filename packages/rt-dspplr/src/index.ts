@@ -8,6 +8,7 @@ export {
     type ClipInfo,
     type ClipInput,
     type ClipSource,
+    type ManifestClip,
     type LoaderB,
     type StatusB,
     type LoadOptions,
@@ -91,3 +92,37 @@ export {
 } from './core/timeline/createTimeline';
 
 export type { LoopRange } from './core/engine/Track';
+
+// Prepared long recordings: `play({ manifest })` on any player. Prepare them with
+// `@saitdigital/rt-dspplr/prepare` (Node) or `rtd-prepare`.
+export type { SourceKind, SourceCapabilities } from './core/sources/types';
+export type { PreparedOverview, WindowAudio, StreamStats, SegmentedOptions } from './core/sources/SegmentedSource';
+/** @deprecated aliases of the first long-audio experiment */
+export {
+    StreamPlayerCore,
+    createStreamPlayer,
+    type StreamClip,
+    type StreamClipInput,
+    type StreamPlayerOptions,
+    type StreamPlayerState,
+} from './core/stream/StreamPlayer';
+export type { AudioManifest, ManifestSegment, ManifestPeakLevel, ManifestLoudness } from './core/stream/manifest';
+export type { TimelinePlayer } from './core/timeline/TimelineCore';
+
+// DSP plugins ("bring your own effect"): player.effects.add(plugin, …).
+export {
+    validateParam,
+    resolveParams,
+    paramToUnit,
+    unitToParam,
+    type DspPlugin,
+    type PluginParam,
+    type PluginParams,
+    type PluginInstance,
+    type PluginRealtime,
+    type PluginPreview,
+    type PluginPreviewProcess,
+    type EffectState,
+    type PreviewCoverage,
+} from './core/effects/types';
+export { highPassPlugin, dynamicsPlugin } from './core/effects/builtins';
