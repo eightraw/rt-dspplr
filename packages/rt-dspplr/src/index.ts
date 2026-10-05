@@ -94,22 +94,22 @@ export {
 export type { LoopRange } from './core/engine/Track';
 
 // Prepared long recordings: `play({ manifest })` on any player. Prepare them with
-// `@saitdigital/rt-dspplr/prepare` (Node) or `rtd-prepare`.
-export type { SourceKind, SourceCapabilities } from './core/sources/types';
+// `@saitdigital/rt-dspplr-prepare` (Node) or its `rtd-prepare` CLI. The formats
+// themselves (validation, binary files) are in `@saitdigital/rt-dspplr/format`.
+export type { SourceKind, SourceCapabilities, StemSummary } from './core/sources/types';
 export type { PreparedOverview, WindowAudio, StreamStats, SegmentedOptions } from './core/sources/SegmentedSource';
-/** @deprecated aliases of the first long-audio experiment */
-export {
-    StreamPlayerCore,
-    createStreamPlayer,
-    type StreamClip,
-    type StreamClipInput,
-    type StreamPlayerOptions,
-    type StreamPlayerState,
-} from './core/stream/StreamPlayer';
-export type { AudioManifest, ManifestSegment, ManifestPeakLevel, ManifestLoudness } from './core/stream/manifest';
+export type {
+    AudioManifest,
+    ManifestSegment,
+    ManifestPeakLevel,
+    ManifestLoudness,
+    ManifestStem,
+    ManifestStems,
+} from './core/stream/manifest';
 export type { TimelinePlayer } from './core/timeline/TimelineCore';
 
 // DSP plugins ("bring your own effect"): player.effects.add(plugin, …).
+// EXPERIMENTAL: the plugin API may change in minor releases before 1.0.
 export {
     validateParam,
     resolveParams,

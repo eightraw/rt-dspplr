@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
-import { type AudioManifest, type ManifestStem } from '../core/stream/manifest';
-import { parseWavFile } from '../core/stream/wavFormat';
+import { type AudioManifest, type ManifestStem } from '@saitdigital/rt-dspplr/format';
+import { parseWavFile } from '@saitdigital/rt-dspplr/format';
 import { DEFAULT_FRAMES_PER_PEAK } from './analysis';
 import { wavDecoder, type AudioDecoder } from './decoder';
 import { resamplerDesign } from './jobs';
@@ -11,9 +11,11 @@ import { writeTimeline, type PrepareOptions, type PrepareStorage } from './prepa
 import { resampleInputRange, resampleRange } from './resampler';
 
 // ---------------------------------------------------------------------------
-// Stem B on A's frame grid: the one code path behind
-// prepareAudio(a, { stems: { b } }) and attachStem(). B is a processed version
-// of A (denoised, restored…), at any rate, channel count and length.
+// A named stem on A's frame grid: the one code path behind
+// prepareAudio(a, { stems: { [key]: … } }) and attachStem(). The stem ("B"
+// below) is a time-aligned derivative of A, made by whatever the host runs, at
+// any rate, channel count and length. Output that changes timing (re-timed,
+// re-synthesised or translated audio) is not a stem: alignment refuses it.
 //
 //   1. alignment   B is decoded at its own rate; only the 8 windows of 2 s
 //                  (± the search range) that the alignment needs are
@@ -25,8 +27,8 @@ import { resampleInputRange, resampleRange } from './resampler';
 //   2. adaptation  B is decoded again and converted once: downmixed when A is
 //                  mono, resampled on the worker pool (parallelResample.ts,
 //                  deterministic), mono → every channel of A.
-//   3. grid        shifted, padded or trimmed to A's length, written as b/seg/*,
-//                  b/peaks.bin, b/bands.bin, b/spectrogram.bin on A's segment
+//   3. grid        shifted, padded or trimmed to A's length, written as <key>/seg/*,
+//                  <key>/peaks.bin, <key>/bands.bin, <key>/spectrogram.bin on A's segment
 //                  boundaries (writeTimeline, as A).
 //   4. pairing     correlation with A (global and per segment) → the mix law.
 //                  B's loudness against A's is information only. No trim is
@@ -47,13 +49,13 @@ export interface StemOptions {
     maxOffsetSeconds?: number;
     /** Below this confidence (0..1) B is refused. Default 0.3. */
     minConfidence?: number;
-    /** A refused B: fail the job (default) or keep A only, with the reason recorded in stems.b. */
+    /** A refused stem: fail the job (default) or publish without it, the reason recorded in its entry. */
     onLowConfidence?: 'fail' | 'warn';
     /** Use this offset (frames, B late = positive) instead of measuring. */
     offsetFrames?: number;
     /** Explicit trim for B, stored for the player (default 0: B plays at its own level). */
     gainDb?: number;
-    /** Name recorded in stems.b.source. */
+    /** Name recorded in the stem's `source.name`. */
     name?: string;
 }
 
@@ -223,7 +225,8 @@ export interface BuildStemContext {
     read(key: string): Promise<Uint8Array | null>;
     /** A's manifest (written or about to be). */
     manifest: AudioManifest;
-    stem: 'b';
+    /** The stem's key (its files go under `<key>/`). */
+    stem: string;
     input: StemInput;
     options: StemOptions;
     /** prepare's options (concurrency, decoder, bands/spectrogram switches). */
@@ -234,7 +237,7 @@ export interface BuildStemContext {
     onProgress?: (stage: 'aligning' | 'writing', fraction: number) => void;
 }
 
-/** Align, adapt and write stem B on A's grid; returns the ready stems.b entry (the caller writes the manifest). */
+/** Align, adapt and write a stem on A's grid; returns its ready entry (the caller writes the manifest). */
 export async function buildStem(ctx: BuildStemContext): Promise<ManifestStem> {
     const { storage, read, manifest, stem, input, options, pool, signal } = ctx;
     const rate = manifest.sampleRate;
@@ -336,7 +339,12 @@ export async function buildStem(ctx: BuildStemContext): Promise<ManifestStem> {
             agreeing: agreeing.length,
         };
         const low = results.length === 0 || agreeing.length < Math.max(2, Math.ceil(results.length / 2)) || confidence < (options.minConfidence ?? 0.3);
-        if (low) throw new StemAlignmentError(`stem ${stem}: B does not line up with A (offset ${offset} frames, confidence ${confidence.toFixed(2)}, ${agreeing.length}/${results.length} windows agree)`, alignment);
+        if (low) {
+            throw new StemAlignmentError(`stems.${stem} does not line up with A (offset ${offset} frames, confidence ${confidence.toFixed(2)}, `
+                + `${agreeing.length}/${results.length} windows agree). A stem must be a time-aligned derivative of A, on the same timeline. `
+                + 'Output that changes timing (stretched, re-timed, re-synthesised or translated audio) cannot be blended with A: '
+                + 'publish it as a separate clip with its own manifest.', alignment);
+        }
     } else {
         alignment = { offsetFrames: offset, offsetMs: Math.round((offset / rate) * 1e5) / 100, confidence: 1, windows: 0, agreeing: 0 };
     }
@@ -447,7 +455,7 @@ export async function buildStem(ctx: BuildStemContext): Promise<ManifestStem> {
     };
 }
 
-/** The stems.b entry of a B that was not attached (the reason, and what was measured). */
+/** The entry of a stem that was not attached (the reason, and what was measured). */
 export function failedStem(manifest: AudioManifest, error: unknown, extra: Partial<ManifestStem> = {}): ManifestStem {
     return {
         status: 'failed',

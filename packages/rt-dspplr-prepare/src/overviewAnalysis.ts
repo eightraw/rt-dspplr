@@ -1,7 +1,7 @@
-import { computeHighPassCoefficients, HIGH_PASS_SECTION_Q } from '../core/dsp/highPass';
-import { DEFAULT_BAND_CUTOFFS, DEFAULT_FRAMES_PER_BAND_BIN, type BandsFile } from '../core/stream/bandsFile';
-import type { SpectrogramFile } from '../core/stream/spectrogramFile';
-import { frameRows, planBands, PYRAMID_BANDS, quantizeRows } from '../core/spectrogram/spectral';
+import { computeHighPassCoefficients, HIGH_PASS_SECTION_Q } from '@saitdigital/rt-dspplr/format';
+import { DEFAULT_BAND_CUTOFFS, DEFAULT_FRAMES_PER_BAND_BIN, type BandsFile } from '@saitdigital/rt-dspplr/format';
+import type { SpectrogramFile } from '@saitdigital/rt-dspplr/format';
+import { frameRows, planBands, PYRAMID_BANDS, quantizeRows } from '@saitdigital/rt-dspplr/format';
 
 // ---------------------------------------------------------------------------
 // Streaming analyses for the overview previews, fed the playback signal:

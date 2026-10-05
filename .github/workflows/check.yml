@@ -11,7 +11,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -19,11 +19,19 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Both packages (player, then prepare), the demo and the gallery.
       - run: npm run build
       - run: npm run typecheck
+      # Node tests of both packages.
       - run: npm test
       - run: npx publint packages/rt-dspplr
-      - run: npx --yes @arethetypeswrong/cli --pack packages/rt-dspplr --profile esm-only --exclude-entrypoints ./styles.css
+      - run: npx publint packages/rt-dspplr-prepare
+      - run: npx --yes @arethetypeswrong/cli --pack packages/rt-dspplr --profile esm-only --exclude-entrypoints ./styles.css ./manifest.schema.json
+      - run: npx --yes @arethetypeswrong/cli --pack packages/rt-dspplr-prepare --profile esm-only
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser -w packages/rt-dspplr
       - run: npm run test:package -w packages/rt-dspplr
+      # Packs both, installs them in a throwaway consumer, runs the CLI, plays its output in Chromium.
+      - run: npm run test:package -w packages/rt-dspplr-prepare
+      - run: npm pack --workspace packages/rt-dspplr --dry-run
+      - run: npm pack --workspace packages/rt-dspplr-prepare --dry-run

@@ -2,8 +2,8 @@
 // The DSP plugin contract ("bring your own effect").
 //
 // A plugin is plain data plus functions. It describes its parameters, how it
-// runs in the audio graph (realtime), and how the previews show it (the
-// owner's principle: whatever is heard is what is drawn). The built-in
+// runs in the audio graph (realtime), and how the previews show it (what is
+// heard is what is drawn). The built-in
 // high-pass and dynamics are plugins of this same contract (builtins.ts).
 //
 // Chain order, for every source:
@@ -18,10 +18,14 @@
 // and the stretcher gets the dry signal it is designed for. The fader comes
 // after the inserts, as on a mixing desk: moving it never changes how a
 // compressor or a gate reacts.
+//
+// EXPERIMENTAL: every type and helper here may change in minor releases before 1.0.
 // ---------------------------------------------------------------------------
 
+/** @experimental */
 export type ParamScale = 'linear' | 'log';
 
+/** @experimental */
 export interface PluginParam {
     /** Stable id (the AudioParam name for worklet plugins). */
     id: string;
@@ -41,9 +45,10 @@ export interface PluginParam {
     format?: (value: number) => string;
 }
 
+/** @experimental */
 export type PluginParams = Record<string, number>;
 
-/** What a realtime plugin returns from create(): its nodes and how to drive them. */
+/** What a realtime plugin returns from create(): its nodes and how to drive them. @experimental */
 export interface PluginInstance {
     input: AudioNode;
     output: AudioNode;
@@ -52,6 +57,7 @@ export interface PluginInstance {
     dispose(): void;
 }
 
+/** @experimental */
 export type PluginRealtime =
     | {
         kind: 'nodes';
@@ -74,6 +80,8 @@ export type PluginRealtime =
  * clip's audio (chunk by chunk, `state` kept between chunks). It must be
  * self-contained — its source is sent to the worker (Function#toString), so it
  * cannot use closures or imports. Process `channels` in place.
+ *
+ * @experimental
  */
 export type PluginPreviewProcess = (
     channels: Float32Array[],
@@ -82,6 +90,7 @@ export type PluginPreviewProcess = (
     state: Record<string, unknown>,
 ) => void;
 
+/** @experimental */
 export interface PluginPreview {
     /** For the waveform (and, without magnitudeResponse, the spectrogram's column levels). */
     process?: PluginPreviewProcess;
@@ -93,6 +102,11 @@ export interface PluginPreview {
     magnitudeResponse?: (params: PluginParams, freqsHz: Float32Array, sampleRate: number) => Float32Array;
 }
 
+/**
+ * A DSP plugin: parameters, realtime processing, previews.
+ *
+ * @experimental The plugin API may change in minor releases before 1.0.
+ */
 export interface DspPlugin {
     id: string;
     name: string;
@@ -107,7 +121,7 @@ export interface DspPlugin {
     builtin?: 'highpass' | 'dynamics';
 }
 
-/** An effect in a player's chain, as the state shows it. */
+/** An effect in a player's chain, as the state shows it. @experimental */
 export interface EffectState {
     /** Instance id (unique in the chain). */
     id: string;
@@ -118,7 +132,7 @@ export interface EffectState {
     error: string | null;
 }
 
-/** How completely the previews show the current chain. */
+/** How completely the previews show the current chain. @experimental */
 export interface PreviewCoverage {
     /** Every active effect is in the waveform preview (exact where audio is decoded). */
     waveform: boolean;
@@ -130,7 +144,7 @@ export interface PreviewCoverage {
     missing: string[];
 }
 
-/** Clamp to the schema; throw on an unknown parameter or a non-number. */
+/** Clamp to the schema; throw on an unknown parameter or a non-number. @experimental */
 export function validateParam(plugin: DspPlugin, id: string, value: number): number {
     const spec = plugin.params.find((p) => p.id === id);
     if (!spec) throw new Error(`${plugin.id}: no parameter "${id}"`);
@@ -138,7 +152,7 @@ export function validateParam(plugin: DspPlugin, id: string, value: number): num
     return Math.min(spec.max, Math.max(spec.min, value));
 }
 
-/** Defaults of every parameter, overridden by `params` (validated). */
+/** Defaults of every parameter, overridden by `params` (validated). @experimental */
 export function resolveParams(plugin: DspPlugin, params: PluginParams = {}): PluginParams {
     const out: PluginParams = {};
     for (const p of plugin.params) out[p.id] = p.default;
@@ -146,12 +160,13 @@ export function resolveParams(plugin: DspPlugin, params: PluginParams = {}): Plu
     return out;
 }
 
-/** Slider position 0..1 ⇄ value, by the param's scale. */
+/** Slider position 0..1 ⇄ value, by the param's scale. @experimental */
 export function paramToUnit(spec: PluginParam, value: number): number {
     if (spec.scale === 'log' && spec.min > 0) return Math.log(value / spec.min) / Math.log(spec.max / spec.min);
     return (value - spec.min) / (spec.max - spec.min || 1);
 }
 
+/** @experimental */
 export function unitToParam(spec: PluginParam, unit: number): number {
     const u = Math.min(1, Math.max(0, unit));
     if (spec.scale === 'log' && spec.min > 0) return spec.min * Math.pow(spec.max / spec.min, u);

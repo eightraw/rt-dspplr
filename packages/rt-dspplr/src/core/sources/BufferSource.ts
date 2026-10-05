@@ -84,6 +84,7 @@ export class BufferSource implements PlaybackSource {
             kind: 'buffer',
             canPreservePitch: !!this._stretch?.available,
             canMixStemB: true,
+            stems: [],
             exactWaveformPreview: true,
             spectrogram: true,
             loopSnapping: true,

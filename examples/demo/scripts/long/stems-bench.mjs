@@ -6,7 +6,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { dockerProcessor, prepareAudio } from '@saitdigital/rt-dspplr/prepare';
+import { dockerProcessor, prepareAudio } from '@saitdigital/rt-dspplr-prepare';
 
 const args = process.argv.slice(2);
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };

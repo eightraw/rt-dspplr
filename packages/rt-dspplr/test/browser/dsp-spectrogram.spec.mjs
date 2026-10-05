@@ -90,7 +90,7 @@ test('paint cost of the DSP pass per knob move', async ({ page }) => {
         for (let i = 0; i < 40; i += 1) {
             const state = { processing: { highPassHz: i % 2 ? 300 : 120, compression: 0.5, outputGainDb: -3 * (i % 3), speed: 1, mix: 0 }, audioContext: null };
             const t0 = performance.now();
-            reuse = adv.applyDspToSpectrogram(data, { state, preview: { pyramid: null, gain, windowGain: null }, timelineRate: 48000, minHz: 30, maxHz: 16000 }, reuse);
+            reuse = h.internals.applyDspToSpectrogram(data, { state, preview: { pyramid: null, gain, windowGain: null }, timelineRate: 48000, minHz: 30, maxHz: 16000 }, reuse);
             const t1 = performance.now();
             adv.paintSpectrogram(image, reuse, [1, 0], look, 1);
             times.push([t1 - t0, performance.now() - t1]);

@@ -73,13 +73,14 @@ export function MixSlider({ core, state }: { core: AudioPlayerCore; state: Audio
     const valueText = gainB <= 0 ? 'Stem A only' : gainA <= 0 ? 'Stem B only'
         : `Stem A ${Math.round(gainA * 100)}%, stem B ${Math.round(gainB * 100)}%`;
     const available = state.statusB !== 'unavailable' && state.statusB !== 'processing';
+    const stems = state.capabilities.stems ?? [];
     // Without stem B the slider stays usable only to bring a value
     // left over from the previous clip back down.
     const disabled = state.clipId === null || (!available && mix <= 0);
     const hint = state.clipId === null
         ? 'Load a clip first'
         : state.statusB === 'processing'
-            ? 'Processed stem is being prepared on the server…'
+            ? 'Stem B is being prepared on the server…'
             : !available
             ? 'No stem B for this clip'
             : state.statusB === 'error'
@@ -111,7 +112,17 @@ export function MixSlider({ core, state }: { core: AudioPlayerCore; state: Audio
                 onChange={onChange}
                 onDoubleClick={() => core.setMix(state.mixLaw === 'separation' ? 0.5 : 0)}
             />
-            <span className="rtd-mixer-end" aria-hidden="true">Stem B</span>
+            {stems.length > 1 ? (
+                // Prepared clips with more than one stem: which one the knob blends with.
+                <select
+                    className="rtd-mixer-stem"
+                    aria-label="Stem B"
+                    value={state.stem ?? ''}
+                    onChange={(event) => core.setStem(event.currentTarget.value)}
+                >
+                    {stems.map((stem) => <option key={stem.key} value={stem.key}>{stem.label ?? stem.key}</option>)}
+                </select>
+            ) : <span className="rtd-mixer-end" aria-hidden="true">Stem B</span>}
             <span className="rtd-mixer-status" aria-live="polite">
                 {state.statusB === 'loading' || state.statusB === 'processing' ? <IconSpinner /> : state.statusB === 'error' ? '!' : null}
             </span>

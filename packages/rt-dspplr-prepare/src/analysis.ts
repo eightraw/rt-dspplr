@@ -1,5 +1,5 @@
-import type { ManifestLoudness } from '../core/stream/manifest';
-import type { PeakChannelData, PeakLevelData } from '../core/stream/peaksFile';
+import type { ManifestLoudness } from '@saitdigital/rt-dspplr/format';
+import type { PeakChannelData, PeakLevelData } from '@saitdigital/rt-dspplr/format';
 
 // ---------------------------------------------------------------------------
 // Streaming peaks + loudness over planar Float32 blocks of the playback signal.

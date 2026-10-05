@@ -21,9 +21,21 @@ with the framework-independent audio engine. TypeScript types are included.
 - **Custom interfaces:** a headless engine, and the timeline, the spectrogram and the
   author menu without React, for any framework.
 
-Files are decoded into memory in full. DSP controls operate during playback;
-pitch-preserving speed changes require preparing a rendered variant. This is not
-a streaming decoder or an instantaneous streaming time-stretch engine.
+Ordinary files are decoded into memory in full; DSP controls operate during
+playback, and pitch-preserving speed changes prepare a rendered variant. Long
+recordings can instead be **prepared once on the server** and played segment by
+segment: the whole timeline (waveform, DSP preview, spectrogram) is there at once,
+audio is fetched around the playhead, speed keeps the pitch in realtime, and the
+A⇄B knob blends the recording with one of its named, server-made stems.
+
+## Packages
+
+| Package | | |
+|---|---|---|
+| [`@saitdigital/rt-dspplr`](packages/rt-dspplr/README.md) | browser | The player: headless engine, React component, timeline, spectrogram, prepared-file playback, the file formats (`./format`) and the manifest schema. |
+| [`@saitdigital/rt-dspplr-prepare`](packages/rt-dspplr-prepare/README.md) | Node ≥ 20.19 | `rtd-prepare` CLI and API: segments, overview files and named stems for long recordings. |
+
+The prepared-file format is specified in [docs/manifest.md](docs/manifest.md).
 
 ## The ready-made player
 
@@ -79,6 +91,7 @@ Audio in the animations:
 
 ```bash
 npm install @saitdigital/rt-dspplr
+npm install @saitdigital/rt-dspplr-prepare   # on the server, for long recordings
 ```
 
 The React component additionally needs `react >= 18` and your application's React
@@ -125,9 +138,25 @@ framework and no stylesheet. Playback needs an element on the page; without one,
 `play()` rejects with an error that says so. With React, put `ref={player.ref}` from
 `useAudioPlayer()` on your root, or call `player.mount(element)` in any framework.
 
+## Long recordings
+
+```bash
+npx rtd-prepare talk.wav public/media/talk
+```
+
+```ts
+await player.play({ manifest: '/media/talk/manifest.json' });
+```
+
+See [the prepare package](packages/rt-dspplr-prepare/README.md) for the CLI, the API,
+named stems and server-side processors, and
+[Long recordings](packages/rt-dspplr/README.md#long-recordings-prepared-files) for the
+player side.
+
 ## Documentation
 
 - [API, React examples, themes, browser support and memory](packages/rt-dspplr/README.md)
+- [Preparing long recordings](packages/rt-dspplr-prepare/README.md) and [the manifest format](docs/manifest.md)
 - [Time-stretch strategies](packages/rt-dspplr/README.md#time-stretch-strategies)
 - [Workers, bundlers and CSP](packages/rt-dspplr/README.md#bundlers-workers-csp)
 
@@ -181,18 +210,19 @@ stem B the clean synthesis it was made from.
 ## Development
 
 ```text
-packages/rt-dspplr/   library source, documentation and tests
-examples/demo/       demo consuming the built library
+packages/rt-dspplr/          the player: source, documentation and tests
+packages/rt-dspplr-prepare/  the prepare step (Node): source, documentation and tests
+examples/demo/               demo consuming the built packages
 examples/gallery/    the five interfaces shown above
 ```
 
 ```bash
-npm run build          # library, demo and gallery
+npm run build          # both packages, demo and gallery
 npm run typecheck
 npm test
 npx playwright install chromium
 npm run test:browser   # audio, workers, React and attribution UI
-npm run test:package   # install the tarball in an isolated consumer
+npm run test:package   # install the tarballs in an isolated consumer (the prepare CLI's output played in Chromium)
 ```
 
 After changing library source, run `npm run build:lib` and refresh the demo.

@@ -1,4 +1,4 @@
-import { decodeInterleaved, looksLikeWav, parseWavHeader, WavFormatError, type WavFormat } from '../core/stream/wavFormat';
+import { decodeInterleaved, looksLikeWav, parseWavHeader, WavFormatError, type WavFormat } from '@saitdigital/rt-dspplr/format';
 
 // ---------------------------------------------------------------------------
 // Decoder hook. A decoder turns the source's bytes into planar Float32 blocks.

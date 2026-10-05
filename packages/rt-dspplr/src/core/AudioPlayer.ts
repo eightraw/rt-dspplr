@@ -63,10 +63,15 @@ export interface ClipSource {
     id?: string;
 }
 
-/** A prepared long recording (see `@saitdigital/rt-dspplr/prepare`). */
+/** A prepared long recording (made with `@saitdigital/rt-dspplr-prepare`). */
 export interface ManifestClip {
     /** URL of manifest.json; segment, peaks, bands and spectrogram URLs are relative to it. */
     manifest: string;
+    /**
+     * Key of the manifest stem the A/B knob blends with. Default: `b` when the
+     * manifest has it ready, else its first ready stem. See `player.setStem()`.
+     */
+    stem?: string;
     id?: string;
     src?: undefined;
 }
@@ -80,6 +85,8 @@ export interface ClipInfo {
     srcB: AudioInput | null;
     /** Set for a prepared clip: it plays through the segmented source. */
     manifest: string | null;
+    /** A prepared clip's requested blend stem (ManifestClip.stem). */
+    stem?: string | null;
 }
 
 /**
@@ -203,6 +210,8 @@ export interface AudioPlayerState {
     capabilities: SourceCapabilities;
     /** The manifest of a prepared clip. */
     manifest: AudioManifest | null;
+    /** Key of the manifest stem the knob blends with (prepared clips), or null. See `setStem()`. */
+    stem: string | null;
     /** Waiting for a segment while playing (start, seek, or a stall). */
     buffering: boolean;
     /** Peaks, bands and spectrogram of a prepared clip, as they arrive. */
@@ -247,6 +256,7 @@ const DEFAULT_CAPABILITIES: SourceCapabilities = {
     kind: 'buffer',
     canPreservePitch: true,
     canMixStemB: true,
+    stems: [],
     exactWaveformPreview: true,
     spectrogram: true,
     loopSnapping: true,
@@ -276,7 +286,7 @@ function defaultClipId(src: AudioInput): string {
 function normalizeClip(input: ClipInput): ClipInfo {
     if (isClipObject(input)) {
         if (typeof input.manifest === 'string') {
-            return { id: input.id ?? input.manifest, src: input.manifest, srcB: null, manifest: input.manifest };
+            return { id: input.id ?? input.manifest, src: input.manifest, srcB: null, manifest: input.manifest, stem: input.stem ?? null };
         }
         const clip = input as ClipSource;
         return {
@@ -329,6 +339,8 @@ export class AudioPlayerCore {
      * stretcher, before the volume. The built-in high-pass ('highpass') and
      * dynamics ('dynamics') are plugins in it too. Parameters are validated
      * against each plugin's schema and smoothed in the audio graph.
+     *
+     * @experimental The plugin API may change in minor releases before 1.0.
      */
     readonly effects = {
         list: (): EffectState[] => this._state.effects,
@@ -704,6 +716,19 @@ export class AudioPlayerCore {
         if (this._source.kind === 'segmented') await this._segmentedSource?.refreshManifest();
     };
 
+    /**
+     * Choose which stem of a prepared clip the A/B knob blends with (its key
+     * in the manifest's `stems`; null for the default: `b`, else the first
+     * ready stem). One stem is active at a time; the mix position is kept.
+     * Returns false when no prepared clip is loaded or its manifest has no
+     * such stem. To choose before loading, pass it with the clip:
+     * `play({ manifest, stem })`.
+     */
+    setStem = (key: string | null): boolean => {
+        if (this._source.kind !== 'segmented' || !this._segmentedSource) return false;
+        return this._segmentedSource.setStem(key);
+    };
+
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
@@ -760,7 +785,7 @@ export class AudioPlayerCore {
             this._update({
                 sourceKind: next.kind,
                 capabilities: next.capabilities,
-                ...(next.kind === 'buffer' ? { manifest: null, prepared: null, buffering: false } : {}),
+                ...(next.kind === 'buffer' ? { manifest: null, stem: null, prepared: null, buffering: false } : {}),
             });
         }
         return next;
@@ -819,6 +844,7 @@ export class AudioPlayerCore {
             sourceKind: null,
             capabilities: DEFAULT_CAPABILITIES,
             manifest: null,
+            stem: null,
             buffering: false,
             prepared: null,
             volume: this._state?.volume ?? 1,

@@ -8,12 +8,14 @@ import { pipeline } from 'node:stream/promises';
 
 // ---------------------------------------------------------------------------
 // Stem processors: the server-side counterpart of the player's plugins. A
-// processor turns A into B (a denoiser, an enhancer, a restoration model…):
+// processor turns A into a stem (whatever the host runs; the library never interprets it):
 //
-//   prepareAudio(a, { stems: { b: { processor } } })
+//   prepareAudio(a, { stems: { [key]: { processor } } })
 //     → is a processor configured? → run it on A (in parallel with A's own
-//       segments and analyses) → align and adapt its output → stems.b in the
-//       one manifest.
+//       segments and analyses) → align and adapt its output → stems[key] in
+//       the one manifest.
+//
+// EXPERIMENTAL: the stem processor API may change in minor releases before 1.0.
 //
 // The output may be at any rate, channel count and length, and in any format
 // the decoder hook can read. prepare aligns and adapts it. The adapters below
@@ -22,6 +24,7 @@ import { pipeline } from 'node:stream/promises';
 // processor.
 // ---------------------------------------------------------------------------
 
+/** @experimental */
 export interface StemProcessorInput {
     /** A as a file: the input path itself, or a temporary copy when A came as a stream. */
     path: string;
@@ -37,13 +40,19 @@ export interface StemProcessorInput {
     onProgress?: (fraction: number) => void;
 }
 
+/** @experimental */
 export type StemProcessorOutput =
     | { path: string }
     | { stream: AsyncIterable<Uint8Array> | ReadableStream<Uint8Array> }
     | { channels: Float32Array[]; sampleRate: number };
 
+/**
+ * Makes a stem from A, on the server. Its output must stay on A's timeline.
+ *
+ * @experimental The stem processor API may change in minor releases before 1.0.
+ */
 export interface StemProcessor {
-    /** Stable id, recorded in stems.b.processor (with version and params) to spot a stale B. */
+    /** Stable id, recorded in the stem's `processor` (with version and params) to spot a stale stem. */
     id: string;
     version: string;
     params?: Record<string, unknown>;
@@ -109,7 +118,7 @@ export async function runProcessor(
     }
 }
 
-/** A plain function as a processor. */
+/** A plain function as a processor. @experimental */
 export function functionProcessor(
     fn: (input: StemProcessorInput) => Promise<StemProcessorOutput> | StemProcessorOutput,
     meta: { id: string; version: string; params?: Record<string, unknown>; timeoutMs?: number },
@@ -160,7 +169,7 @@ export interface CommandProcessorOptions {
     env?: NodeJS.ProcessEnv;
 }
 
-/** Any CLI (an ffmpeg filter chain, a model's script…) that reads {in} and writes {out}. */
+/** Any CLI (an ffmpeg filter chain, a script…) that reads {in} and writes {out}. @experimental */
 export function commandProcessor(options: CommandProcessorOptions): StemProcessor {
     const id = options.id ?? `command:${path.basename(options.command)}`;
     return {
@@ -197,7 +206,7 @@ export interface DockerProcessorOptions {
     runArgs?: string[];
 }
 
-/** A Docker image as a processor: A mounted read-only at /in, the scratch folder at /work. No network by default. */
+/** A Docker image as a processor: A mounted read-only at /in, the scratch folder at /work. No network by default. @experimental */
 export function dockerProcessor(options: DockerProcessorOptions): StemProcessor {
     const id = options.id ?? `docker:${options.image}`;
     const docker = options.docker ?? 'docker';
@@ -245,7 +254,7 @@ export interface HttpProcessorOptions {
     params?: Record<string, unknown>;
 }
 
-/** An HTTP service as a processor (e.g. an enhance microservice): A goes in the request, B comes back in the response body. */
+/** An HTTP service as a processor: A goes in the request, the stem comes back in the response body. @experimental */
 export function httpProcessor(options: HttpProcessorOptions): StemProcessor {
     const id = options.id ?? `http:${new URL(options.url).host}`;
     return {
@@ -254,7 +263,7 @@ export function httpProcessor(options: HttpProcessorOptions): StemProcessor {
         params: options.params ?? { url: options.url, method: options.method ?? 'POST', field: options.field ?? null },
         timeoutMs: options.timeoutMs,
         async run(input) {
-            let body: BodyInit;
+            let body: NonNullable<RequestInit["body"]>;
             const headers: Record<string, string> = { ...options.headers };
             if (options.field) {
                 // multipart/form-data, streamed: the file is never held in memory.
@@ -268,11 +277,11 @@ export function httpProcessor(options: HttpProcessorOptions): StemProcessor {
                     for await (const chunk of fs.createReadStream(file, { highWaterMark: 1 << 20 })) yield chunk as Buffer;
                     yield tail;
                 }
-                body = Readable.toWeb(Readable.from(multipart())) as unknown as BodyInit;
+                body = Readable.toWeb(Readable.from(multipart())) as unknown as NonNullable<RequestInit["body"]>;
                 headers['content-type'] = `multipart/form-data; boundary=${boundary}`;
                 headers['content-length'] = String(head.length + (await fsp.stat(file)).size + tail.length);
             } else {
-                body = Readable.toWeb(fs.createReadStream(input.path)) as unknown as BodyInit;
+                body = Readable.toWeb(fs.createReadStream(input.path)) as unknown as NonNullable<RequestInit["body"]>;
                 headers['content-type'] ??= 'application/octet-stream';
             }
             let response: Response;

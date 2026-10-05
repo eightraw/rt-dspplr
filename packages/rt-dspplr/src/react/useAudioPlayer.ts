@@ -39,6 +39,7 @@ export interface UseAudioPlayerResult extends Pick<
     | 'setProcessing'
     | 'setPauseMode'
     | 'setSourceB'
+    | 'setStem'
     | 'getCurrentTime'
     | 'on'
 > {
@@ -88,6 +89,7 @@ export function useAudioPlayer(options?: AudioPlayerOptions): UseAudioPlayerResu
         setProcessing: player.setProcessing,
         setPauseMode: player.setPauseMode,
         setSourceB: player.setSourceB,
+        setStem: player.setStem,
         getCurrentTime: player.getCurrentTime,
         on: player.on,
     }), [player, state, ref]);

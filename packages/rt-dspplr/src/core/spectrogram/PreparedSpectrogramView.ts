@@ -235,7 +235,7 @@ export function createPreparedSpectrogram(
 
 /** The A/B gains the engine plays with (B's explicit trim included), for painting the blend. */
 function stemGains(state: AudioPlayerState): [number, number] {
-    const stem = state.manifest?.stems?.b;
+    const stem = state.stem ? state.manifest?.stems?.[state.stem] : undefined;
     if (!stem || stem.status !== 'ready') return [1, 0];
     const [a, b] = mixGains(state.processing.mix, state.mixLaw);
     return [a, b * Math.pow(10, (stem.gainDb ?? 0) / 20)];

@@ -20,6 +20,7 @@ import type { DspPlugin, PluginInstance } from './types';
 // fast); the contract's preview hooks are what third-party plugins use.
 // ---------------------------------------------------------------------------
 
+/** @experimental Built-in high-pass, as a plugin. */
 export const highPassPlugin: DspPlugin = {
     id: 'rtd.highpass',
     name: 'High-pass',
@@ -48,6 +49,7 @@ export const highPassPlugin: DspPlugin = {
     },
 };
 
+/** @experimental Built-in compressor + output gain + ceiling, as a plugin. */
 export const dynamicsPlugin: DspPlugin = {
     id: 'rtd.dynamics',
     name: 'Dynamics',

@@ -5,17 +5,17 @@ import { findZeroCrossing } from '../engine/zeroCrossing';
 import type { SpectralPyramid } from '../spectrogram/protocol';
 import type { WaveformPeakLevel, WaveformPeakPyramid } from '../waveform/pyramid';
 import { decodeBandsFile, type BandsFile } from '../stream/bandsFile';
-import { assertManifest, type AudioManifest, type ManifestStem } from '../stream/manifest';
+import { assertManifest, DEFAULT_STEM_KEY, readyStemKeys, type AudioManifest, type ManifestStem } from '../stream/manifest';
 import { mixGains, type MixLaw } from '../controls';
 import { decodePeaksFile, peaksToPyramid, readLevel, type PeaksFile } from '../stream/peaksFile';
 import { SegmentScheduler } from '../stream/SegmentScheduler';
 import { SegmentStore, type SegmentDecode, type SegmentStoreStats } from '../stream/SegmentStore';
 import { loadStreamEngine, StreamEngine, type EngineReport } from '../engine/StreamEngine';
 import { decodeSpectrogramFile, toSpectralPyramid, type SpectrogramFile } from '../stream/spectrogramFile';
-import type { PlaybackSource, SourceCapabilities, SourceHost } from './types';
+import type { PlaybackSource, SourceCapabilities, SourceHost, StemSummary } from './types';
 
 // ---------------------------------------------------------------------------
-// SegmentedSource — a prepared long recording (see `./prepare`): manifest,
+// SegmentedSource — a prepared long recording (@saitdigital/rt-dspplr-prepare): manifest,
 // peaks, bands and spectrogram first (KBs to a few MB), so the timeline is
 // whole at once; segments are fetched and decoded around the playhead and
 // scheduled back to back by SegmentScheduler into the core's output chain.
@@ -70,8 +70,8 @@ export interface SegmentedOptions {
     /** Realtime stretch in the engine (Signalsmith Stretch). Default true. */
     realtimeStretch?: boolean;
     /**
-     * Opt-in, for hosts that publish a manifest before its stem B is made: while
-     * stems.b says 'processing', re-read the manifest this often (ms) and show
+     * Opt-in, for hosts that publish a manifest before its stem is made: while
+     * the active stem says 'processing', re-read the manifest this often (ms) and show
      * 'processing'. Default 0: manifests are read as published (B there or not),
      * and refreshManifest() re-reads on demand.
      */
@@ -119,11 +119,12 @@ export class SegmentedSource implements PlaybackSource {
     readonly kind = 'segmented' as const;
     capabilities: SourceCapabilities = SegmentedSource._caps(false);
 
-    private static _caps(pitch: boolean, stemB = false): SourceCapabilities {
+    private static _caps(pitch: boolean, stemB = false, stems: readonly StemSummary[] = []): SourceCapabilities {
         return {
             kind: 'segmented',
             canPreservePitch: pitch,
             canMixStemB: stemB,
+            stems,
             exactWaveformPreview: false,
             spectrogram: true,
             loopSnapping: false,
@@ -137,6 +138,9 @@ export class SegmentedSource implements PlaybackSource {
     // ---- stem B (manifest v3) ----
     private _storeB: SegmentStore | null = null;
     private _stemB: ManifestStem | null = null;
+    /** Key of the stem the knob blends with (null: none); and the one the host asked for. */
+    private _stemKey: string | null = null;
+    private _wantStem: string | null = null;
     private _mix = 0;
     /** B is wanted while the mix is above 0, and for a while after the knob last moved. */
     private _bWantedUntil = 0;
@@ -252,12 +256,13 @@ export class SegmentedSource implements PlaybackSource {
         this._stats = SegmentedSource._freshStats();
         const url = new URL(clip.manifest, typeof location !== 'undefined' ? location.href : undefined).href;
         this._clipId = clip.id;
+        this._wantStem = clip.stem ?? null;
         this._playStartedAt = performance.now();
         this._loadStartedAt = this._playStartedAt;
         this._update({
             clipId: clip.id, src: clip.manifest, status: 'loading', progress: 0, error: null, isPlaying: false,
             currentTime: 0, duration: 0, ended: false, loop: null, startedAt: null, playbackStartPoint: 0,
-            pendingSpeed: null, statusB: 'unavailable', buffer: null, bufferB: null, mixLaw: this._host.options.mixLaw ?? 'crossfade',
+            pendingSpeed: null, statusB: 'unavailable', stem: null, buffer: null, bufferB: null, mixLaw: this._host.options.mixLaw ?? 'crossfade',
             playRequestId: this._state.playRequestId + 1, manifest: null, buffering: autoplay,
             prepared: { peaks: null, bands: null, spectrogram: null },
         });
@@ -403,7 +408,6 @@ export class SegmentedSource implements PlaybackSource {
         this._pump();
     };
 
-    /** No stem B in segmented mode (yet): the value only stays in the state. */
     /** The knob moved: smoothed gains in the engine; B is fetched only while it is wanted. */
     setMix(mix: number): void {
         this._mix = mix;
@@ -459,10 +463,66 @@ export class SegmentedSource implements PlaybackSource {
         }
     }
 
+    /**
+     * The stem the knob should blend with: the one asked for; else 'b' when it is
+     * ready, else the first ready one; else 'b' or the first listed (not ready:
+     * no blend, but its status shows, e.g. 'processing' with polling).
+     */
+    private _pickStem(manifest: AudioManifest): string | null {
+        const stems = manifest.stems ?? {};
+        if (this._wantStem && stems[this._wantStem]) return this._wantStem;
+        const ready = readyStemKeys(manifest);
+        if (ready.includes(DEFAULT_STEM_KEY)) return DEFAULT_STEM_KEY;
+        return ready[0] ?? (stems[DEFAULT_STEM_KEY] ? DEFAULT_STEM_KEY : Object.keys(stems)[0] ?? null);
+    }
+
+    /**
+     * Choose which stem the knob blends with. One stem is active at a time;
+     * switching lets go of the previous one's segments and overview. Returns
+     * false when no manifest is loaded or it has no such stem. null: the default choice.
+     */
+    setStem(key: string | null): boolean {
+        const m = this._manifest;
+        if (!m) return false;
+        if (key !== null && !m.stems?.[key]) {
+            console.warn(`[AudioPlayer] the manifest has no stem ${JSON.stringify(key)}`);
+            return false;
+        }
+        this._wantStem = key;
+        const ctx = this._engine?.context;
+        // Still being set up: _applyStems() picks it up.
+        if (!ctx || !this._store) return true;
+        if (this._pickStem(m) === this._stemKey) return true;
+        this._releaseStem();
+        this._applyStems(m, ctx);
+        return true;
+    }
+
+    /** Let go of the active stem: its store, its segments in the engine, its overview. */
+    private _releaseStem(): void {
+        if (this._eng) for (const i of this._eng.held('b')) this._eng.drop('b', i);
+        this._storeB?.dispose();
+        this._storeB = null;
+        this._stemB = null;
+        this._stemKey = null;
+        this._bOverviewAsked = false;
+        this._window = null;
+        const prepared = this._state.prepared;
+        if (prepared && (prepared.peaksB || prepared.bandsB || prepared.spectrogram?.levels.some((l) => l.b))) {
+            const spectrogram = prepared.spectrogram
+                ? { ...prepared.spectrogram, referenceSum: prepared.spectrogram.referenceMax, levels: prepared.spectrogram.levels.map((l) => ({ ...l, b: null })) }
+                : null;
+            this._publish({ peaksB: null, bandsB: null, spectrogram }, 'spectrogram');
+        }
+    }
+
     private _applyStems(manifest: AudioManifest, ctx: BaseAudioContext): void {
-        const stem = manifest.stems?.b ?? null;
+        const key = this._pickStem(manifest);
+        if (key !== this._stemKey && this._stemKey !== null) this._releaseStem();
+        const stem = key ? manifest.stems![key] : null;
         const was = this._stemB;
         this._stemB = stem;
+        this._stemKey = key;
         if (this._pollTimer) clearInterval(this._pollTimer);
         this._pollTimer = null;
         if (stem?.status === 'processing') {
@@ -488,10 +548,11 @@ export class SegmentedSource implements PlaybackSource {
                 void this._loadOverviewB(this._loadId);
             }
         }
-        this.capabilities = SegmentedSource._caps(this.capabilities.canPreservePitch, stem?.status === 'ready');
+        this.capabilities = SegmentedSource._caps(this.capabilities.canPreservePitch, stem?.status === 'ready', SegmentedSource._stemList(manifest));
         this._update({
             capabilities: this.capabilities,
             manifest,
+            stem: key,
             mixLaw: this._mixLaw(),
             // A stem that is not ready is no stem B, unless the host opted into the 'processing' flow.
             statusB: stem?.status === 'ready' ? (this._storeB ? 'ready' : 'idle') : stem?.status === 'processing' && (this._options.pollStemsMs ?? 0) > 0 ? 'processing' : 'unavailable',
@@ -500,9 +561,15 @@ export class SegmentedSource implements PlaybackSource {
         if (stem?.status === 'ready' && was?.status !== 'ready' && was) this._host.emit('bload', { clipId: this._clipId ?? '' });
     }
 
-    /** Stem B's peaks, bands and spectrogram, for the blended overview (loaded when the mix first asks). */
+    /** The manifest's stems, for `capabilities.stems` (ready ones, in manifest order). */
+    private static _stemList(manifest: AudioManifest): StemSummary[] {
+        return readyStemKeys(manifest).map((key) => ({ key, label: manifest.stems![key].label ?? null }));
+    }
+
+    /** The active stem's peaks, bands and spectrogram, for the blended overview (loaded when the mix first asks). */
     private async _loadOverviewB(loadId: number): Promise<void> {
         const stem = this._stemB;
+        const key = this._stemKey;
         if (!stem || stem.status !== 'ready') return;
         const get = async (url?: string) => {
             if (!url) return null;
@@ -511,7 +578,7 @@ export class SegmentedSource implements PlaybackSource {
         };
         try {
             const [peaks, bands, spectro] = await Promise.all([get(stem.peaks?.url), get(stem.bands?.url), get(stem.spectrogram?.url)]);
-            if (loadId !== this._loadId) return;
+            if (loadId !== this._loadId || key !== this._stemKey) return;
             const prepared = this._state.prepared ?? { peaks: null, bands: null, spectrogram: null };
             const patch: Partial<PreparedOverview> = { correlated: (stem.correlation?.global ?? 1) >= 0.5 };
             if (peaks) patch.peaksB = peaksToPyramid(decodePeaksFile(peaks), new Map());
@@ -636,6 +703,7 @@ export class SegmentedSource implements PlaybackSource {
         this._storeB?.dispose();
         this._storeB = null;
         this._stemB = null;
+        this._stemKey = null;
         this._disposeEngine();
         this._halt();
         this._store?.dispose();
@@ -934,7 +1002,7 @@ export class SegmentedSource implements PlaybackSource {
         engine.onReport = (report) => this._onReport(report);
         engine.onEnded = () => this._onEngineEnded();
         engine.onStretch = (state) => {
-            this.capabilities = SegmentedSource._caps(state.ready, this.capabilities.canMixStemB);
+            this.capabilities = SegmentedSource._caps(state.ready, this.capabilities.canMixStemB, this.capabilities.stems);
             this._update({ capabilities: this.capabilities });
         };
         this._eng = engine;
@@ -948,7 +1016,7 @@ export class SegmentedSource implements PlaybackSource {
         this._engPlaying = false;
         this._lastReport = null;
         if (this.capabilities.canPreservePitch) {
-            this.capabilities = SegmentedSource._caps(false, this.capabilities.canMixStemB);
+            this.capabilities = SegmentedSource._caps(false, this.capabilities.canMixStemB, this.capabilities.stems);
             this._update({ capabilities: this.capabilities });
         }
     }

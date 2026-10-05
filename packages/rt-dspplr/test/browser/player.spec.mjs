@@ -7,9 +7,15 @@ test.beforeEach(async ({ page }) => {
 test('main entry is narrow; advanced exports remain available', async ({ page }) => {
     const result = await page.evaluate(async () => {
         const main = await import('../../dist/index.js');
-        return { track: 'Track' in main, factory: typeof main.createAudioPlayer, advanced: typeof h.advanced.Track };
+        // Playback internals are not public: neither in "." nor in "./advanced".
+        const internals = ['SegmentStore', 'SegmentScheduler', 'StreamEngine', 'BufferSource', 'SegmentedSource', 'EffectChain', 'createStreamPlayer', 'StreamPlayerCore', 'approximateProcessedPyramid', 'previewCode', 'wavHeader16']
+            .filter((name) => name in main || name in h.advanced);
+        return {
+            track: 'Track' in main, factory: typeof main.createAudioPlayer, advanced: typeof h.advanced.Track,
+            timeline: typeof h.advanced.TimelineCore, internals, format: typeof h.format.assertManifest, setStem: typeof h.make().setStem,
+        };
     });
-    expect(result).toEqual({ track: false, factory: 'function', advanced: 'function' });
+    expect(result).toEqual({ track: false, factory: 'function', advanced: 'function', timeline: 'function', internals: [], format: 'function', setStem: 'function' });
 });
 
 test('buffer playback, seek and independent player disposal', async ({ page }) => {

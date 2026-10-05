@@ -233,9 +233,10 @@ class Panel {
             const b = p.getState().buffer;
             if (b) rows.push(['decoded in memory', `${clock(b.duration)} (${mb(b.length * b.numberOfChannels * 4)} PCM)`]);
         }
-        const stem = p?.getState().manifest?.stems?.b;
+        const key = p?.getState().stem ?? null;
+        const stem = key ? p?.getState().manifest?.stems?.[key] : undefined;
         if (stem) {
-            rows.push(['stem B', stem.status === 'ready'
+            rows.push([`stem B: ${stem.label ?? key}`, stem.status === 'ready'
                 ? `ready${stem.processor ? ` (${stem.processor.id}@${stem.processor.version}, ${(stem.processor.durationMs / 1000).toFixed(1)} s)` : ''}: offset ${stem.alignment?.offsetMs} ms (confidence ${stem.alignment?.confidence}), correlation ${stem.correlation?.global}, ${stem.mixLaw}, ${stem.loudnessDeltaDb} dB vs A (info), B up to ${((stem.source?.bandwidthHz ?? 0) / 1000).toFixed(1)} kHz; B segments fetched ${s?.fetchesB ?? 0}`
                 : stem.status]);
         }

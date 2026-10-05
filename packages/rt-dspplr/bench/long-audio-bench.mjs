@@ -6,7 +6,9 @@
 //   node bench/long-audio-bench.mjs --dir <folder> [--mode buffer|stream|both] [--only name] [--out results.json] [--mbps 50 --rtt 40]
 //
 // <folder> holds <name>.wav sources and, for the manifest mode, <name>/manifest.json
-// (from `rtd-prepare`). Needs a built dist/ (npm run build:lib). Each run gets a
+// (from `rtd-prepare`, @saitdigital/rt-dspplr-prepare). Needs a built dist/
+// (npm run build:lib); the internals it measures directly are bundled from
+// src/ by bench/internals.ts at start. Each run gets a
 // fresh browser; memory is the summed private bytes of every browser process
 // (sampled every 250 ms with PowerShell on Windows, /proc elsewhere is not wired)
 // plus the page's JS heap from the DevTools protocol.
@@ -18,8 +20,40 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { chromium } from '@playwright/test';
 import { pathToFileURL } from 'node:url';
+import { build } from 'esbuild';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+// The internals (segment engine, approximate preview...) are not exported by the
+// package: bundle them from src/, with the inline worker/worklet imports the
+// library build uses (as Blob-URL strings).
+const internalsFile = path.join(root, 'node_modules', '.cache', 'rtd-bench', 'internals.js');
+const inlineWorkers = {
+    name: 'inline-workers',
+    setup(b) {
+        b.onResolve({ filter: /\?inline-(worker|worklet)$/ }, (a) => ({ path: path.resolve(a.resolveDir, a.path.replace(/\?inline-(worker|worklet)$/, '')), namespace: a.path.endsWith('worker') ? 'inline-worker' : 'inline-worklet' }));
+        b.onLoad({ filter: /.*/, namespace: 'inline-worker' }, async (a) => ({ contents: await inlined(a.path, 'worker'), loader: 'js' }));
+        b.onLoad({ filter: /.*/, namespace: 'inline-worklet' }, async (a) => ({ contents: await inlined(a.path, 'worklet'), loader: 'js' }));
+    },
+};
+async function inlined(file, kind) {
+    const r = await build({ entryPoints: [file], bundle: true, write: false, format: 'iife', platform: 'browser', target: 'es2020', minify: true, logLevel: 'silent' });
+    const code = JSON.stringify(r.outputFiles[0].text);
+    return kind === 'worker'
+        ? `const code = ${code}; let url = null; export default function createWorker() { url ??= URL.createObjectURL(new Blob([code], { type: 'text/javascript' })); return new Worker(url); }`
+        : `const code = ${code}; let url = null; export default function getWorkletUrl() { url ??= URL.createObjectURL(new Blob([code], { type: 'text/javascript' })); return url; }`;
+}
+await build({
+    entryPoints: [path.join(root, 'bench', 'internals.ts')],
+    outfile: internalsFile,
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    target: 'es2020',
+    logLevel: 'warning',
+    define: { __RTD_VERSION__: JSON.stringify('bench') },
+    plugins: [inlineWorkers],
+});
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
     const i = args.indexOf(`--${name}`);
@@ -104,7 +138,7 @@ window.run = async ({ mode, url }) => {
 window.decodeBench = async (url, rounds = 20) => {
     const ctx = new AudioContext({ sampleRate: 48000 });
     const bytes = await (await fetch(url)).arrayBuffer();
-    const adv = await import('/dist/advanced.js');
+    const adv = await import('/internals.js');
     const time = async (fn) => { const t = []; for (let i = 0; i < rounds; i++) { const t0 = now(); await fn(); t.push(now() - t0); } t.sort((a, b) => a - b); return t[t.length >> 1]; };
     const native = await time(() => ctx.decodeAudioData(bytes.slice(0)));
     const pcm = await time(() => {
@@ -128,7 +162,7 @@ window.decodeBench = async (url, rounds = 20) => {
 // Approximate (stored peaks + bands) vs exact (peaks worker over the decoded file)
 // processed waveform, per drawn column: RMS and peak differences in dB.
 window.approxError = async ({ wav, manifest, settings, windows }) => {
-    const adv = await import('/dist/advanced.js');
+    const adv = await import('/internals.js');
     const ui = document.getElementById('ui');
     const a = api.createAudioPlayer({ element: ui, prewarmSpeeds: false, stretcher: 'native' });
     const b = api.createAudioPlayer({ element: ui });
@@ -192,7 +226,7 @@ window.approxError = async ({ wav, manifest, settings, windows }) => {
 };
 // Realtime stretch through the stream engine, offline: input as base64 Float32 (mono, 48 kHz).
 window.stretchRender = async ({ input, rate }) => {
-    const adv = await import('/dist/advanced.js');
+    const adv = await import('/internals.js');
     const bytes = Uint8Array.from(atob(input), (c) => c.charCodeAt(0));
     const x = new Float32Array(bytes.buffer);
     const sr = 48000;
@@ -238,6 +272,7 @@ function serve() {
             return;
         }
         if (url.pathname.startsWith('/dist/')) file = path.join(root, decodeURIComponent(url.pathname));
+        else if (url.pathname === '/internals.js') file = internalsFile;
         else if (url.pathname.startsWith('/audio/')) file = path.join(dir, decodeURIComponent(url.pathname.slice(7)));
         if (!file || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
             res.writeHead(404);

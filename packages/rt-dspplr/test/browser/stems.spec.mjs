@@ -8,8 +8,9 @@
 // Fixtures from long-fixtures.mjs: pairEq (B = A, 37 ms late), pairQuiet
 // (B = A, 37 ms late, -6 dB), both made in one prepare call; pairHot (A only).
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { test, expect } from '@playwright/test';
+import { loadPrepare } from './long-fixtures.mjs';
 
 const BASE = '/node_modules/.cache/rtd-long';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -159,7 +160,7 @@ test('the card reads stems as published: B in the manifest → knob on; no B →
 });
 
 test('refreshManifest() (explicit; nothing polls by default) attaches a B the host published later, while A plays', async ({ page }) => {
-    const { attachStem } = await import(pathToFileURL(path.join(root, 'dist', 'prepare.js')).href);
+    const { attachStem } = await loadPrepare();
     const dir = path.join(FIXTURES, 'pairHot');
     await page.evaluate((base) => h.mountCard({ manifest: `${base}/pairHot/manifest.json` }, { stretcher: 'native', prewarmSpeeds: false, processing: { highPassHz: 0, compression: 0 } }), BASE);
     await page.waitForFunction(() => window.cardPlayer?.getState().duration > 0);
@@ -220,4 +221,79 @@ test('waveform and spectrogram show the A/B blend', async ({ page }) => {
     console.log('blend views:', JSON.stringify(r));
     expect(r.waveChange).toBeGreaterThan(0.01);
     expect(r.spec1).toBeLessThan(r.spec0 * 0.97);
+});
+
+// ---- named stems -----------------------------------------------------------------------------
+// pairNamed: one manifest, two stems with neutral keys and labels: b (A's level) and v1 (-6 dB).
+
+test('named stems: play({ manifest, stem }) picks the blend stem, setStem() switches it, capabilities list them', async ({ page }) => {
+    const urls = [];
+    page.on('request', (req) => { const m = /\/pairNamed\/(b|v1)\/seg\//.exec(req.url()); if (m) urls.push(m[1]); });
+    const r = await page.evaluate(async () => {
+        const { player } = mk();
+        await player.play({ manifest: `${longBase}/pairNamed/manifest.json`, stem: 'v1' });
+        await h.sleep(500);
+        const s0 = player.getState();
+        const a = await levelDb(player);
+        player.setMix(1);
+        await h.sleep(900);
+        const v1 = await levelDb(player);
+        const switched = player.setStem('b');
+        await h.sleep(900);
+        const b = await levelDb(player);
+        const s1 = player.getState();
+        const unknown = player.setStem('nope');
+        const back = player.setStem(null); // the default: 'b'
+        const out = {
+            stem0: s0.stem, stems: s0.capabilities.stems, can: s0.capabilities.canMixStemB, statusB: s0.statusB,
+            v1: v1 - a, b: b - a, switched, stem1: s1.stem, statusB1: s1.statusB, mix1: s1.processing.mix,
+            unknown, back, stem2: player.getState().stem, playing: player.getState().isPlaying,
+        };
+        player.dispose();
+        // Without `stem`, the default is 'b'.
+        const { player: p2 } = mk();
+        await p2.load({ manifest: `${longBase}/pairNamed/manifest.json` });
+        out.defaultStem = p2.getState().stem;
+        p2.dispose();
+        return out;
+    });
+    console.log('named stems:', JSON.stringify(r));
+    expect(r.stem0).toBe('v1');
+    expect(r.stems).toEqual([{ key: 'b', label: 'Noise reduction' }, { key: 'v1', label: 'Voice conversion' }]);
+    expect(r.can).toBe(true);
+    expect(r.statusB).toBe('ready');
+    expect(Math.abs(r.v1 + 6.02)).toBeLessThan(0.6);
+    expect(r.switched).toBe(true);
+    expect(r.stem1).toBe('b');
+    expect(r.statusB1).toBe('ready');
+    expect(r.mix1).toBe(1);
+    expect(Math.abs(r.b)).toBeLessThan(0.6);
+    expect(r.unknown).toBe(false);
+    expect(r.back).toBe(true);
+    expect(r.stem2).toBe('b');
+    expect(r.playing).toBe(true);
+    expect(r.defaultStem).toBe('b');
+    expect(urls).toContain('v1');
+    expect(urls).toContain('b');
+});
+
+test('the card shows a stem selector (labels) only when the manifest has more than one stem', async ({ page }) => {
+    const card = async (name) => {
+        await page.evaluate((url) => h.mountCard({ manifest: url }, { stretcher: 'native', prewarmSpeeds: false, processing: { highPassHz: 0, compression: 0 } }), `${BASE}/${name}/manifest.json`);
+        await page.waitForFunction(() => window.cardPlayer?.getState().statusB === 'ready');
+        return page.evaluate(() => {
+            const select = document.querySelector('.rtd-mixer select.rtd-mixer-stem');
+            return { select: !!select, options: select ? [...select.options].map((o) => [o.value, o.textContent]) : null, value: select?.value ?? null };
+        });
+    };
+    const one = await card('pairEq');
+    expect(one).toEqual({ select: false, options: null, value: null });
+    const two = await card('pairNamed');
+    expect(two).toEqual({ select: true, options: [['b', 'Noise reduction'], ['v1', 'Voice conversion']], value: 'b' });
+    await page.selectOption('.rtd-mixer select.rtd-mixer-stem', 'v1');
+    const after = await page.evaluate(async () => {
+        await until(() => window.cardPlayer.getState().stem === 'v1', 3000);
+        return { stem: window.cardPlayer.getState().stem, value: document.querySelector('.rtd-mixer select.rtd-mixer-stem').value };
+    });
+    expect(after).toEqual({ stem: 'v1', value: 'v1' });
 });

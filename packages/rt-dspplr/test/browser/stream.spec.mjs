@@ -180,17 +180,17 @@ test('segment boundaries and a loop across one are sample-exact (OfflineAudioCon
     const result = await page.evaluate(async () => {
         const base = `${longBase}/mono30`;
         const manifest = await (await fetch(`${base}/manifest.json`)).json();
-        const ref = h.advanced.parseWavFile(await (await fetch(`${longBase}/mono30.wav`)).arrayBuffer()).channels[0];
+        const ref = h.format.parseWavFile(await (await fetch(`${longBase}/mono30.wav`)).arrayBuffer()).channels[0];
         const sr = manifest.sampleRate;
         const segs = await Promise.all(manifest.segments.list.map(async (s) => {
-            const wav = h.advanced.parseWavFile(await (await fetch(`${base}/${s.url}`)).arrayBuffer());
+            const wav = h.format.parseWavFile(await (await fetch(`${base}/${s.url}`)).arrayBuffer());
             const b = new AudioBuffer({ length: wav.frames, sampleRate: sr, numberOfChannels: 1 });
             b.copyToChannel(wav.channels[0], 0);
             return b;
         }));
         const render = async (frames, setup) => {
             const ctx = new OfflineAudioContext(1, frames, sr);
-            const s = new h.advanced.SegmentScheduler(ctx, ctx.destination, manifest.segments.list, sr);
+            const s = new h.internals.SegmentScheduler(ctx, ctx.destination, manifest.segments.list, sr);
             setup(s);
             s.pump(frames / sr, (i) => segs[i]);
             return (await ctx.startRendering()).getChannelData(0);

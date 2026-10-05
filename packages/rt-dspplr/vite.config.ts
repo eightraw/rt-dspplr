@@ -7,7 +7,10 @@ import { inlineWorkersPlugin } from './build/inline-plugin';
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
 const version = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8')).version as string;
 
-// Library build for the "." and "./react" entries. The optional
+/** Modules of the "./format" entry: pure code, no DOM / worker / Node APIs (check-dist verifies). */
+const FORMAT_MODULES = /[\\/]src[\\/]core[\\/](stream[\\/](manifest|peaksFile|bandsFile|spectrogramFile|wavFormat)|spectrogram[\\/]spectral|dsp[\\/]highPass)\.ts$/;
+
+// Library build for the ".", "./react", "./advanced" and "./format" entries. The optional
 // "./stretch-rubberband" entry is built separately by build/build-rubberband.mjs
 // (it must keep a bare `rubberband-wasm` import and a `new Worker(new URL(...))`
 // expression for the consumer's bundler, which Vite's lib mode would rewrite).
@@ -32,6 +35,7 @@ export default defineConfig({
                 index: path.resolve(rootDir, 'src/index.ts'),
                 react: path.resolve(rootDir, 'src/react/index.ts'),
                 advanced: path.resolve(rootDir, 'src/advanced.ts'),
+                format: path.resolve(rootDir, 'src/format.ts'),
             },
             formats: ['es'],
         },
@@ -40,8 +44,10 @@ export default defineConfig({
             output: {
                 entryFileNames: '[name].js',
                 chunkFileNames: 'chunks/[name]-[hash].js',
-                // One shared chunk for the engine, imported by both entries.
+                // The pure format code in a chunk of its own: "./format" loads only that
+                // (in Node too). One shared chunk for the engine, used by the browser entries.
                 manualChunks(id) {
+                    if (FORMAT_MODULES.test(id)) return 'format';
                     return /[\\/]src[\\/]core[\\/]/.test(id) ? 'core' : undefined;
                 },
                 // Next.js App Router: the React entry is a client module.

@@ -50,22 +50,48 @@ export interface ManifestLoudness {
 }
 
 /**
- * A second stem on the main stem's frame grid: the output of heavy processing
- * of A (denoise, restoration…), mixed with A as dry/wet. Written by
- * attachStem(), possibly long after A; `status` says where it stands.
+ * Keys of named stems: an opaque, host-chosen id, 1-32 characters of ASCII
+ * letters, digits, `_` and `-`, starting with a letter or digit. The library
+ * never interprets a key. `a` (any case) is reserved for the source itself;
+ * `b` is the default key. Keys are compared case-insensitively for collisions,
+ * because a stem's files live under `<key>/` (case-insensitive file systems).
+ */
+export const STEM_KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
+/** The key used when a host names no stem (and the key of every manifest written before named stems). */
+export const DEFAULT_STEM_KEY = 'b';
+
+/** Whether `key` is a valid stem key (STEM_KEY_PATTERN, and not the reserved `a`). */
+export function isStemKey(key: unknown): key is string {
+    return typeof key === 'string' && STEM_KEY_PATTERN.test(key) && key.toLowerCase() !== 'a';
+}
+
+/** Throws a descriptive error when `key` is not a valid stem key. */
+export function assertStemKey(key: unknown): asserts key is string {
+    if (isStemKey(key)) return;
+    if (typeof key === 'string' && key.toLowerCase() === 'a') throw new Error('Stem key "a" is reserved for the source');
+    throw new Error(`Invalid stem key ${JSON.stringify(key)}: 1-32 of [A-Za-z0-9_-], starting with a letter or digit`);
+}
+
+/**
+ * A stem on the source's frame grid: a time-aligned derivative of A (the
+ * same timeline), mixed with A by the player's A/B knob. What it contains is
+ * up to the host. Written by prepareAudio() / attachStem(); `status` says
+ * where it stands.
  */
 export interface ManifestStem {
     status: 'processing' | 'ready' | 'failed';
+    /** A human name for interfaces (the card shows `label ?? key`). Never interpreted. */
+    label?: string;
     error?: string;
     updatedAt: string;
     /**
      * The A this stem was made from (A's manifest id, sha256 of its source bytes):
-     * a host compares it, and `processor`, to spot a stale B and reprocess.
+     * a host compares it, and `processor`, to spot a stale stem and reprocess.
      */
     aSourceId?: string;
-    /** The external processor that made B (absent for a ready-made B input). */
+    /** The external processor that made the stem (absent for a ready-made input). */
     processor?: { id: string; version: string; params?: Record<string, unknown>; durationMs: number };
-    /** sha256 of B's source bytes. */
+    /** sha256 of the stem's source bytes. */
     id?: string;
     source?: {
         name: string | null;
@@ -73,10 +99,10 @@ export interface ManifestStem {
         sampleRate: number;
         channels: number;
         frames: number;
-        /** Highest frequency B carries (a 16 kHz speech enhancer: ~8 kHz): the UI can say B lacks highs. */
+        /** Highest frequency the stem carries (from a 16 kHz input: ~8 kHz): the UI can say it lacks highs. */
         bandwidthHz: number;
     };
-    /** Where B sat against A, measured by cross-correlation and compensated (B was shifted by -offsetFrames). */
+    /** Where the stem sat against A, measured by cross-correlation and compensated (shifted by -offsetFrames). */
     alignment?: {
         offsetFrames: number;
         offsetMs: number;
@@ -85,13 +111,13 @@ export interface ManifestStem {
         windows: number;
         agreeing: number;
     };
-    /** Zero-lag correlation of A and aligned B: the whole clip, and per segment. */
+    /** Zero-lag correlation of A and the aligned stem: the whole clip, and per segment. */
     correlation?: { global: number; perSegment: number[] };
-    /** The mix law for this pair: 'crossfade' for correlated dry/wet (level kept at every position). */
+    /** The mix law for this pair: 'crossfade' for a correlated pair (level kept at every position). */
     mixLaw?: 'crossfade' | 'equal-power';
-    /** B's loudness minus A's (gated RMS), information only — never applied automatically. */
+    /** The stem's loudness minus A's (gated RMS), information only - never applied automatically. */
     loudnessDeltaDb?: number;
-    /** An explicit, opt-in trim for B (default 0). */
+    /** An explicit, opt-in trim for the stem (default 0). */
     gainDb?: number;
     loudness?: ManifestLoudness;
     segments?: AudioManifest['segments'];
@@ -100,11 +126,14 @@ export interface ManifestStem {
     spectrogram?: AudioManifest['spectrogram'];
 }
 
+/** Named stems of a manifest (v3): key -> stem. See STEM_KEY_PATTERN. */
+export type ManifestStems = Record<string, ManifestStem>;
+
 export interface AudioManifest {
     /** Bumped on every rewrite of the manifest (a stem attached…). */
     revision?: number;
-    /** v3: further stems on the same grid. */
-    stems?: { b?: ManifestStem };
+    /** v3: named stems on the same grid (`b` when the host named none). */
+    stems?: ManifestStems;
     format: typeof MANIFEST_FORMAT;
     formatVersion: number;
     analyzerVersion: string;
@@ -175,19 +204,109 @@ export interface AudioManifest {
     };
 }
 
-/** Throws when `value` is not a manifest this version can play. */
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const isInt = (v: unknown, min = 0): v is number => Number.isInteger(v) && (v as number) >= min;
+const isStr = (v: unknown): v is string => typeof v === 'string';
+
+function checkSegments(s: unknown, where: string): string | null {
+    if (!isObj(s)) return `${where} is missing`;
+    if (s.codec !== 'wav-pcm16') return `Unsupported segment codec ${String(s.codec)}`;
+    if (!isInt(s.framesPerSegment, 1)) return `${where}.framesPerSegment must be a positive integer`;
+    if (!Array.isArray(s.list)) return `${where}.list must be an array`;
+    for (const [i, seg] of s.list.entries()) {
+        if (!isObj(seg) || !isInt(seg.index) || !isInt(seg.startFrame) || !isInt(seg.frames) || !isStr(seg.url) || !isInt(seg.bytes)) {
+            return `${where}.list[${i}] needs index, startFrame, frames, url and bytes`;
+        }
+    }
+    return null;
+}
+
+function checkPeaks(p: unknown, where: string): string | null {
+    if (!isObj(p) || !isStr(p.url) || !isInt(p.bytes) || p.format !== 'rtd-peaks' || !isInt(p.version, 1) || !Array.isArray(p.levels)) {
+        return `${where} needs url, bytes, format 'rtd-peaks', version and levels`;
+    }
+    for (const [i, l] of p.levels.entries()) {
+        if (!isObj(l) || !isInt(l.framesPerPeak, 1) || !isInt(l.peaks) || !isInt(l.byteOffset) || !isInt(l.byteLength)) {
+            return `${where}.levels[${i}] needs framesPerPeak, peaks, byteOffset and byteLength`;
+        }
+    }
+    return null;
+}
+
+function checkBlock(b: unknown, where: string, format: string): string | null {
+    if (b === undefined) return null;
+    if (!isObj(b) || !isStr(b.url) || !isInt(b.bytes) || b.format !== format || !isInt(b.version, 1)) {
+        return `${where} needs url, bytes, format '${format}' and version`;
+    }
+    return null;
+}
+
+function checkLoudness(l: unknown, where: string): string | null {
+    if (!isObj(l) || !isNum(l.peak) || !isNum(l.peakDb) || !isNum(l.rmsDb) || !isNum(l.gatedRmsDb) || !Array.isArray(l.perChannel)) {
+        return `${where} needs peak, peakDb, rmsDb, gatedRmsDb and perChannel`;
+    }
+    return null;
+}
+
+/**
+ * Why `value` is not a manifest this version can play, or null when it is.
+ * The rules are those of `manifest.schema.json` (shipped as
+ * `@saitdigital/rt-dspplr/manifest.schema.json`) for the fields the player reads;
+ * see docs/manifest.md.
+ */
+export function manifestProblem(value: unknown): string | null {
+    if (!isObj(value) || value.format !== MANIFEST_FORMAT) return 'Not an rtd audio manifest';
+    const m = value;
+    if (!isInt(m.formatVersion, 1)) return `Unsupported manifest version ${String(m.formatVersion)}`;
+    if (m.formatVersion > MANIFEST_FORMAT_VERSION) {
+        return `Unsupported manifest version ${String(m.formatVersion)} (this player reads ${MANIFEST_FORMAT_VERSION} and older)`;
+    }
+    if (!isStr(m.analyzerVersion) || !isStr(m.id) || !isStr(m.createdAt)) return 'Manifest is missing required fields (analyzerVersion, id, createdAt)';
+    if (!isNum(m.duration) || m.duration < 0 || !isInt(m.sampleRate, 1) || !isInt(m.sourceSampleRate, 1) || !isInt(m.channels, 1) || !isInt(m.frames)) {
+        return 'Manifest is missing required fields (duration, sampleRate, sourceSampleRate, channels, frames)';
+    }
+    if (m.revision !== undefined && !isInt(m.revision, 1)) return 'revision must be a positive integer';
+    const src = m.source;
+    if (!isObj(src) || !(src.name === null || isStr(src.name)) || !isInt(src.bytes) || !isStr(src.encoding) || !isInt(src.bitsPerSample, 1) || !isInt(src.frames)) {
+        return 'Manifest is missing required fields (source)';
+    }
+    if (m.resample !== null && !(isObj(m.resample) && isInt(m.resample.from, 1) && isInt(m.resample.to, 1))) return 'resample must be null or { from, to, ... }';
+    const problem = checkSegments(m.segments, 'segments') ?? checkPeaks(m.peaks, 'peaks') ?? checkLoudness(m.loudness, 'loudness')
+        ?? checkBlock(m.bands, 'bands', 'rtd-bands') ?? checkBlock(m.spectrogram, 'spectrogram', 'rtd-spectrogram');
+    if (problem) return problem;
+    if (m.stems !== undefined) {
+        if (!isObj(m.stems)) return 'stems must be an object of named stems';
+        const seen = new Set<string>();
+        for (const [key, stem] of Object.entries(m.stems)) {
+            if (!isStemKey(key)) return `Invalid stem key ${JSON.stringify(key)}`;
+            if (seen.has(key.toLowerCase())) return `Stem keys collide on ${JSON.stringify(key)} (keys are case-insensitive)`;
+            seen.add(key.toLowerCase());
+            const where = `stems.${key}`;
+            if (!isObj(stem) || !['processing', 'ready', 'failed'].includes(stem.status as string) || !isStr(stem.updatedAt)) {
+                return `${where} needs status ('processing' | 'ready' | 'failed') and updatedAt`;
+            }
+            if (stem.label !== undefined && !(isStr(stem.label) && stem.label.length > 0 && stem.label.length <= 120)) return `${where}.label must be a string of 1-120 characters`;
+            if (stem.gainDb !== undefined && !isNum(stem.gainDb)) return `${where}.gainDb must be a number`;
+            if (stem.processor !== undefined && !(isObj(stem.processor) && isStr(stem.processor.id) && isStr(stem.processor.version))) return `${where}.processor needs id and version`;
+            if (stem.mixLaw !== undefined && stem.mixLaw !== 'crossfade' && stem.mixLaw !== 'equal-power') return `${where}.mixLaw must be 'crossfade' or 'equal-power'`;
+            if (stem.status === 'ready') {
+                const p = checkSegments(stem.segments, `${where}.segments`) ?? checkPeaks(stem.peaks, `${where}.peaks`)
+                    ?? checkBlock(stem.bands, `${where}.bands`, 'rtd-bands') ?? checkBlock(stem.spectrogram, `${where}.spectrogram`, 'rtd-spectrogram');
+                if (p) return p;
+            }
+        }
+    }
+    return null;
+}
+
+/** Throws when `value` is not a manifest this version can play (see manifestProblem()). */
 export function assertManifest(value: unknown): asserts value is AudioManifest {
-    const m = value as Partial<AudioManifest> | null;
-    if (!m || typeof m !== 'object' || m.format !== MANIFEST_FORMAT) {
-        throw new Error('Not an rtd audio manifest');
-    }
-    if (typeof m.formatVersion !== 'number' || m.formatVersion > MANIFEST_FORMAT_VERSION) {
-        throw new Error(`Unsupported manifest version ${String(m.formatVersion)} (this player reads ${MANIFEST_FORMAT_VERSION})`);
-    }
-    if (!(m.sampleRate! > 0) || !(m.channels! > 0) || !(m.frames! >= 0) || !m.segments?.list || !m.peaks?.url) {
-        throw new Error('Manifest is missing required fields');
-    }
-    if (m.segments.codec !== 'wav-pcm16') {
-        throw new Error(`Unsupported segment codec ${String(m.segments.codec)}`);
-    }
+    const problem = manifestProblem(value);
+    if (problem) throw new Error(problem);
+}
+
+/** Keys of the manifest's stems that are ready to play, in manifest order. */
+export function readyStemKeys(manifest: Pick<AudioManifest, 'stems'>): string[] {
+    return Object.entries(manifest.stems ?? {}).filter(([, s]) => s.status === 'ready' && !!s.segments).map(([k]) => k);
 }

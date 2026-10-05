@@ -1,5 +1,14 @@
 # Long audio experiment: prepared manifest + segments
 
+> **Released in 0.4.0.** This file is the experiment's log (rounds 1–4), kept for
+> the measurements and the reasoning. What shipped differs in places: the prepare
+> step is its own package, `@saitdigital/rt-dspplr-prepare` (the `./prepare` entry
+> below no longer exists); the formats are in `@saitdigital/rt-dspplr/format`;
+> stems are named (`stems: { [key]: … }`, `b` the default, `player.setStem()`);
+> the deprecated `createStreamPlayer` aliases are gone; `./advanced` does not export
+> the playback internals. The normative format is [manifest.md](manifest.md); the
+> current API is in the package READMEs and CHANGELOG.md.
+
 Status: experiment on branch `experiment/long-audio`, round 4 (see [Round 4](#round-4): the DSP plugin
 API, and stem B as server-processed dry/wet on prepared files). Round 3 (parallel prepare, DSP on the
 spectrogram, the AudioWorklet stream engine with realtime stretch, the zoom fix) and round 2 follow it. In round 1 the work was a separate
@@ -23,7 +32,7 @@ the usage are in the README, "DSP plugins". In short:
   third-party plugins from the schema (sliders, bypass, error, a "Not in the preview" note).
 - **Realtime**: `nodes` (any Web Audio graph) or `worklet` (module URL or code; params become
   AudioParams).
-- **Previews**, so plugins show up in the waveform **and** the spectrogram (the owner's principle):
+- **Previews**, so plugins show up in the waveform **and** the spectrogram (what is heard is what is drawn):
   - `magnitudeResponse()` for LTI effects. The spectrogram applies it per row at paint time, for both
     sources and the overview. The prepared waveform overview gets a per-85 ms-column level change from
     it, weighted by the prepared spectrogram's energy per row.
@@ -57,7 +66,7 @@ playback continues; the volume after the effects.
 
 ### R4: stem B as server-processed dry/wet
 
-**The flow (owner's clarification).** B is made on the server **before the file is published**, as
+**The flow.** B is made on the server **before the file is published**, as
 part of manifest creation:
 
 > external processing configured? → B is needed → run the processor → align and adapt → stems.b in
@@ -199,7 +208,7 @@ and analyses, as for A) plus reading A back for the correlation.
 
 ## Round 3
 
-The owner's principle: **every place where the user can see or hear the signal reflects the
+The principle: **every place where the user can see or hear the signal reflects the
 current DSP state, live, for both sources.** The waveform, the spectrogram, the card and every
 timeline therefore draw from one shared DSP preview per player. Meters read the analyser that sits
 after the DSP chain. The overview strip draws no signal (only the view window and the playhead), so
@@ -604,7 +613,7 @@ data, COARSEST FIRST: per level columns × rows u8 (column-major, row 0 = highes
 ## API
 
 ```ts
-import { prepareAudio, ffmpegDecoder } from '@saitdigital/rt-dspplr/prepare';     // Node
+import { prepareAudio, ffmpegDecoder } from '@saitdigital/rt-dspplr-prepare';     // Node (was ./prepare)
 const job = prepareAudio('talk.wav', { outDir: 'prepared/talk' });              // bands/spectrogram: true by default
 await job.done;  // job.status: 'queued' → 'processing' → 'ready' | 'failed'
 

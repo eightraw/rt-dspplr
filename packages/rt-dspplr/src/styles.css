@@ -758,6 +758,18 @@
     white-space: nowrap;
 }
 
+.rtd-mixer-stem {
+    font: inherit;
+    font-size: 12px;
+    max-width: 10em;
+    min-width: 0;
+    padding: 1px 2px;
+    color: var(--rtd-text);
+    background: var(--rtd-surface, transparent);
+    border: 1px solid var(--rtd-border, currentColor);
+    border-radius: 4px;
+}
+
 .rtd-mixer[data-disabled] {
     opacity: 0.5;
 }

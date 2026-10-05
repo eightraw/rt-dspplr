@@ -1,12 +1,22 @@
-// Playwright global setup for the stream-player tests: writes two synthetic
-// recordings and prepares them with the built `./prepare` entry into
-// node_modules/.cache/rtd-long (served by the test server at /node_modules/.cache/rtd-long/).
+// Playwright global setup for the stream-player tests: writes synthetic
+// recordings and prepares them with the built @saitdigital/rt-dspplr-prepare
+// (packages/rt-dspplr-prepare/dist: `npm run build:lib` at the root builds it)
+// into node_modules/.cache/rtd-long (served by the test server at /node_modules/.cache/rtd-long/).
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const FIXTURES = path.join(root, 'node_modules', '.cache', 'rtd-long');
+const PREPARE = path.resolve(root, '..', 'rt-dspplr-prepare', 'dist', 'index.js');
+
+/** The built prepare package (a sibling workspace package; its dist must exist). */
+export async function loadPrepare() {
+    if (!fs.existsSync(PREPARE)) {
+        throw new Error(`${PREPARE} is missing: build it first (npm run build -w packages/rt-dspplr-prepare, or npm run build:lib at the root)`);
+    }
+    return import(pathToFileURL(PREPARE).href);
+}
 
 function wav16(file, seconds, rate, channels) {
     const frames = Math.round(seconds * rate);
@@ -60,7 +70,7 @@ function writeMono16(file, x, rate) {
 
 /** A/B pairs (stem B = A, 37 ms late; at A's level and at -6 dB), and an A-only clip that a test gives a B later. */
 async function pairs() {
-    const { prepareAudio } = await import(pathToFileURL(path.join(root, 'dist', 'prepare.js')).href);
+    const { prepareAudio } = await loadPrepare();
     const rate = 48000;
     const a = noise(20, rate);
     const delay = Math.round(0.037 * rate);
@@ -78,10 +88,21 @@ async function pairs() {
         if (b) stems[name] = m.stems.b;
     }
     fs.writeFileSync(path.join(FIXTURES, 'pairs.json'), JSON.stringify(stems, null, 1));
+    // Two named stems with labels (neutral keys; the labels are only examples): b at A's level, v1 at -6 dB.
+    const named = path.join(FIXTURES, 'pairNamed');
+    fs.rmSync(named, { recursive: true, force: true });
+    await prepareAudio(srcA, {
+        outDir: named,
+        segmentSeconds: 4,
+        stems: {
+            b: { input: path.join(FIXTURES, 'pairB0.wav'), label: 'Noise reduction' },
+            v1: { input: path.join(FIXTURES, 'pairB6.wav'), label: 'Voice conversion' },
+        },
+    }).done;
 }
 
 export default async function setup() {
-    const { prepareAudio } = await import(pathToFileURL(path.join(root, 'dist', 'prepare.js')).href);
+    const { prepareAudio } = await loadPrepare();
     fs.mkdirSync(FIXTURES, { recursive: true });
     const items = [
         { name: 'stereo70', seconds: 70, rate: 48000, channels: 2, segmentSeconds: 10 },

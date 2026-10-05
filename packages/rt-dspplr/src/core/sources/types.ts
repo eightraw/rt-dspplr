@@ -20,12 +20,26 @@ import type { LoopRange } from '../engine/Track';
 
 export type SourceKind = 'buffer' | 'segmented';
 
+/** A named stem of a prepared clip (see the manifest's `stems`). */
+export interface StemSummary {
+    /** The host-chosen key (opaque; `b` when the host named none). */
+    key: string;
+    /** The manifest's human label, if any: interfaces show `label ?? key`. */
+    label: string | null;
+}
+
 export interface SourceCapabilities {
     kind: SourceKind;
     /** Speed changes keep the pitch (a stretch worker). False: playbackRate, pitch follows speed. */
     canPreservePitch: boolean;
-    /** A second stem (stem B / enhanced) can be mixed in. */
+    /** A second stem (stem B) can be mixed in. */
     canMixStemB: boolean;
+    /**
+     * Prepared clips: the manifest's ready stems, in manifest order. The knob
+     * blends A with one of them at a time (`state.stem`, `player.setStem()`).
+     * Empty for whole clips, whose stem B is `srcB` / `loadB`.
+     */
+    stems: readonly StemSummary[];
     /** The waveform previews the DSP exactly over the whole clip (false: approximated outside the decoded window). */
     exactWaveformPreview: boolean;
     /** A spectrogram can be drawn (prepared overview or computed from the decoded clip). */

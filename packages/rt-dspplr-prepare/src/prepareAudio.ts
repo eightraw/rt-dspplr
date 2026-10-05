@@ -4,17 +4,26 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import {
     ANALYZER_VERSION,
+    BANDS_VERSION,
+    DEFAULT_FRAMES_PER_BAND_BIN,
     MANIFEST_FORMAT,
     MANIFEST_FORMAT_VERSION,
+    PEAKS_VERSION,
+    SPECTROGRAM_VERSION,
+    assertStemKey,
+    encodeBandsFile,
+    encodePeaksFile,
+    encodeSpectrogramFile,
+    peaksLayout,
+    spectrogramLayout,
+    wavHeader16,
     type AudioManifest,
     type ManifestLoudness,
     type ManifestSegment,
-} from '../core/stream/manifest';
-import { encodePeaksFile, peaksLayout, PEAKS_VERSION } from '../core/stream/peaksFile';
-import { wavHeader16 } from '../core/stream/wavFormat';
+    type ManifestStem,
+    type SpectrogramFile,
+} from '@saitdigital/rt-dspplr/format';
 import { DEFAULT_FRAMES_PER_PEAK, levelsFromFinest, loudnessFrom, type FinestPeaks } from './analysis';
-import { encodeBandsFile, BANDS_VERSION, DEFAULT_FRAMES_PER_BAND_BIN } from '../core/stream/bandsFile';
-import { encodeSpectrogramFile, spectrogramLayout, SPECTROGRAM_VERSION, type SpectrogramFile } from '../core/stream/spectrogramFile';
 import { spectrogramLevels, SPECTROGRAM_RANGE_DB, SPECTROGRAM_TOP_DB } from './overviewAnalysis';
 import { jobFrames, WARMUP_FRAMES, type JobResult, type JobSpec } from './jobs';
 import { defaultConcurrency, JobPool } from './pool';
@@ -24,7 +33,6 @@ import { type ResamplerOptions } from './resampler';
 import { resampleInParallel, resamplerInfo } from './parallelResample';
 import { buildStem, failedStem, StemAlignmentError, type StemInput, type StemOptions } from './stem';
 import { runProcessor, type StemProcessor } from './processors';
-import type { ManifestStem } from '../core/stream/manifest';
 
 // ---------------------------------------------------------------------------
 // prepareAudio — ingest-time preparation of a long recording for the stream
@@ -40,28 +48,48 @@ export interface PrepareStorage {
 }
 
 /**
- * Stem B, made in the same prepare call and published in the same manifest:
- * either a ready-made B (`input`) or an external `processor` that makes it
- * from A. Exactly one of the two.
+ * A named stem, made in the same prepare call and published in the same
+ * manifest: either a ready-made stem (`input`) or an external `processor`
+ * that makes it from A. Exactly one of the two.
+ *
+ * A stem must be a time-aligned derivative of A (same timeline, same events
+ * at the same times): the player blends it with A sample by sample. Output
+ * that changes timing is not a stem; publish it as a clip of its own.
+ *
+ * @experimental The stem processor API may change in minor releases before 1.0.
  */
 export interface StemSpec extends StemOptions {
     input?: StemInput;
     processor?: StemProcessor;
+    /** A human name, stored in the manifest for interfaces (the card shows `label ?? key`). Never interpreted. */
+    label?: string;
     /** Processor timeout (ms). Default: the processor's own, else 30 min. */
     timeoutMs?: number;
-    /** The processor failed: fail the job (default) or publish A only, the error recorded in stems.b. */
+    /** The processor failed: fail the job (default) or publish without this stem, the error recorded in its entry. */
     onProcessorError?: 'fail' | 'skip';
+}
+
+/** Wall-clock parts of one stem (ms). */
+export interface StemTimings {
+    /** The processor's run (beside A), or null for a ready-made input. */
+    processorMs: number | null;
+    /** How long the job waited for the processor after A was done. */
+    processorWaitMs: number;
+    /** Aligning, converting and writing the stem, or null when it was skipped. */
+    stemMs: number | null;
 }
 
 export type PrepareStatus = 'queued' | 'processing' | 'ready' | 'failed';
 
 export interface PrepareProgress {
     status: PrepareStatus;
-    /** What is running: A's segments and analyses, the stem processor, stem B. */
-    stage?: 'a' | 'processor' | 'b';
+    /** What is running: A's segments and analyses, a stem's processor, a stem's files. */
+    stage?: 'a' | 'processor' | 'stem';
+    /** The stem key of the 'processor' and 'stem' stages. */
+    stem?: string;
     /** The processor's own progress (0..1) when it reports one. */
     processorFraction?: number;
-    /** 0..1 by source bytes read (NaN when the size is unknown); with a stem B, A and B count half each. */
+    /** 0..1 by A's source bytes read (NaN when the size is unknown). */
     fraction: number;
     bytesRead: number;
     totalBytes: number | null;
@@ -109,8 +137,12 @@ export interface PrepareOptions {
     readChunkBytes?: number;
     signal?: AbortSignal;
     onProgress?: (progress: PrepareProgress) => void;
-    /** Stem B (dry/wet partner of A) in the same manifest. */
-    stems?: { b?: StemSpec };
+    /**
+     * Named stems in the same manifest: `{ [key]: { input | processor, label? } }`.
+     * Keys are opaque, host-chosen ids (STEM_KEY_PATTERN of `@saitdigital/rt-dspplr/format`,
+     * not `a`); `b` is the player's default. Each stem's files go under `<key>/`.
+     */
+    stems?: Record<string, StemSpec>;
     /** Scratch folder for processors (default: the OS temp folder). */
     tmpDir?: string;
 }
@@ -121,9 +153,12 @@ export interface PrepareStats {
     segments: number;
     /** Analysis threads used (1 = inline on the main thread). */
     threads: number;
-    /** Wall-clock parts (ms): A's timeline, the processor (runs beside A), the wait for it after A, stem B. */
-    timings: { aMs: number; processorMs: number | null; processorWaitMs: number; stemMs: number | null };
-    /** e.g. a stem B that was skipped (onProcessorError 'skip', onLowConfidence 'warn'). */
+    /**
+     * Wall-clock parts (ms): A's timeline, then per stem. The totals: the longest
+     * processor (they run beside A), the summed waits for them after A, the summed stem work.
+     */
+    timings: { aMs: number; processorMs: number | null; processorWaitMs: number; stemMs: number | null; stems: Record<string, StemTimings> };
+    /** e.g. a stem that was skipped (onProcessorError 'skip', onLowConfidence 'warn'). */
     warnings: string[];
 }
 
@@ -268,6 +303,27 @@ export function prepareAudio(input: PrepareInput, options: PrepareOptions = {}):
     };
 }
 
+/** The stems option, checked: valid keys, no case-insensitive collision, exactly one of input/processor. */
+function checkStemSpecs(stems: PrepareOptions['stems']): Array<[string, StemSpec]> {
+    if (stems === undefined) return [];
+    if (typeof stems !== 'object' || stems === null || Array.isArray(stems)) throw new Error('stems must be an object: { [key]: { input | processor } }');
+    const seen = new Map<string, string>();
+    const out: Array<[string, StemSpec]> = [];
+    for (const [key, spec] of Object.entries(stems)) {
+        if (spec === undefined) continue;
+        assertStemKey(key);
+        const lower = key.toLowerCase();
+        if (seen.has(lower)) throw new Error(`stems.${key} collides with stems.${seen.get(lower)} (stem keys are case-insensitive: their files share a folder)`);
+        seen.set(lower, key);
+        if (!spec || !spec.input === !spec.processor) throw new Error(`stems.${key} needs exactly one of \`input\` (a ready stem) or \`processor\``);
+        if (spec.label !== undefined && (typeof spec.label !== 'string' || spec.label.length === 0 || spec.label.length > 120)) {
+            throw new Error(`stems.${key}.label must be a string of 1-120 characters`);
+        }
+        out.push([key, spec]);
+    }
+    return out;
+}
+
 async function run(
     input: PrepareInput,
     options: PrepareOptions,
@@ -279,9 +335,9 @@ async function run(
     const segmentSeconds = options.segmentSeconds ?? 10;
     if (!(segmentSeconds > 0)) throw new Error('segmentSeconds must be > 0');
     const framesPerPeak = Math.max(16, Math.floor(options.framesPerPeak ?? DEFAULT_FRAMES_PER_PEAK));
-    const stemB = options.stems?.b;
-    if (stemB && !stemB.input === !stemB.processor) throw new Error('stems.b needs exactly one of `input` (a ready B) or `processor`');
-    if (stemB && !storage.getObject) throw new Error('stems.b needs a storage that can read back (getObject), or outDir');
+    const stemSpecs = checkStemSpecs(options.stems);
+    if (stemSpecs.length && !storage.getObject) throw new Error('stems need a storage that can read back (getObject), or outDir');
+    const anyProcessor = stemSpecs.some(([, spec]) => spec.processor);
     const warnings: string[] = [];
     const tStart = performance.now();
 
@@ -306,7 +362,7 @@ async function run(
     }
     // A processor needs A as a file: a stream input is copied to the scratch folder on the way.
     let tee: fs.WriteStream | null = null;
-    if (stemB?.processor && !aPath) {
+    if (anyProcessor && !aPath) {
         aPath = path.join(await scratch(), name ?? 'a.wav');
         tee = fs.createWriteStream(aPath);
     }
@@ -342,11 +398,12 @@ async function run(
         const channels = format.channels;
         const rate = chooseTargetRate(format.sampleRate, options.targetRate);
 
-        // ---- the processor runs beside A's own work -------------------------------------------
+        // ---- the processors run beside A's own work, all at once ------------------------------
         type ProcessorRun = { output: Awaited<ReturnType<typeof runProcessor>>['output']; durationMs: number } | { error: unknown; durationMs: number };
-        let processorRun: Promise<ProcessorRun> | null = null;
-        if (stemB?.processor) {
-            const processor = stemB.processor;
+        const processorRuns = new Map<string, Promise<ProcessorRun>>();
+        for (const [key, spec] of stemSpecs) {
+            if (!spec.processor) continue;
+            const processor = spec.processor;
             const start = async (): Promise<ProcessorRun> => {
                 const t0 = performance.now();
                 try {
@@ -359,15 +416,17 @@ async function run(
                         channels: format.channels,
                         frames: format.frames,
                         tmpDir: dir,
-                        onProgress: (fraction) => setProgress({ processorFraction: fraction }),
-                    }, { signal: processorStop.signal, timeoutMs: stemB.timeoutMs });
+                        onProgress: (fraction) => setProgress({ processorFraction: fraction, stem: key }),
+                    }, { signal: processorStop.signal, timeoutMs: spec.timeoutMs });
                     return r;
                 } catch (error) {
                     return { error, durationMs: Math.round(performance.now() - t0) };
                 }
             };
             // A path input: at once. A stream input: once its bytes are all in the scratch copy.
-            processorRun = tee ? aBytesRead.then(start) : start();
+            const run = tee ? aBytesRead.then(start) : start();
+            run.catch(() => undefined);
+            processorRuns.set(key, run);
         }
 
         async function* decodedBlocks(): AsyncGenerator<Float32Array[]> {
@@ -388,7 +447,7 @@ async function run(
             framesPerPeak,
             segmentSeconds,
             signal,
-            onFrames: (frames) => setProgress({ bytesRead, frames, ...(stemB ? { stage: 'a' } : {}) }),
+            onFrames: (frames) => setProgress({ bytesRead, frames, ...(stemSpecs.length ? { stage: 'a' } : {}) }),
             onSegments: (count) => setProgress({ segments: count }),
         });
         const aMs = Math.round(performance.now() - tStart);
@@ -424,76 +483,84 @@ async function run(
             ...(spectrogram ? { spectrogram } : {}),
         };
 
-        // ---- stem B: processed (or given), aligned, adapted, on A's grid ----------------------
-        let processorMs: number | null = null;
-        let processorWaitMs = 0;
-        let stemMs: number | null = null;
-        if (stemB) {
+        // ---- stems: processed (or given), aligned, adapted, on A's grid, one after another ----
+        const stemTimings: Record<string, StemTimings> = {};
+        const stems: Record<string, ManifestStem> = {};
+        for (const [key, spec] of stemSpecs) {
+            const timing: StemTimings = { processorMs: null, processorWaitMs: 0, stemMs: null };
+            stemTimings[key] = timing;
+            const labelled = (entry: ManifestStem): ManifestStem => (spec.label ? Object.assign({ status: entry.status, label: spec.label }, entry) : entry);
             let stem: ManifestStem | null = null;
-            let bInput: StemInput | null = stemB.input ?? null;
+            let input: StemInput | null = spec.input ?? null;
             let provenance: ManifestStem['processor'];
+            const processorRun = processorRuns.get(key);
             if (processorRun) {
-                setProgress({ stage: 'processor' });
+                setProgress({ stage: 'processor', stem: key });
                 const tw = performance.now();
                 const r = await processorRun;
-                processorWaitMs = Math.round(performance.now() - tw);
-                processorMs = r.durationMs;
-                const p = stemB.processor!;
+                timing.processorWaitMs = Math.round(performance.now() - tw);
+                timing.processorMs = r.durationMs;
+                const p = spec.processor!;
                 provenance = { id: p.id, version: p.version, ...(p.params ? { params: p.params } : {}), durationMs: r.durationMs };
                 if ('error' in r) {
-                    if (stemB.onProcessorError !== 'skip') throw r.error;
-                    stem = failedStem(manifest, r.error, { processor: provenance });
-                    warnings.push(`stems.b skipped: ${stem.error}`);
+                    if (spec.onProcessorError !== 'skip') throw r.error;
+                    stem = labelled(failedStem(manifest, r.error, { processor: provenance }));
+                    warnings.push(`stems.${key} skipped: ${stem.error}`);
                 } else if ('stream' in r.output) {
                     // Read twice (alignment, then writing): spooled to the scratch folder first.
-                    const file = path.join(await scratch(), 'b.stream');
+                    const file = path.join(await scratch(), `${key}.stream`);
                     const out = r.output.stream;
                     const iterable = typeof (out as ReadableStream).getReader === 'function' ? readableToIterable(out as ReadableStream<Uint8Array>) : (out as AsyncIterable<Uint8Array>);
                     const ws = fs.createWriteStream(file);
                     for await (const chunk of iterable) if (!ws.write(chunk)) await new Promise<void>((res) => ws.once('drain', () => res()));
                     await new Promise<void>((res, rej) => ws.end((e?: Error | null) => (e ? rej(e) : res())));
-                    bInput = file;
+                    input = file;
                 } else if ('path' in r.output) {
-                    bInput = r.output.path;
+                    input = r.output.path;
                 } else {
-                    bInput = r.output;
+                    input = r.output;
                 }
             }
-            if (!stem && bInput) {
-                setProgress({ stage: 'b' });
+            if (!stem && input) {
+                setProgress({ stage: 'stem', stem: key });
                 const t0 = performance.now();
                 try {
-                    stem = await buildStem({
+                    stem = labelled(await buildStem({
                         storage,
-                        read: (key) => storage.getObject!(key),
+                        read: (k) => storage.getObject!(k),
                         manifest,
-                        stem: 'b',
-                        input: bInput,
-                        options: stemB,
+                        stem: key,
+                        input,
+                        options: spec,
                         prepare: options,
                         pool,
                         signal,
                         processor: provenance,
                         onProgress: (stage, fraction) => {
-                            if (stage === 'writing') setProgress({ stage: 'b', frames: Math.round(fraction * totalFrames) });
+                            if (stage === 'writing') setProgress({ stage: 'stem', stem: key, frames: Math.round(fraction * totalFrames) });
                         },
-                    });
+                    }));
                 } catch (error) {
-                    if (!(error instanceof StemAlignmentError) || (stemB.onLowConfidence ?? 'fail') !== 'warn') throw error;
-                    stem = failedStem(manifest, error, provenance ? { processor: provenance } : {});
-                    warnings.push(`stems.b skipped: ${stem.error}`);
+                    if (!(error instanceof StemAlignmentError) || (spec.onLowConfidence ?? 'fail') !== 'warn') throw error;
+                    stem = labelled(failedStem(manifest, error, provenance ? { processor: provenance } : {}));
+                    warnings.push(`stems.${key} skipped: ${stem.error}`);
                 }
-                stemMs = Math.round(performance.now() - t0);
+                timing.stemMs = Math.round(performance.now() - t0);
                 outputBytes += [stem.peaks?.bytes ?? 0, stem.bands?.bytes ?? 0, stem.spectrogram?.bytes ?? 0, ...(stem.segments?.list.map((x) => x.bytes) ?? [])].reduce((x, y) => x + y, 0);
             }
-            if (stem) manifest.stems = { b: stem };
+            if (stem) stems[key] = stem;
         }
+        if (Object.keys(stems).length) manifest.stems = stems;
+        const all = Object.values(stemTimings);
+        const processorMs = all.some((t) => t.processorMs !== null) ? Math.max(...all.map((t) => t.processorMs ?? 0)) : null;
+        const processorWaitMs = all.reduce((n, t) => n + t.processorWaitMs, 0);
+        const stemMs = all.some((t) => t.stemMs !== null) ? all.reduce((n, t) => n + (t.stemMs ?? 0), 0) : null;
 
         const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest, null, 1));
         // Written last: a manifest's presence means every file it lists is in place.
         await storage.putObject('manifest.json', manifestBytes, 'application/json');
         outputBytes += manifestBytes.length;
-        return { manifest, outputBytes, threads: timeline.threads, timings: { aMs, processorMs, processorWaitMs, stemMs }, warnings };
+        return { manifest, outputBytes, threads: timeline.threads, timings: { aMs, processorMs, processorWaitMs, stemMs, stems: stemTimings }, warnings };
     } finally {
         signal.removeEventListener('abort', stopProcessor);
         processorStop.abort(new Error('prepare ended'));
@@ -528,7 +595,7 @@ export interface TimelineInput {
     framesPerPeak: number;
     segmentSeconds: number;
     signal: AbortSignal;
-    /** Path prefix of every file written ('' for the main stem, 'b/' for stem B). */
+    /** Path prefix of every file written ('' for A, '<key>/' for a stem). */
     prefix?: string;
     /** A pool shared with the caller (resampling, other stems); else one is made and closed here. */
     pool?: JobPool;

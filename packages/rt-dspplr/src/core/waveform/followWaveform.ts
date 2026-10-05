@@ -272,7 +272,7 @@ function followSegmented(player: PreviewPlayer, onPyramid: Publish): () => void 
         if (peaksB !== sentB || (changedInputs && peaksB)) {
             sentB = peaksB;
             changedB = true;
-            const stem = state.manifest?.stems?.b;
+            const stem = state.stem ? state.manifest?.stems?.[state.stem] : undefined;
             preview.setStemB(peaksB ? { stored: peaksB, bands: prepared?.bandsB ?? null, correlated: prepared?.correlated ?? true, gain: Math.pow(10, (stem?.gainDb ?? 0) / 20) } : null);
         }
         if (changedInputs || changedB || !sameProcessing(applied, processing)) {

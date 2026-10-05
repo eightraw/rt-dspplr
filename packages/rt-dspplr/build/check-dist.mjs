@@ -1,5 +1,11 @@
 // Post-build checks + size report.
 //  - "." and "./react" (and every chunk they load) must not reference rubberband-wasm.
+//  - No file in dist/ may reference Node-only modules (the package is for browsers;
+//    Node-only code lives in @saitdigital/rt-dspplr-prepare).
+//  - "./format" loads only the pure format chunk: no engine, DOM, worker or Node code.
+//  - Vendored third-party code ships with its notice (in the chunk and in
+//    THIRD_PARTY_NOTICES.md, which package.json "files" must list).
+//  - The manifest JSON Schema is in place and is draft 2020-12.
 //  - "./stretch-rubberband" must keep rubberband-wasm as a bare import and must
 //    not contain the WASM binary.
 //  - Sizes per entry: own file + statically imported chunks, raw and gzip.
@@ -43,7 +49,7 @@ function size(files) {
 const kb = (n) => `${(n / 1024).toFixed(1)} KB`;
 const report = [];
 
-for (const entry of ['index.js', 'react.js', 'advanced.js']) {
+for (const entry of ['index.js', 'react.js', 'advanced.js', 'format.js']) {
     const files = [...staticImports(entry)];
     for (const file of files) {
         const code = read(file);
@@ -53,6 +59,66 @@ for (const entry of ['index.js', 'react.js', 'advanced.js']) {
     }
     const { raw, gz } = size(files);
     report.push({ entry, files: files.length, raw, gz });
+}
+
+// ---- no Node-only code anywhere in dist ------------------------------------------------
+function walkDist(dir = dist) {
+    return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+        const full = path.join(dir, e.name);
+        return e.isDirectory() ? walkDist(full) : [path.relative(dist, full).split(path.sep).join('/')];
+    });
+}
+const nodeOnly = /\bfrom\s*["'](?:node:[\w/]+|fs|fs\/promises|path|os|child_process|worker_threads|crypto|stream|http|https|net|url|module)["']|\brequire\(\s*["'](?:node:|fs|path|os|child_process|worker_threads)|\bimport\(\s*["']node:|\bworker_threads\b|\bnode:fs\b|\bprocess\.(?:argv|exit|cwd)\b/;
+for (const file of walkDist().filter((f) => /\.(m?js|d\.ts)$/.test(f))) {
+    if (nodeOnly.test(read(file))) errors.push(`${file} references a Node-only module (worker_threads, node:fs, ...)`);
+}
+for (const file of walkDist()) {
+    if (/(^|\/)(rtd-)?prepare([-./]|$)/i.test(file)) errors.push(`${file}: prepare code belongs to @saitdigital/rt-dspplr-prepare`);
+}
+
+// ---- "./format" is the pure format chunk only ------------------------------------------
+{
+    const files = [...staticImports('format.js')];
+    for (const file of files) {
+        if (/chunks\/core-/.test(file)) errors.push(`format.js loads the engine chunk ${file}`);
+        const code = read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+        if (/\b(?:window|document|navigator|AudioContext|AudioWorkletNode|importScripts)\b|new Worker\(|URL\.createObjectURL/.test(code)) {
+            errors.push(`${file} (loaded by format.js) uses a browser-only API`);
+        }
+    }
+}
+
+// ---- third-party notices -------------------------------------------------------------------
+{
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    const noticesFile = path.join(root, 'THIRD_PARTY_NOTICES.md');
+    if (!pkg.files?.includes('THIRD_PARTY_NOTICES.md')) errors.push('package.json "files" does not list THIRD_PARTY_NOTICES.md');
+    const notices = fs.existsSync(noticesFile) ? fs.readFileSync(noticesFile, 'utf8') : '';
+    if (!/Signalsmith Stretch/.test(notices) || !/Permission is hereby granted/.test(notices)) errors.push('THIRD_PARTY_NOTICES.md lacks the Signalsmith Stretch MIT notice');
+    // Every vendored source (src/vendor/*) must have its notice in the chunk it ends up in.
+    const vendored = walkDist().filter((f) => /^chunks\/signalsmithStretch-.*\.js$/.test(f));
+    if (vendored.length !== 1) errors.push(`expected one Signalsmith Stretch chunk, found ${vendored.length}`);
+    for (const file of vendored) {
+        const code = read(file);
+        if (!/Signalsmith Stretch [\d.]+ \(npm "signalsmith-stretch"\), MIT License/.test(code) || !/Permission is hereby granted/.test(code)) {
+            errors.push(`${file} lost its MIT notice`);
+        }
+    }
+    const vendorDir = path.join(root, 'src', 'vendor');
+    for (const name of fs.existsSync(vendorDir) ? fs.readdirSync(vendorDir) : []) {
+        if (name !== 'signalsmithStretch.ts') errors.push(`src/vendor/${name}: new vendored code needs a notice check in check-dist and THIRD_PARTY_NOTICES.md`);
+    }
+}
+
+// ---- the manifest schema -------------------------------------------------------------------
+{
+    const schemaFile = path.join(root, 'schema', 'manifest.schema.json');
+    try {
+        const schema = JSON.parse(fs.readFileSync(schemaFile, 'utf8'));
+        if (schema.$schema !== 'https://json-schema.org/draft/2020-12/schema') errors.push('schema/manifest.schema.json is not draft 2020-12');
+    } catch (error) {
+        errors.push(`schema/manifest.schema.json: ${error.message}`);
+    }
 }
 
 if (!/^['"]use client['"];/.test(read('react.js'))) {
@@ -97,4 +163,4 @@ if (errors.length > 0) {
     console.error('\ncheck-dist FAILED:\n  ' + errors.join('\n  '));
     process.exit(1);
 }
-console.log('\ncheck-dist OK: core/react are free of rubberband-wasm; the optional entry keeps it external.\n');
+console.log('\ncheck-dist OK: no Node-only code, ./format is pure, notices and schema in place; core/react are free of rubberband-wasm, the optional entry keeps it external.\n');

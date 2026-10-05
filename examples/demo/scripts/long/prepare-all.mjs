@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Prepares every <name>.wav in a folder into <name>/ (manifest.json, peaks,
-// bands, spectrogram, seg/*.wav) with the package's `./prepare` entry. Stem B
+// bands, spectrogram, seg/*.wav) with @saitdigital/rt-dspplr-prepare. Stem B
 // is made in the same call, so one manifest has both A and B. B comes from:
 //   - a ready-made file, when <dir>/stems/<name>.b.wav exists (make-stems.mjs,
 //     make-speech-docker.sh);
@@ -12,7 +12,7 @@
 // Folders that are up to date (manifest newer than its sources) are skipped.
 import fs from 'node:fs';
 import path from 'node:path';
-import { dockerProcessor, prepareAudio } from '@saitdigital/rt-dspplr/prepare';
+import { dockerProcessor, prepareAudio } from '@saitdigital/rt-dspplr-prepare';
 
 const args = process.argv.slice(2);
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
@@ -43,7 +43,7 @@ for (const file of wavs) {
     const out = path.join(dir, name);
     const bFile = path.join(dir, 'stems', `${name}.b.wav`);
     const processor = dockerImage && name.includes(dockerFor) ? denoiser(dockerImage) : null;
-    const stems = processor ? { b: { processor } } : fs.existsSync(bFile) ? { b: { input: bFile } } : undefined;
+    const stems = processor ? { b: { processor, label: 'Noise reduction (ffmpeg afftdn)' } } : fs.existsSync(bFile) ? { b: { input: bFile, label: 'Ready-made B' } } : undefined;
     const manifest = path.join(out, 'manifest.json');
     const newest = Math.max(fs.statSync(src).mtimeMs, stems?.b.input ? fs.statSync(bFile).mtimeMs : 0);
     if (!force && fs.existsSync(manifest) && fs.statSync(manifest).mtimeMs > newest) {

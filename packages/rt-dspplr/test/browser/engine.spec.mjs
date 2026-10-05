@@ -14,10 +14,10 @@ test.beforeEach(async ({ page }) => {
         /** An offline context with the engine and `segments` (arrays of mono Float32Array) fed in. */
         window.offlineEngine = async (seconds, segments, options = {}) => {
             const ctx = new OfflineAudioContext(1, Math.round(seconds * sr), sr);
-            await h.advanced.loadStreamEngine(ctx, !!options.stretch);
+            await h.internals.loadStreamEngine(ctx, !!options.stretch);
             const starts = [0];
             for (const s of segments) starts.push(starts[starts.length - 1] + s.length);
-            const engine = new h.advanced.StreamEngine(ctx, { channels: 1, starts, stretch: !!options.stretch });
+            const engine = new h.internals.StreamEngine(ctx, { channels: 1, starts, stretch: !!options.stretch });
             engine.node.connect(ctx.destination);
             const feed = options.feed ?? segments.map((_, i) => i);
             for (const i of feed) engine.feed('a', i, [segments[i].slice()]);
@@ -42,9 +42,9 @@ test.beforeEach(async ({ page }) => {
 test('engine output is sample-exact across segment boundaries and loop wraps', async ({ page }) => {
     const result = await page.evaluate(async () => {
         const sr = 48000;
-        const ref = h.advanced.parseWavFile(await (await fetch(`${longBase}/mono30.wav`)).arrayBuffer()).channels[0];
+        const ref = h.format.parseWavFile(await (await fetch(`${longBase}/mono30.wav`)).arrayBuffer()).channels[0];
         const manifest = await (await fetch(`${longBase}/mono30/manifest.json`)).json();
-        const segs = await Promise.all(manifest.segments.list.map(async (s) => h.advanced.parseWavFile(await (await fetch(`${longBase}/mono30/${s.url}`)).arrayBuffer()).channels[0]));
+        const segs = await Promise.all(manifest.segments.list.map(async (s) => h.format.parseWavFile(await (await fetch(`${longBase}/mono30/${s.url}`)).arrayBuffer()).channels[0]));
         const skip = 192; // the 4 ms fade-in of a start
         // 1) From an odd frame across three 3 s boundaries.
         const from = 2 * sr + 12345;
@@ -87,10 +87,10 @@ test('volume, A/B mix and seeks never click (smoothed ramps, declicked jumps)', 
         const mix = await (async () => {
             const sr2 = 48000;
             const ctx2 = new OfflineAudioContext(1, sr2 * 2, sr2);
-            await h.advanced.loadStreamEngine(ctx2, false);
+            await h.internals.loadStreamEngine(ctx2, false);
             const segsA = cut(tone, sr2), segsB = cut(b, sr2);
             const starts = [0]; for (const s of segsA) starts.push(starts[starts.length - 1] + s.length);
-            const e = new h.advanced.StreamEngine(ctx2, { channels: 1, starts, stretch: false });
+            const e = new h.internals.StreamEngine(ctx2, { channels: 1, starts, stretch: false });
             e.node.connect(ctx2.destination);
             segsA.forEach((s, i) => e.feed('a', i, [s.slice()]));
             segsB.forEach((s, i) => e.feed('b', i, [s.slice()]));
@@ -176,11 +176,11 @@ test('realtime stretch: loop wraps and speed changes stay continuous (no gap, no
         const tone = sine(sr * 6, 375, 0.5);
         const natural = maxDelta(tone);
         const ctx = new OfflineAudioContext(1, sr * 5, sr);
-        await h.advanced.loadStreamEngine(ctx, true);
-        await h.advanced.stretchAvailable(ctx);
+        await h.internals.loadStreamEngine(ctx, true);
+        await h.internals.stretchAvailable(ctx);
         const segs = cut(tone, sr * 2);
         const starts = [0]; for (const s of segs) starts.push(starts[starts.length - 1] + s.length);
-        const engine = new h.advanced.StreamEngine(ctx, { channels: 1, starts, stretch: true });
+        const engine = new h.internals.StreamEngine(ctx, { channels: 1, starts, stretch: true });
         engine.node.connect(ctx.destination);
         segs.forEach((s, i) => engine.feed('a', i, [s.slice()]));
         engine.setLoop({ start: sr, end: 2 * sr });

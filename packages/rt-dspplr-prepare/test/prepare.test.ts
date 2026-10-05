@@ -9,25 +9,32 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import {
-    decodePeaksFile,
-    designResampler,
     memoryStorage,
     prepareAudio,
-    StreamingResampler,
     wavDecoder,
-    parseWavFile,
     type AudioDecoder,
-    decodeBandsFile,
     attachStem,
-    decodeSpectrogramFile,
-    highPassEnergyRatio,
-    resampleInParallel,
     functionProcessor,
     commandProcessor,
     httpProcessor,
-} from '../src/prepare/index';
-import { JobPool } from '../src/prepare/pool';
-import { computeHighPassCoefficients, HIGH_PASS_SECTION_Q } from '../src/core/dsp/highPass';
+} from '../src/index';
+import { designResampler, StreamingResampler } from '../src/resampler';
+import { resampleInParallel } from '../src/parallelResample';
+import { JobPool } from '../src/pool';
+import { markStem } from '../src/attachStem';
+import Ajv2020 from 'ajv/dist/2020';
+import manifestSchema from '@saitdigital/rt-dspplr/manifest.schema.json';
+// The formats come from the player package (one implementation for both).
+import {
+    assertManifest,
+    computeHighPassCoefficients,
+    decodeBandsFile,
+    decodePeaksFile,
+    decodeSpectrogramFile,
+    highPassEnergyRatio,
+    HIGH_PASS_SECTION_Q,
+    parseWavFile,
+} from '@saitdigital/rt-dspplr/format';
 
 const results: string[] = [];
 
@@ -552,6 +559,17 @@ const RATE = 48000;
 const A40 = speechLike(RATE * 40, RATE, 1, 41);
 const A40wav = asWav16(A40, RATE);
 
+/** Every manifest the stem tests publish is checked against the shipped JSON Schema and assertManifest(). */
+const validateSchema = new Ajv2020({ allErrors: true, strict: false }).compile(manifestSchema as object);
+const schemaChecked: string[] = [];
+function checkManifest(m: unknown, name: string): void {
+    const ok = validateSchema(m);
+    assert.ok(ok, `${name}: schema: ${JSON.stringify(validateSchema.errors)}`);
+    assert.doesNotThrow(() => assertManifest(m), `${name}: assertManifest`);
+    schemaChecked.push(name);
+}
+
+
 {
     // One call: A and B (16 kHz, mono, 37 ms late, -6 dB) → one manifest; same bytes for 1 and 4 threads.
     const bWav = asWav16([resampleF64(delayed(A40[0], Math.round(0.037 * RATE), 0.5), RATE, 16000)], 16000);
@@ -566,6 +584,7 @@ const A40wav = asWav16(A40, RATE);
     const one = await run(1);
     const four = await run(4);
     const m = one.manifest;
+    checkManifest(m, 'A + b in one call');
     const b = m.stems!.b!;
     assert.equal(m.formatVersion, 3);
     assert.equal(m.revision, 1, 'published once');
@@ -583,7 +602,7 @@ const A40wav = asWav16(A40, RATE);
     assert.deepEqual(b.segments!.list.map((s) => [s.startFrame, s.frames]), m.segments.list.map((s) => [s.startFrame, s.frames]));
     const lv = levelDb(one.storage, m as never, 2);
     assert.ok(Math.abs(lv.db + 6) < 0.7 && lv.rho > 0.95, `B segment ${lv.db.toFixed(2)} dB, ρ ${lv.rho.toFixed(3)}`);
-    assert.deepEqual([...one.stages].sort(), ['a', 'b']);
+    assert.deepEqual([...one.stages].sort(), ['a', 'stem']);
     // Determinism across concurrency: every file, and the manifest but for timestamps.
     const keys = [...one.storage.objects.keys()].sort();
     assert.deepEqual(keys, [...four.storage.objects.keys()].sort());
@@ -602,6 +621,7 @@ const A40wav = asWav16(A40, RATE);
         assert.ok(Buffer.from(later.objects.get(key)!).equals(Buffer.from(one.storage.objects.get(key)!)), `attachStem: ${key} differs from the one-call prepare`);
     }
     assert.equal(readManifestOf(later).revision, 2);
+    checkManifest(readManifestOf(later), 'attachStem b');
     assert.equal(attached.alignment!.offsetFrames, b.alignment!.offsetFrames);
     results.push(`prepare A+B in one call: B 16 kHz mono 37 ms late → offset ${b.alignment!.offsetFrames} (${b.alignment!.offsetMs} ms), confidence ${b.alignment!.confidence}, ρ ${b.correlation!.global}, ${b.mixLaw}, band ${b.source!.bandwidthHz} Hz, loudness ${b.loudnessDeltaDb} dB (info); one manifest (revision 1), B on A's grid; ${keys.length} files byte-identical for 1 vs 4 threads; attachStem writes the same B bytes`);
 }
@@ -621,15 +641,94 @@ const A40wav = asWav16(A40, RATE);
     assert.equal(mw.stems!.b!.status, 'failed');
     assert.match(mw.stems!.b!.error!, /does not line up/);
     assert.ok(mw.stems!.b!.alignment);
+    checkManifest(mw, 'b refused (warn)');
     assert.equal(job.stats!.warnings.length, 1);
     assert.ok(![...warned.objects.keys()].some((k) => k.startsWith('b/seg/')), 'no B segments');
     await assert.rejects(prepareAudio(chunks(A40wav, 3, 65536), { storage: memoryStorage(), stems: { b: {} } }).done, /exactly one/);
     results.push('stem B refusals: 1-frame offset exact; unrelated B fails the job (no manifest) or, with onLowConfidence "warn", publishes A only with stems.b failed + reason + measured alignment');
 }
 
+// ---- named stems ----------------------------------------------------------------------------
+
+{
+    // Two stems with neutral keys and labels, in one call: each on A's grid under its own folder.
+    const storage = memoryStorage();
+    const bWav = asWav16([delayed(A40[0], Math.round(0.037 * RATE), 0.5)], RATE);
+    const v1Wav = asWav16([delayed(A40[0], Math.round(0.011 * RATE), 0.8)], RATE);
+    const job = prepareAudio(chunks(A40wav, 3, 65536), {
+        storage,
+        concurrency: 2,
+        stems: {
+            b: { input: () => chunks(bWav, 5, 65536), label: 'Noise reduction' },
+            v1: { input: () => chunks(v1Wav, 5, 65536), label: 'Voice conversion' },
+        },
+    });
+    const seen = new Set<string>();
+    job.on('progress', (p) => { if (p.stage === 'stem' && p.stem) seen.add(p.stem); });
+    const m = await job.done;
+    assert.deepEqual(Object.keys(m.stems!), ['b', 'v1']);
+    assert.equal(m.stems!.b.label, 'Noise reduction');
+    assert.equal(m.stems!.v1.label, 'Voice conversion');
+    assert.equal(m.stems!.b.status, 'ready');
+    assert.equal(m.stems!.v1.status, 'ready');
+    assert.ok(Math.abs(m.stems!.b.alignment!.offsetFrames - Math.round(0.037 * RATE)) <= 1);
+    assert.ok(Math.abs(m.stems!.v1.alignment!.offsetFrames - Math.round(0.011 * RATE)) <= 1);
+    assert.ok(m.stems!.v1.segments!.list.every((x) => x.url.startsWith('v1/seg/')));
+    assert.ok(storage.objects.has('v1/peaks.bin') && storage.objects.has('b/peaks.bin'));
+    assert.deepEqual([...seen].sort(), ['b', 'v1']);
+    assert.deepEqual(Object.keys(job.stats!.timings.stems).sort(), ['b', 'v1']);
+    const lv = levelDb(storage, { ...m, stems: { b: m.stems!.v1 } } as never, 1);
+    assert.ok(Math.abs(lv.db - 20 * Math.log10(0.8)) < 0.5, `v1 level ${lv.db.toFixed(2)} dB`);
+    checkManifest(m, 'two named stems');
+
+    // attachStem / markStem take any valid key, and keep a label.
+    const v2 = await attachStem({ storage }, 'v2', () => chunks(v1Wav, 5, 65536), { concurrency: 1, label: 'Variant 2' });
+    assert.equal(v2.label, 'Variant 2');
+    const after = readManifestOf(storage);
+    assert.deepEqual(Object.keys(after.stems), ['b', 'v1', 'v2']);
+    assert.equal(after.revision, 2);
+    checkManifest(after, 'attachStem v2');
+    const marked = await markStem({ storage }, 'v3', 'processing');
+    assert.equal(marked.stems!.v3.status, 'processing');
+    checkManifest(marked, 'markStem v3 processing');
+
+    // Key validation: reserved 'a', invalid characters, case-insensitive collisions, labels.
+    const bad = async (stems: Record<string, unknown>, re: RegExp) => assert.rejects(
+        prepareAudio(chunks(A40wav, 3, 65536), { storage: memoryStorage(), concurrency: 1, stems: stems as never }).done, re);
+    const input = { input: { channels: [Float32Array.from(A40[0])], sampleRate: RATE } };
+    await bad({ a: input }, /reserved/);
+    await bad({ A: input }, /reserved/);
+    await bad({ 'two words': input }, /Invalid stem key/);
+    await bad({ '-x': input }, /Invalid stem key/);
+    await bad({ ['k'.repeat(33)]: input }, /Invalid stem key/);
+    await bad({ '../b': input }, /Invalid stem key/);
+    await bad({ V1: input, v1: input }, /collides/);
+    await bad({ v1: { ...input, label: '' } }, /label/);
+    await assert.rejects(attachStem({ storage }, 'a', () => chunks(v1Wav, 5, 65536)), /reserved/);
+    await assert.rejects(markStem({ storage }, 'no/slash', 'processing'), /Invalid stem key/);
+    results.push(`named stems: b ("Noise reduction") + v1 ("Voice conversion") in one call, each on A's grid under <key>/, offsets ${m.stems!.b.alignment!.offsetMs} / ${m.stems!.v1.alignment!.offsetMs} ms; attachStem v2 + markStem v3; keys validated (a reserved, pattern, case-insensitive collisions, labels)`);
+}
+
+{
+    // A time-warped variant (3 % longer: what re-timing output looks like) is not a stem: alignment refuses it,
+    // and the message says what to do instead.
+    const warped = resampleF64(A40[0], RATE, Math.round(RATE * 1.03));
+    const stems = { v1: { input: { channels: [Float32Array.from(warped)], sampleRate: RATE } } };
+    const err = await prepareAudio(chunks(A40wav, 3, 65536), { storage: memoryStorage(), concurrency: 2, stems }).done.then(() => null, (e: Error) => e);
+    assert.ok(err, 'a 3 % stretched stem must be refused');
+    assert.match(err!.message, /stems\.v1 does not line up with A/);
+    assert.match(err!.message, /time-aligned derivative of A/);
+    assert.match(err!.message, /separate clip with its own manifest/);
+    const warned = await prepareAudio(chunks(A40wav, 3, 65536), { storage: memoryStorage(), concurrency: 2, stems: { v1: { ...stems.v1, onLowConfidence: 'warn' as const, label: 'Variant' } } }).done;
+    assert.equal(warned.stems!.v1.status, 'failed');
+    assert.equal(warned.stems!.v1.label, 'Variant');
+    checkManifest(warned, 'failed stem (warn)');
+    results.push(`time-warped stem (+3 %): refused (confidence ${warned.stems!.v1.alignment?.confidence}), message points to a separate clip`);
+}
+
 // ---- stem processors ------------------------------------------------------------------------
 
-/** The test's "denoiser": a high-shelf cut and a downward expander, 23 ms late, at 0.7. */
+/** The test's processor: a high-shelf cut and a downward expander, 23 ms late, at 0.7. */
 function processB(x: Float32Array, rate: number): Float32Array {
     const d = Math.round(0.023 * rate);
     const y = new Float32Array(x.length);
@@ -646,6 +745,7 @@ function processB(x: Float32Array, rate: number): Float32Array {
 }
 const wavMono16 = (x: Float32Array, rate: number) => asWav16([Float64Array.from(x)], rate);
 const checkProcessed = (m: Awaited<ReturnType<typeof prepareAudio>['done']>, id: string) => {
+    checkManifest(m, id);
     const b = m.stems!.b!;
     assert.equal(b.status, 'ready', `${id}: ${b.error}`);
     assert.equal(b.processor!.id, id);
@@ -743,9 +843,9 @@ fs.writeFileSync(out, o);
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
     const port = (server.address() as { port: number }).port;
     try {
-        const raw = await prepareAudio(aFile, { storage: memoryStorage(), concurrency: 2, stems: { b: { processor: httpProcessor({ url: `http://127.0.0.1:${port}/enhance`, id: 'test.http', version: '3' }) } } }).done;
+        const raw = await prepareAudio(aFile, { storage: memoryStorage(), concurrency: 2, stems: { b: { processor: httpProcessor({ url: `http://127.0.0.1:${port}/process`, id: 'test.http', version: '3' }) } } }).done;
         const b = checkProcessed(raw, 'test.http');
-        const form = await prepareAudio(aFile, { storage: memoryStorage(), concurrency: 1, stems: { b: { processor: httpProcessor({ url: `http://127.0.0.1:${port}/enhance`, field: 'audio', id: 'test.http' }) } } }).done;
+        const form = await prepareAudio(aFile, { storage: memoryStorage(), concurrency: 1, stems: { b: { processor: httpProcessor({ url: `http://127.0.0.1:${port}/process`, field: 'audio', id: 'test.http' }) } } }).done;
         checkProcessed(form, 'test.http');
         await assert.rejects(prepareAudio(aFile, { storage: memoryStorage(), concurrency: 1, stems: { b: { processor: httpProcessor({ url: `http://127.0.0.1:${port}/fail`, id: 'test.http' }) } } }).done, /answered 503: busy/);
         results.push(`http processor: raw body and multipart → offset ${b.alignment!.offsetFrames}, ρ ${b.correlation!.global}; 503 → job fails with the status and body`);
@@ -756,5 +856,6 @@ fs.writeFileSync(out, o);
 }
 fs.rmSync(tmpRoot, { recursive: true, force: true });
 
+results.push(`manifests checked against manifest.schema.json and assertManifest(): ${schemaChecked.length}`);
 console.log(results.map((line) => `  ok  ${line}`).join('\n'));
 console.log('\nprepare tests passed');
