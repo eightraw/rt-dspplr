@@ -301,14 +301,6 @@ export class BufferSource implements PlaybackSource {
         }
     };
 
-    setVolume(value: number): void {
-        this._volume = value;
-        const node = this._mixer?.masterGainNode;
-        const ctx = this._engine?.context;
-        if (node && ctx) node.gain.setTargetAtTime(value, ctx.currentTime, 0.005);
-    }
-
-    private _volume = 1;
 
     /** Stop and drop the clip: another source plays the next one. */
     unload(): void {
@@ -388,7 +380,6 @@ export class BufferSource implements PlaybackSource {
         if (mixer.masterGainNode) {
             mixer.masterGainNode.disconnect();
             mixer.masterGainNode.connect(output.input);
-            mixer.masterGainNode.gain.value = this._volume;
         }
 
         this._engine = output.engine;
@@ -516,12 +507,13 @@ export class BufferSource implements PlaybackSource {
 
         const startPoint = clampTime(requestedStart, trackA.duration);
         const transportCurrent = requestId === this._playRequestId;
+        // bufferB is left as it is: cleared when this load began, it may already hold this clip's
+        // stem B, installed while A's load was finishing (both decoded in the cache, say).
         this._update({
             status: 'ready',
             progress: 1,
             duration: trackA.duration,
             buffer: trackA.buffer,
-            bufferB: null,
             currentTime: transportCurrent ? startPoint : trackA.currentTime,
             playbackStartPoint: transportCurrent ? startPoint : this._state.playbackStartPoint,
         });

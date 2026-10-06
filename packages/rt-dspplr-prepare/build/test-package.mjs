@@ -100,7 +100,7 @@ if (manifest.stems.v1.label !== 'Variant one') throw new Error('label lost');
 const job = prepareAudio('talk.wav', { outDir: 'prepared-api', segmentSeconds: 3, concurrency: 2 });
 const m = await job.done;
 if (job.stats.threads < 2) throw new Error('the installed worker was not found (' + job.stats.threads + ' thread)');
-for (const f of ['seg/000000.wav', 'peaks.bin', 'bands.bin', 'spectrogram.bin']) if (!fs.existsSync('prepared-api/' + f)) throw new Error(f);
+for (const f of ['source.wav', 'peaks.bin', 'bands.bin', 'spectrogram.bin']) if (!fs.existsSync('prepared-api/' + f)) throw new Error(f);
 if (JSON.stringify(m.segments) !== JSON.stringify(manifest.segments)) throw new Error('CLI and API segments differ');
 console.log('installed CLI output: schema and assertManifest agree; installed API ran on ' + job.stats.threads + ' threads, same segments');`;
     fs.writeFileSync(path.join(temp, 'check.mjs'), check);

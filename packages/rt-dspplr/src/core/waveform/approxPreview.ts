@@ -117,8 +117,18 @@ export function approximateProcessed(
         }
     }
 
+    // The input gain, before the dynamics (it drives the compressor); the gain track is relative to the clip.
+    const inGain = Math.max(0, processing.inputGain ?? 1);
+    if (inGain !== 1) {
+        for (let i = 0; i < n; i += 1) {
+            min[i] *= inGain;
+            max[i] *= inGain;
+            rms[i] *= inGain;
+        }
+    }
     const gains = new Float32Array(n);
     applyDynamicsInSubsteps(min, max, rms, bin, sampleRate, processing, gains);
+    if (inGain !== 1) for (let i = 0; i < n; i += 1) gains[i] *= inGain;
 
     // Doubling levels, as the peaks worker builds them, so a column picks the same bin size in both modes.
     return { pyramid: buildPeakPyramid(min, max, rms, bin, stored.totalSamples), gain: { binSize: bin, startFrame: 0, values: gains, outputGain: Math.max(0, processing.outputGain) } };

@@ -80,35 +80,93 @@ export function loadFrame(fft: Fft, stem: Int16Array, centre: number): void {
     }
 }
 
+/** One radix-2 stage of `size` over the half-size complex arrays (twiddle outer). */
+function stage(re: Float32Array, im: Float32Array, cos: Float32Array, sin: Float32Array, half: number, size: number): void {
+    const step = half / size;
+    const span = size >> 1;
+    for (let k = 0; k < span; k += 1) {
+        const c = cos[k * step];
+        const s = -sin[k * step];
+        for (let a = k; a < half; a += size) {
+            const b = a + span;
+            const tr = re[b] * c - im[b] * s;
+            const ti = re[b] * s + im[b] * c;
+            re[b] = re[a] - tr;
+            im[b] = im[a] - ti;
+            re[a] += tr;
+            im[a] += ti;
+        }
+    }
+}
+
+/** Stages L1 and 2·L1 in one pass: every butterfly as stage() computes it, the first stage's results rounded to float32 (Math.fround) as its stores would. */
+function stagePair(re: Float32Array, im: Float32Array, cos: Float32Array, sin: Float32Array, half: number, L1: number): void {
+    const fr = Math.fround;
+    const span1 = L1 >> 1;
+    const L2 = L1 << 1;
+    const step1 = half / L1;
+    const step2 = half / L2;
+    for (let k = 0; k < span1; k += 1) {
+        const c1 = cos[k * step1], s1 = -sin[k * step1];
+        const c2 = cos[k * step2], s2 = -sin[k * step2];
+        const c3 = cos[(k + span1) * step2], s3 = -sin[(k + span1) * step2];
+        for (let i0 = k; i0 < half; i0 += L2) {
+            const i1 = i0 + span1, i2 = i0 + L1, i3 = i2 + span1;
+            const r0 = re[i0], m0 = im[i0], r1 = re[i1], m1 = im[i1], r2 = re[i2], m2 = im[i2], r3 = re[i3], m3 = im[i3];
+            let tr = r1 * c1 - m1 * s1;
+            let ti = r1 * s1 + m1 * c1;
+            const R1 = fr(r0 - tr), M1 = fr(m0 - ti), R0 = fr(r0 + tr), M0 = fr(m0 + ti);
+            tr = r3 * c1 - m3 * s1;
+            ti = r3 * s1 + m3 * c1;
+            const R3 = fr(r2 - tr), M3 = fr(m2 - ti), R2 = fr(r2 + tr), M2 = fr(m2 + ti);
+            tr = R2 * c2 - M2 * s2;
+            ti = R2 * s2 + M2 * c2;
+            re[i2] = R0 - tr;
+            im[i2] = M0 - ti;
+            re[i0] = R0 + tr;
+            im[i0] = M0 + ti;
+            tr = R3 * c3 - M3 * s3;
+            ti = R3 * s3 + M3 * c3;
+            re[i3] = R1 - tr;
+            im[i3] = M1 - ti;
+            re[i1] = R1 + tr;
+            im[i1] = M1 + ti;
+        }
+    }
+}
+
+/**
+ * Another real FFT behind transform(): `fn(fft)` writes |X[k]|·fft.norm (k = 0 … N/2) of
+ * fft.frame windowed by fft.hann into fft.spectrum and returns it. Null: the JS one. Set by
+ * a host that has a faster one - the Node prepare step plugs pffft (WebAssembly SIMD) in -
+ * before it analyses anything, so one run never mixes the two.
+ */
+export function setSpectralBackend(fn: ((fft: Fft) => Float32Array) | null): void {
+    backend = fn;
+}
+
+let backend: ((fft: Fft) => Float32Array) | null = null;
+
 /** |X[k]| for k = 0 … N/2 of the windowed frame, into `fft.spectrum`. */
 export function transform(fft: Fft): Float32Array {
+    return backend ? backend(fft) : transformJs(fft);
+}
+
+/** transform() in JS: a real FFT through a complex one of half the size (what a backend can fall back to). */
+export function transformJs(fft: Fft): Float32Array {
     const { half, norm, hann, bitReverse, re, im, frame, cos, sin, splitCos, splitSin, spectrum } = fft;
     for (let n = 0; n < half; n += 1) {
         const j = bitReverse[n];
         re[j] = frame[2 * n] * hann[2 * n];
         im[j] = frame[2 * n + 1] * hann[2 * n + 1];
     }
-    for (let size = 2; size <= half; size <<= 1) {
-        const step = half / size;
-        const span = size >> 1;
-        for (let start = 0; start < half; start += size) {
-            for (let k = 0; k < span; k += 1) {
-                const c = cos[k * step];
-                const s = -sin[k * step];
-                const a = start + k;
-                const b = a + span;
-                const tr = re[b] * c - im[b] * s;
-                const ti = re[b] * s + im[b] * c;
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
-            }
-        }
-    }
+    // Two radix-2 stages per pass (each butterfly as before; Math.fround stands for the float32 store between them).
+    let size = 2;
+    for (; size * 2 <= half; size <<= 2) stagePair(re, im, cos, sin, half, size);
+    if (size <= half) stage(re, im, cos, sin, half, size);
     for (let k = 0; k <= half; k += 1) {
-        const a = k % half;
-        const b = (half - k) % half;
+        const a = k === half ? 0 : k; // k % half
+        const b = k === 0 ? 0 : half - k; // (half - k) % half
         const er = (re[a] + re[b]) * 0.5;
         const ei = (im[a] - im[b]) * 0.5;
         const or = (re[a] - re[b]) * 0.5;

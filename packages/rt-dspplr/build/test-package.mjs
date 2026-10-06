@@ -16,7 +16,7 @@ try {
     assert.ok(pack.files.every(file => !file.path.endsWith('.wasm') && !file.path.includes('node_modules/')));
     assert.ok(pack.files.some(file => file.path === 'dist/bundle-sizes.json'));
     // Browser package: no Node-only prepare code, no CLI; the notices and the schema ship.
-    for (const file of ['THIRD_PARTY_NOTICES.md', 'schema/manifest.schema.json', 'dist/format.js', 'LICENSE.md', 'README.md']) {
+    for (const file of ['THIRD_PARTY_NOTICES.md', 'schema/manifest.schema.json', 'dist/format.js', 'LICENSE.md', 'README.md', 'CHANGELOG.md']) {
         assert.ok(pack.files.some(f => f.path === file), `${file} is missing from the tarball`);
     }
     assert.ok(!pack.files.some(f => /(^|\/)(rtd-)?prepare([-./]|$)|^bin\//.test(f.path)), 'prepare code or a bin in the browser package');
@@ -50,7 +50,7 @@ assert.equal(typeof rubberbandStretcher, 'function');
 assert.equal(typeof TimelineCore, 'function');
 assert.equal('SegmentStore' in advanced || 'StreamEngine' in advanced || 'createStreamPlayer' in core, false);
 // "./format" runs in Node (no DOM): validation, stem keys, WAV.
-assert.equal(format.MANIFEST_FORMAT_VERSION, 3);
+assert.equal(format.MANIFEST_FORMAT_VERSION, 4);
 assert.equal(format.isStemKey('v1') && !format.isStemKey('a'), true);
 assert.throws(() => format.assertManifest({ format: 'rtd-audio-manifest', formatVersion: 99 }), /Unsupported manifest version/);
 const wav = format.parseWavFile(format.wavHeader16(1, 48000, 0).buffer);

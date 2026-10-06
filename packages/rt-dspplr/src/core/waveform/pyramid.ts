@@ -1,7 +1,7 @@
 export interface WaveformPeakLevel {
     binSize: number;
     /**
-     * A partial level (the stream player's live detail of the segments on
+     * A partial level (a prepared clip's live detail of the segments on
      * screen) starts at this bin; its arrays then cover bins
      * [startBin, startBin + length); it may be fractional (bins aligned to
      * the window's first frame). Absent: the level covers the clip.

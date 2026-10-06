@@ -12,6 +12,18 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
   whole clips: one `createAudioPlayer()`, one state, the same React card,
   `<Timeline>` and `createTimeline()`. Switching between a whole clip and a
   prepared one on one player stops and unloads the other source.
+- The audio of a prepared recording is the original file itself, kept by prepare
+  byte for byte (WAV, MP3, Ogg Opus; other formats as a 16-bit WAV). The manifest
+  holds an index of it: for each segment, the byte range that holds it. The
+  player fetches a segment with an HTTP Range request and decodes it: WAV on the
+  spot, MP3, Opus and FLAC with WebAssembly builds of dr_mp3, libopus and dr_flac,
+  one lazy chunk per codec (30, 113 and 21 KB gzipped) fetched the first time a
+  clip of that codec plays, decoding in a worker (on the main thread when a
+  Content-Security-Policy forbids blob: workers). Segments read back the samples
+  prepare analysed: WAV and MP3 exactly, Opus within float rounding. An hour of
+  MP3 is stored as the MP3 (our hour-long test file: 102 MB instead of 651 MB of WAV
+  segments), and on a 4G connection the first sound comes in 1.1–2.2 s and a seek
+  in 0.3–0.9 s (WAV segments: 2–6 s).
 - The manifest, the peaks and the coarse spectrogram (a few hundred KB to about
   1.5 MB) make the timeline, ruler, zoom, pan, waveform, DSP preview and
   spectrogram usable over the whole duration at once. Audio is fetched around the
@@ -21,9 +33,12 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
 - Playback runs in an AudioWorklet stream engine: sample-exact across segments and
   loop wraps, a held playhead on underruns (silence, then the same sample), smoothed
   volume and A/B mix. Speed keeps the pitch through a realtime stretcher
-  (Signalsmith Stretch, MIT, a lazy chunk of about 100 KB, 44 KB gzipped) when the manifest rate equals the
-  context rate; otherwise pitch follows speed and the card says so. The
-  AudioBufferSourceNode scheduler remains the fallback (`segmented: { engine: false }`).
+  (Signalsmith Stretch, MIT, a lazy chunk of about 100 KB, 44 KB gzipped). The
+  engine runs at the clip's own rate and converts its output to the context's
+  with a streaming windowed-sinc resampler when they differ, so a 44.1 or 16 kHz
+  recording keeps realtime speed too. Without the stretcher the pitch follows
+  speed and the card says so. The AudioBufferSourceNode scheduler remains the
+  fallback (`segmented: { engine: false }`).
 - The waveform previews the DSP everywhere: approximated in the overview from the
   stored peaks and bands, exact in a decoded window for views up to 20 s. The
   spectrogram draws the stored overview and refines from decoded segments when
@@ -44,23 +59,38 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
   or labels.
 - Stems are read as published: no polling unless `segmented.pollStemsMs` is set;
   `refreshManifest()` applies a newer `revision`.
-- `player.setVolume(linear)` and `state.volume`: a fader after the effects, smoothed.
+- **Gain stages.** `setInputGain(db)` (new, `processing.inputGainDb`) is the first stage, before the
+  high-pass, the compressor and the effects; `setOutputGain(db)` is now the last one, after the
+  effects; the -0.01 dBFS ceiling comes after it (it used to sit inside the dynamics, before
+  third-party effects, which could then go over full scale). Both gains are smoothed and drawn on
+  the waveform and the spectrogram. The card's Post FX panel lists the controls in chain order.
+- The spectrogram follows the card's theme (`--rtd-spectrogram-*`, `--rtd-overlay-*`) and paints
+  nothing before a clip. `palette.colormap` colours it with a scientific colormap (`magma`,
+  `inferno`, `plasma`, `viridis`, `grey`, `_r` reversed, or your own stops; `COLORMAPS`):
+  `magma_r` by default in the light theme, `magma` in the dark one.
+- The shared AudioContext now runs at the device's rate when it is 44.1 or 48 kHz
+  (else 48 kHz) instead of a fixed 48 kHz; `sampleRate` still sets it.
 
 ### File formats, manifest specification and schema
 
 - New entry `@saitdigital/rt-dspplr/format`: the manifest types, `assertManifest()`,
   `manifestProblem()`, the stem key rules (`STEM_KEY_PATTERN`, `isStemKey`,
-  `assertStemKey`, `DEFAULT_STEM_KEY`), and the readers and writers of peaks.bin,
-  bands.bin, spectrogram.bin and the WAV segments. Pure code (no DOM, no Node APIs),
+  `assertStemKey`, `DEFAULT_STEM_KEY`), the readers and writers of peaks.bin,
+  bands.bin, spectrogram.bin and WAV, and the source runs (`segmentFromRun`,
+  `decodePcmRun`, `decodeStreamRun`, `decodeOpusRun`: a segment's bytes decoded
+  and cut out, given a codec's compiled WebAssembly). Pure code (no DOM, no Node APIs),
   in a chunk of its own; the prepare package imports it instead of carrying a copy.
   The analysis kernels shared with prepare (`frameRows`, `planBands`, `quantizeRows`,
   `computeHighPassCoefficients`) are exported there as experimental.
-- `docs/manifest.md` specifies the manifest (fields, types, units, versions 1–3) and
-  the compatibility policy: a player reads every `formatVersion` up to its own,
-  ignores unknown optional fields, and refuses an unknown major version.
+- `docs/manifest.md` specifies the manifest, now `formatVersion` 4 (fields, types,
+  units, the source and its index, how a run of each codec decodes) and the
+  compatibility policy: before 1.0 a player reads its own version only (versions
+  1–3, with WAV segment files, are refused: prepare the recording again), and
+  ignores unknown optional fields. The timeline is the source's own rate; the
+  manifest has no `resample` any more.
 - The JSON Schema (draft 2020-12) ships as `@saitdigital/rt-dspplr/manifest.schema.json`.
   `assertManifest()` now checks the same rules (it used to check only a few fields);
-  a test keeps the two in agreement on fixtures, on prepared folders and on 50 broken
+  a test keeps the two in agreement on fixtures, on prepared folders and on 72 broken
   manifests.
 
 ### DSP plugins (experimental)
@@ -70,8 +100,8 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
   setParam`, a parameter schema the card's Post FX panel renders, `nodes` or
   `worklet` realtime processing, `magnitudeResponse()` / `process()` previews in the
   waveform and the spectrogram, `state.previewCoverage`, crash isolation
-  (`effecterror`). Chain order: source (A/B mix → stretch) → effects → volume →
-  analyser. Example: `examples/plugins/three-band-eq.js`.
+  (`effecterror`). Chain order: source (A/B mix → stretch) → input gain → effects →
+  output gain → ceiling → analyser. Example: `examples/plugins/three-band-eq.js`.
 - **The plugin API is experimental** (`@experimental` in the types) and may change
   in minor releases before 1.0.
 
@@ -85,8 +115,16 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
 - The package contains no Node-only code (checked at build time). Preparing long
   recordings is a separate package, `@saitdigital/rt-dspplr-prepare`.
 - Play and resume no longer reset the timeline's zoom and pan; only another clip does.
-- `THIRD_PARTY_NOTICES.md` ships in the package with the Signalsmith Stretch MIT
-  notice (also embedded in its chunk); the build checks both.
+- `THIRD_PARTY_NOTICES.md` ships in the package with the notices of Signalsmith
+  Stretch (MIT), dr_mp3 and dr_flac (public domain or MIT-0) and libopus
+  (BSD-3-Clause), each also embedded in its chunk; the build checks both.
+
+### Fixed
+
+- A player that loaded an A/B pair already decoded in the cache (a page left and
+  opened again, so a new player) could lose stem B from its state: B, installed
+  while A's load was finishing, was cleared by A's "ready". The spectrogram then
+  drew stem A alone in A's colour and stopped following the mix.
 
 ## @saitdigital/rt-dspplr-prepare 0.1.0
 
@@ -94,17 +132,36 @@ First release: the prepare step for long recordings. Node ≥ 20.19, ESM.
 
 - `prepareAudio(input, options)` and the `rtd-prepare` CLI read a recording once,
   as a stream (a path, a ReadableStream or an async iterable), and write
-  fixed-length 16-bit WAV segments (sample-exact), multi-level peaks, loudness,
-  bands.bin (high-pass preview energies) and spectrogram.bin (overview), and the
-  manifest last, atomically. Rates above 48 kHz are resampled by default.
-- Analyses run on a `worker_threads` pool (`concurrency`, default cores − 1); the
-  output is byte-identical for any thread count. 60 min mono in about 4 s on 11
+  the original file as it is (`source.<codec>`) with an index of it in the
+  manifest (each segment's byte range), multi-level peaks, loudness, bands.bin
+  (high-pass preview energies) and spectrogram.bin (overview), and the manifest
+  last, atomically. Nothing is resampled: the timeline is the source's rate.
+- The index is checked before it is published: the first segment, one past the
+  middle and the last are read back the player's way (the same decoders) and
+  compared with what was analysed. MP3 runs start 6 frames early (exact), Opus
+  runs 500 ms early on a page boundary (within float rounding; RFC 7845's 80 ms
+  left errors up to −35 dBFS). A source that is not indexed (FLAC, formats read
+  through `ffmpegDecoder()` or another decoder, Opus with more than two channels,
+  a file whose index does not read back, a file with non-finite samples) is kept
+  as a 16-bit WAV of what was decoded, with a warning when the index failed.
+- Analyses run on a `worker_threads` pool (`concurrency`, default cores − 1; a
+  short input with no `pool` runs on the calling thread); the output is
+  byte-identical for any thread count. `createPreparePool()` makes a pool a
+  service keeps and passes to every call (`pool`): warm workers, shared by calls. 60 min mono in about 4 s on 11
   threads, about 0.5 GB peak RSS (`concurrency: 4`: under 300 MB).
 - **Named stems** in the same call and the same manifest:
   `stems: { [key]: { input | processor, label? } }`. Each stem is aligned to A by
-  FFT cross-correlation (offset compensated, confidence recorded), downmixed,
-  resampled on the pool (bit-identical to the streaming resampler), written on A's
-  grid under `<key>/` with its own overview files, and paired with A (correlation,
+  FFT cross-correlation in up to 8 windows where A and the stem both sound: the
+  offset most of them agree on (to ±2 frames) is compensated and their share is
+  the confidence. How strongly a stem correlates with A is not a test: a quiet
+  part such as a vocal's breaths correlates weakly however well it is aligned,
+  while unrelated or re-timed audio peaks at a different lag in every window. A
+  stem silent for part of the file is measured where it sounds. A stem the player
+  reads as it is (WAV, MP3 or Opus at A's rate, with A's channels or one) is kept
+  byte for byte under `<key>/r<revision>/` with its index shifted by the offset
+  (`lead`, `trail` silence where it does not reach); any other is downmixed,
+  resampled on the pool (bit-identical to the streaming resampler) and written as
+  a 16-bit WAV on A's grid. Each gets its own overview files and is paired with A (correlation,
   mix law, loudness delta as information only, opt-in `gainDb`). Keys are
   validated (pattern, `a` reserved, case-insensitive collisions). A stem that does
   not line up fails the job, or with `onLowConfidence: 'warn'` is recorded as
@@ -118,7 +175,17 @@ First release: the prepare step for long recordings. Node ≥ 20.19, ESM.
 - `attachStem(target, key, input, { label })` adds or replaces a stem on a prepared
   folder (same code, same bytes, `revision + 1`); `markStem()` for hosts that
   publish before a stem exists.
-- Storage: `outDir`, or any `{ putObject, getObject? }`; `memoryStorage()`.
+- **Input formats in process**: WAV, MP3, Ogg Opus and FLAC are decoded in
+  WebAssembly (dr_mp3, libopus with opusfile, dr_flac; notices in
+  THIRD_PARTY_NOTICES.md), told apart by their first bytes: no ffmpeg and no
+  process per input. MP3 is gapless with a LAME header, Opus is trimmed by its
+  pre-skip and end granule, FLAC is sample-exact. `builtinDecoder` is the
+  default; `mp3Decoder`, `opusDecoder`, `flacDecoder` are exported, and
+  `ffmpegDecoder()` stays for other formats.
+- Storage: `outDir`, or any `{ putObject, putFile?, getObject?, getRange? }`;
+  `memoryStorage()`. A stream input is copied to the scratch folder on the way
+  (it is stored as it is), and read to its end even when the decoder stops early,
+  so the stored file and the content id are the whole input.
 - Progress `stage: 'a' | 'processor' | 'stem'` with the stem key;
   `job.stats.timings.stems[key]`.
 - The formats come from `@saitdigital/rt-dspplr/format` (a dependency, `^0.4.0`):

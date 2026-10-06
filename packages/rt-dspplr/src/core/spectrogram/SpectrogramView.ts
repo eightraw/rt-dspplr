@@ -8,11 +8,12 @@ import { applyDspToSpectrogram } from './dspPaint';
 import { previewSettings } from '../effects/preview';
 import { subscribeDspPreview, type DspPreview } from '../waveform/followWaveform';
 import {
-    DEFAULT_SPECTROGRAM_PALETTE,
     paintSpectrogram,
+    spectrogramBackground,
     type SpectrogramPalette,
     type SpectrogramColorMode,
 } from './paint';
+import { resolvePalette, themePalette } from './themePalette';
 
 // ---------------------------------------------------------------------------
 // createSpectrogram — a canvas that draws the player's clip as a spectrogram
@@ -51,6 +52,8 @@ export interface SpectrogramOptions {
 }
 
 export interface SpectrogramView {
+    /** Read the theme's colours again (after a theme change) and repaint. */
+    refreshColors(): void;
     /** Show part of the clip, in seconds; null shows all of it. */
     setRange(range: { start: number; end: number } | null): void;
     setOptions(options: SpectrogramOptions): void;
@@ -85,8 +88,8 @@ export function chooseFft(option: number | 'auto' | undefined, samplesPerColumn:
     };
 }
 
-type SpectrogramPlayer = Pick<AudioPlayerCore, 'getState' | 'subscribe'>
-    & Partial<Pick<AudioPlayerCore, 'on' | 'setView' | 'getWindowAudio'>>;
+/** Only the player's own core, which carries the author credit. */
+type SpectrogramPlayer = AudioPlayerCore;
 
 /**
  * A spectrogram of the player's clip on `canvas`. A whole clip is analysed
@@ -122,6 +125,9 @@ export function createSpectrogram(
         setOptions(next) {
             options = next;
             inner.setOptions(next);
+        },
+        refreshColors() {
+            inner.refreshColors();
         },
         dispose() {
             unsubscribe();
@@ -213,10 +219,13 @@ function createBufferSpectrogram(
         schedulePaint();
     });
 
+    // The theme's palette, read once and again after refreshColors(); options.palette wins.
+    let themed: SpectrogramPalette | null = null;
     function look() {
+        themed ??= themePalette(canvas);
         return {
             colorMode: options.colorMode ?? 'single',
-            palette: { ...DEFAULT_SPECTROGRAM_PALETTE, ...options.palette },
+            palette: resolvePalette(themed, options.palette),
             floorDb: options.floorDb ?? 66,
         };
     }
@@ -264,8 +273,13 @@ function createBufferSpectrogram(
             paintFromPyramid(context, pyramid, current);
             return;
         }
-        if (!data || !player.getState().buffer) {
-            context.fillStyle = current.palette.background;
+        if (!player.getState().buffer) {
+            // No clip: nothing to show, and no panel either (the card's empty state shows through).
+            context.clearRect(0, 0, canvas.width, canvas.height);
+            return;
+        }
+        if (!data) {
+            context.fillStyle = spectrogramBackground(current.palette);
             context.fillRect(0, 0, canvas.width, canvas.height);
             return;
         }
@@ -285,7 +299,7 @@ function createBufferSpectrogram(
         // Zoomed, or between a change and the worker's answer: the picture on hand
         // is cropped and stretched to the view, over the whole clip, so nothing
         // the view uncovers is ever empty.
-        context.fillStyle = current.palette.background;
+        context.fillStyle = spectrogramBackground(current.palette);
         context.fillRect(0, 0, canvas.width, canvas.height);
         context.imageSmoothingEnabled = true;
         if (whole && whole !== data) {
@@ -431,6 +445,10 @@ function createBufferSpectrogram(
                 staleBuffers = last.buffer !== null;
                 sync();
             }
+            schedulePaint();
+        },
+        refreshColors() {
+            themed = null;
             schedulePaint();
         },
         dispose() {

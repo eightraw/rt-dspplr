@@ -50,7 +50,24 @@ test.beforeEach(async ({ page }) => {
             }
             return out;
         };
-        window.brightness = (root, selector) => { const s = snap(root, selector); let b = 0; for (let i = 0; i < s.length; i += 4) b += s[i] + s[i + 1] + s[i + 2]; return b / Math.max(1, s.length / 4); };
+        /** The spectrogram's background (theme) as [r, g, b]; a pixel's ink is its distance from it (cleared pixels: none). */
+        window.spectrogramInk = (canvas) => {
+            const style = getComputedStyle(canvas);
+            const stops = h.colormapStops(style.getPropertyValue('--rtd-spectrogram-colormap').trim() || null);
+            const hex = (stops ? stops[0] : style.getPropertyValue('--rtd-spectrogram-bg').trim() || '#131315').replace('#', '');
+            const n = parseInt(hex.length === 3 ? hex.split('').map((c) => c + c).join('') : hex, 16);
+            const bg = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+            return (px, i) => (px[i + 3] === 0 ? 0 : Math.abs(px[i] - bg[0]) + Math.abs(px[i + 1] - bg[1]) + Math.abs(px[i + 2] - bg[2]));
+        };
+        /** Mean ink of the matching canvases (distance from the spectrogram's background). */
+        window.brightness = (root, selector) => {
+            const canvas = root.querySelector(selector);
+            const ink = canvas ? spectrogramInk(canvas) : () => 0;
+            const s = snap(root, selector);
+            let b = 0;
+            for (let i = 0; i < s.length; i += 4) b += ink(s, i);
+            return b / Math.max(1, s.length / 4);
+        };
         window.diff = (a, b) => { if (a.length !== b.length || !a.length) return 1; let d = 0; for (let i = 0; i < a.length; i += 1) if (Math.abs(a[i] - b[i]) > 8) d += 1; return d / a.length; };
     }, BASE);
 });
@@ -135,7 +152,7 @@ test('B segments are fetched only when the mix asks for them', async ({ page }) 
     });
     expect(r.atZero).toBe(0);
     expect(r.after).toBeGreaterThan(0);
-    expect(requests.some((u) => /\/b\/seg\//.test(u))).toBe(true);
+    expect(requests.some((u) => /\/b\/r\d+\/source\./.test(u))).toBe(true);
 });
 
 test('the card reads stems as published: B in the manifest → knob on; no B → knob off, no "processing"', async ({ page }) => {
@@ -228,7 +245,7 @@ test('waveform and spectrogram show the A/B blend', async ({ page }) => {
 
 test('named stems: play({ manifest, stem }) picks the blend stem, setStem() switches it, capabilities list them', async ({ page }) => {
     const urls = [];
-    page.on('request', (req) => { const m = /\/pairNamed\/(b|v1)\/seg\//.exec(req.url()); if (m) urls.push(m[1]); });
+    page.on('request', (req) => { const m = /\/pairNamed\/(b|v1)\/r\d+\/source\./.exec(req.url()); if (m) urls.push(m[1]); });
     const r = await page.evaluate(async () => {
         const { player } = mk();
         await player.play({ manifest: `${longBase}/pairNamed/manifest.json`, stem: 'v1' });

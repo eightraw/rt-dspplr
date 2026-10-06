@@ -13,7 +13,11 @@ examples/demo/storage/clips/*
 !examples/demo/storage/clips/README.md
 # Long-audio experiment: generated recordings and their prepared folders
 examples/demo/storage/long/
+examples/demo/storage/examples/
 
 # Browser test output
 test-results/
 playwright-report/
+
+# Copied from the root at pack time (the docs site reads it from the package)
+packages/rt-dspplr/CHANGELOG.md

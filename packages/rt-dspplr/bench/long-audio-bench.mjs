@@ -134,31 +134,6 @@ window.run = async ({ mode, url }) => {
     window.__player = player; window.__tl = tl;
     return r;
 };
-// Segment decode: decodeAudioData vs parsing the 16-bit WAV on the main thread.
-window.decodeBench = async (url, rounds = 20) => {
-    const ctx = new AudioContext({ sampleRate: 48000 });
-    const bytes = await (await fetch(url)).arrayBuffer();
-    const adv = await import('/internals.js');
-    const time = async (fn) => { const t = []; for (let i = 0; i < rounds; i++) { const t0 = now(); await fn(); t.push(now() - t0); } t.sort((a, b) => a - b); return t[t.length >> 1]; };
-    const native = await time(() => ctx.decodeAudioData(bytes.slice(0)));
-    const pcm = await time(() => {
-        const w = adv.parseWavFile(bytes);
-        const b = new AudioBuffer({ length: w.frames, numberOfChannels: w.channels.length, sampleRate: w.sampleRate });
-        w.channels.forEach((d, c) => b.copyToChannel(d, c));
-    });
-    // Optional FLAC / Opus siblings of the same segment (made with ffmpeg for the comparison).
-    const other = {};
-    for (const ext of ['flac', 'opus']) {
-        const r = await fetch(url.replace(/.wav$/, '.' + ext));
-        if (!r.ok) continue;
-        const b = await r.arrayBuffer();
-        let frames = 0;
-        const ms = await time(async () => { frames = (await ctx.decodeAudioData(b.slice(0))).length; });
-        other[ext] = { bytes: b.byteLength, ms, frames };
-    }
-    await ctx.close();
-    return { bytes: bytes.byteLength, nativeMs: native, pcmMs: pcm, other };
-};
 // Approximate (stored peaks + bands) vs exact (peaks worker over the decoded file)
 // processed waveform, per drawn column: RMS and peak differences in dB.
 window.approxError = async ({ wav, manifest, settings, windows }) => {
@@ -366,8 +341,16 @@ if (args.includes('--stretch-quality')) {
     const rand = ((seed) => () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; })(7);
     const seconds = 10;
     const voiceDir = fs.readdirSync(dir).find((n) => n.includes('espeak') && fs.existsSync(path.join(dir, n, 'manifest.json')));
-    const readSeg = (file) => { const b = fs.readFileSync(file); const n = (b.length - 44) / 2; const out = new Float32Array(n); for (let i = 0; i < n; i += 1) out[i] = b.readInt16LE(44 + 2 * i) / 32768; return out; };
-    const voice = voiceDir ? (() => { const a = readSeg(path.join(dir, voiceDir, 'seg/000001.wav')); const b = readSeg(path.join(dir, voiceDir, 'seg/000002.wav')); const v = new Float32Array(a.length + b.length); v.set(a); v.set(b, a.length); return v; })() : null;
+    // The voice: segments 1 and 2 of a prepared mono 16-bit WAV (their byte ranges of the source).
+    const voice = voiceDir ? (() => {
+        const m = JSON.parse(fs.readFileSync(path.join(dir, voiceDir, 'manifest.json'), 'utf8'));
+        const src = m.segments.source;
+        if (src.codec !== 'wav' || src.pcm.bitsPerSample !== 16 || src.channels !== 1) return null;
+        const b = fs.readFileSync(path.join(dir, voiceDir, src.url));
+        const [start] = m.segments.list[1].range;
+        const [, end] = m.segments.list[2].range;
+        return Float32Array.from({ length: (end - start) / 2 }, (_, i) => b.readInt16LE(start + 2 * i) / 32768);
+    })() : null;
     const signals = {
         tone: Float32Array.from({ length: sr * seconds }, (_, i) => 0.3 * Math.sin(2 * Math.PI * 440 * i / sr)),
         noise: Float32Array.from({ length: sr * seconds }, () => (rand() * 2 - 1) * 0.2),
@@ -504,21 +487,6 @@ if (args.includes('--approx-error')) {
         }
     }
     if (outFile) fs.writeFileSync(outFile, JSON.stringify(all, null, 2));
-    await browser.close();
-    server.close();
-    process.exit(0);
-}
-if (args.includes('--decode-bench')) {
-    const server = await serve();
-    const browser = await chromium.launch();
-    const page = await browser.newPage();
-    await page.goto(`http://127.0.0.1:${server.address().port}/bench.html`);
-    await page.waitForFunction(() => window.ready);
-    for (const name of fs.readdirSync(dir).filter((n) => fs.existsSync(path.join(dir, n, 'manifest.json')))) {
-        const r = await page.evaluate((u) => window.decodeBench(u), `/audio/${name}/seg/000001.wav`);
-        console.log(`${name}: segment ${(r.bytes / 1e6).toFixed(2)} MB, decodeAudioData ${r.nativeMs.toFixed(1)} ms, PCM parse ${r.pcmMs.toFixed(1)} ms (median)`
-            + Object.entries(r.other).map(([k, v]) => `; ${k} ${(v.bytes / 1e3).toFixed(0)} KB decode ${v.ms.toFixed(1)} ms (${v.frames} frames)`).join(''));
-    }
     await browser.close();
     server.close();
     process.exit(0);

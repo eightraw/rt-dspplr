@@ -2,6 +2,8 @@
 
 **Web audio player with real-time DSP — by SAIT Digital.**
 
+**Documentation, live demo and API reference: [sait.digital/research/rt-dspplr](https://sait.digital/research/rt-dspplr).**
+
 Add playback, pitch-preserving speed, looping and an interactive waveform to
 your application. Use the ready-made React player or build your own interface
 with the framework-independent audio engine. TypeScript types are included.
@@ -185,39 +187,30 @@ The examples in [examples/](examples) and the code samples in the READMEs are
 under MIT No Attribution ([examples/LICENSE.md](examples/LICENSE.md)): copy and
 change them freely. The player they use keeps its own license.
 
-## Try the demo locally
+## Try it
 
-The repository includes a development workspace and a Vite demo for exploring or
-developing the player. Consumers install the package without the workspace.
+The demo, with every option and call of the API to try on prepared recordings and
+their stems, is at [sait.digital/research/rt-dspplr](https://sait.digital/research/rt-dspplr), next to the API
+reference and the changelog.
 
-With Node.js 22+ and npm, from a clone of this repository:
+Locally, from a clone of this repository (Node.js 22+ and npm), the gallery runs
+the interfaces shown above on your own audio:
 
 ```bash
 npm ci
 npm run dev
 ```
 
-Open **http://localhost:5173**. Drop audio onto the demo or place files in
-`examples/demo/storage/clips/`. Uploaded files are stored in that local folder.
-Put `example.b.wav` next to `example.wav` to give it a stem B.
-Switch themes and stretch engines, explore the waveform, and copy the usage example.
-
-The demo includes Rubber Band for evaluation; consumer installations do not pull
-it in automatically. Sample audio is not committed. Optionally run `npm run samples`
-with Bash and Docker to generate synthetic examples: stem A is a degraded copy,
-stem B the clean synthesis it was made from.
-
 ## Development
 
 ```text
 packages/rt-dspplr/          the player: source, documentation and tests
 packages/rt-dspplr-prepare/  the prepare step (Node): source, documentation and tests
-examples/demo/               demo consuming the built packages
 examples/gallery/    the five interfaces shown above
 ```
 
 ```bash
-npm run build          # both packages, demo and gallery
+npm run build          # both packages and the gallery
 npm run typecheck
 npm test
 npx playwright install chromium

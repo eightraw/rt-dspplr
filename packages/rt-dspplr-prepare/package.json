@@ -2,7 +2,7 @@
   "name": "@saitdigital/rt-dspplr-prepare",
   "version": "0.1.0",
   "author": "eightraw (SAIT Digital)",
-  "homepage": "https://github.com/eightraw/rt-dspplr/tree/main/packages/rt-dspplr-prepare#readme",
+  "homepage": "https://sait.digital/research/rt-dspplr/api/prepare",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/eightraw/rt-dspplr.git",
@@ -32,7 +32,8 @@
     "dist",
     "bin",
     "README.md",
-    "LICENSE.md"
+    "LICENSE.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "main": "./dist/index.js",
   "types": "./dist/types/index.d.ts",
@@ -49,6 +50,8 @@
   },
   "scripts": {
     "build": "node build/build.mjs",
+    "build:wasm": "node build/build-wasm.mjs",
+    "build:decoders": "node build/build-decoders.mjs && node build/build-wasm.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node build/test-node.mjs",
     "prepack": "npm run build",
@@ -61,6 +64,8 @@
     "@types/node": "^22.10.0",
     "ajv": "^8.17.1",
     "esbuild": "^0.25.0",
-    "typescript": "~5.6.2"
+    "pffft-ng": "^0.1.1",
+    "typescript": "~5.6.2",
+    "wabt": "^1.0.39"
   }
 }

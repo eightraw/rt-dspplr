@@ -1,6 +1,5 @@
-import { HIGH_PASS_MAX_HZ, LIMITER_CEILING_DB, OUTPUT_MAX_DB, OUTPUT_MIN_DB, formatHighPassLabel, formatOutputGainLabel, formatPercentLabel, outputGainDbToGain } from '../controls';
-import { createCompressor, createDynamicsWorklet, createHighPass, createLimiter, createOutputGain } from '../dsp';
-import { dbToGain } from '../dsp/compression';
+import { HIGH_PASS_MAX_HZ, formatHighPassLabel, formatPercentLabel } from '../controls';
+import { createCompressor, createDynamicsWorklet, createHighPass } from '../dsp';
 import AudioEngine from '../engine/AudioEngine';
 import { highPassResponse } from '../spectrogram/dspPaint';
 import type { DspPlugin, PluginInstance } from './types';
@@ -9,13 +8,12 @@ import type { DspPlugin, PluginInstance } from './types';
 // The built-in effects, as plugins of the public contract (dogfooding):
 //
 //   rtd.highpass   24 dB/oct Butterworth (two native biquads)
-//   rtd.dynamics   compressor + output gain + ceiling (-0.01 dBFS) in one
-//                  AudioWorklet pass sharing one detector; native nodes when
-//                  the worklet is unavailable
+//   rtd.dynamics   the peak compressor (an AudioWorklet; native nodes when
+//                  the worklet is unavailable)
 //
-// The compressor, the output gain and the limiter stay one plugin: they are
-// one processor with one detector, and splitting them would change the sound.
-// setHighPass / setCompression / setOutputGain are sugar for their params.
+// The input gain, the output gain and the -0.01 dBFS ceiling are not plugins:
+// they are the chain's own first and last stages (EffectChain).
+// setHighPass / setCompression are sugar for these plugins' params.
 // Their previews run on dedicated code paths of the preview workers (exact,
 // fast); the contract's preview hooks are what third-party plugins use.
 // ---------------------------------------------------------------------------
@@ -49,7 +47,7 @@ export const highPassPlugin: DspPlugin = {
     },
 };
 
-/** @experimental Built-in compressor + output gain + ceiling, as a plugin. */
+/** @experimental Built-in compressor, as a plugin. */
 export const dynamicsPlugin: DspPlugin = {
     id: 'rtd.dynamics',
     name: 'Dynamics',
@@ -57,7 +55,6 @@ export const dynamicsPlugin: DspPlugin = {
     builtin: 'dynamics',
     params: [
         { id: 'amount', label: 'Compression', unit: '%', min: 0, max: 1, default: 0, step: 0.01, format: formatPercentLabel },
-        { id: 'outputGainDb', label: 'Output gain', unit: 'dB', min: OUTPUT_MIN_DB, max: OUTPUT_MAX_DB, default: 0, step: 0.5, format: formatOutputGainLabel },
     ],
     realtime: {
         kind: 'nodes',
@@ -65,17 +62,13 @@ export const dynamicsPlugin: DspPlugin = {
             const engine = AudioEngine.getInstance();
             if (engine.workletAvailable && 'audioWorklet' in ctx) {
                 try {
-                    const dynamics = createDynamicsWorklet(ctx as AudioContext, {
-                        amount: params.amount,
-                        outputGain: outputGainDbToGain(params.outputGainDb),
-                        ceilingGain: dbToGain(LIMITER_CEILING_DB),
-                    });
+                    // Unity gain and no clipping here: the chain's ceiling is its last stage.
+                    const dynamics = createDynamicsWorklet(ctx as AudioContext, { amount: params.amount, outputGain: 1, ceilingGain: 1e6 });
                     return {
                         input: dynamics.input,
                         output: dynamics.output,
                         setParam(id, value) {
                             if (id === 'amount') dynamics.setAmount(value);
-                            else dynamics.setGain(outputGainDbToGain(value));
                         },
                         dispose: () => dynamics.disconnect(),
                     };
@@ -83,24 +76,15 @@ export const dynamicsPlugin: DspPlugin = {
                     console.warn('[AudioPlayer] Failed to create dynamics worklet, using native fallback', error);
                 }
             }
-            // Native fallback: compressor, gain and a hard limiter at the ceiling.
+            // Native fallback: a DynamicsCompressorNode.
             const compressor = createCompressor(ctx, params.amount);
-            const gain = createOutputGain(ctx, outputGainDbToGain(params.outputGainDb));
-            const limiter = createLimiter(ctx);
-            compressor.output.connect(gain.input);
-            gain.output.connect(limiter.input);
             return {
                 input: compressor.input,
-                output: limiter.output,
+                output: compressor.output,
                 setParam(id, value) {
                     if (id === 'amount') compressor.setAmount(value);
-                    else gain.setGain(outputGainDbToGain(value));
                 },
-                dispose() {
-                    compressor.disconnect();
-                    gain.disconnect();
-                    limiter.disconnect();
-                },
+                dispose: () => compressor.disconnect(),
             };
         },
     },

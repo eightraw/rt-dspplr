@@ -9,7 +9,7 @@ import { assertManifest, DEFAULT_STEM_KEY, readyStemKeys, type AudioManifest, ty
 import { mixGains, type MixLaw } from '../controls';
 import { decodePeaksFile, peaksToPyramid, readLevel, type PeaksFile } from '../stream/peaksFile';
 import { SegmentScheduler } from '../stream/SegmentScheduler';
-import { SegmentStore, type SegmentDecode, type SegmentStoreStats } from '../stream/SegmentStore';
+import { SegmentStore, type SegmentStoreStats } from '../stream/SegmentStore';
 import { loadStreamEngine, StreamEngine, type EngineReport } from '../engine/StreamEngine';
 import { decodeSpectrogramFile, toSpectralPyramid, type SpectrogramFile } from '../stream/spectrogramFile';
 import type { PlaybackSource, SourceCapabilities, SourceHost, StemSummary } from './types';
@@ -18,12 +18,10 @@ import type { PlaybackSource, SourceCapabilities, SourceHost, StemSummary } from
 // SegmentedSource — a prepared long recording (@saitdigital/rt-dspplr-prepare): manifest,
 // peaks, bands and spectrogram first (KBs to a few MB), so the timeline is
 // whole at once; segments are fetched and decoded around the playhead and
-// scheduled back to back by SegmentScheduler into the core's output chain.
-//
-// Speed is native playbackRate (pitch follows). TODO(stretch): a realtime
-// stretcher (Signalsmith Stretch, MIT) in an AudioWorklet fed by the same
-// scheduler, ~150 ms pre-roll, its state snapshotted at the loop start so
-// wraps stay seamless — see docs/long-audio-experiment.md.
+// handed to the stream engine (an AudioWorklet: sample-exact joins, stems in
+// lockstep, realtime pitch-preserving speed with Signalsmith Stretch). Without
+// AudioWorklet, SegmentScheduler plays them back to back with AudioBufferSourceNodes
+// (playbackRate: the pitch follows the speed).
 // ---------------------------------------------------------------------------
 
 /** What a segmented clip brought for the overview, as it arrives. */
@@ -57,8 +55,6 @@ export interface SegmentedOptions {
     cacheSeconds?: number;
     /** Segments fetched ahead of the playhead. Default 2. */
     prefetchSegments?: number;
-    /** 'pcm' (default) or 'native' decodeAudioData. */
-    decode?: SegmentDecode;
     /** Sources are created this far ahead of the clock, seconds (scheduler fallback). Default 2. */
     scheduleAheadSeconds?: number;
     /**
@@ -109,6 +105,8 @@ const PUMP_MS = 40;
 /** Views up to this long get their segments decoded for exact previews. */
 export const WINDOW_MAX_SECONDS = 20;
 const WINDOW_MAX_SEGMENTS = 4;
+/** Failures in a row after which a segment counts as broken (the store keeps retrying, slowly). */
+const SEGMENT_FAILURES_MAX = 4;
 
 function clampTime(time: number, duration: number): number {
     const t = Number.isFinite(time) ? Math.max(0, time) : 0;
@@ -133,8 +131,6 @@ export class SegmentedSource implements PlaybackSource {
 
     private _eng: StreamEngine | null = null;
     private _engPlaying = false;
-    private _rateScale = 1;
-    private _volume = 1;
     // ---- stem B (manifest v3) ----
     private _storeB: SegmentStore | null = null;
     private _stemB: ManifestStem | null = null;
@@ -152,6 +148,8 @@ export class SegmentedSource implements PlaybackSource {
     private readonly _host: SourceHost;
     private readonly _options: SegmentedOptions;
     private _disposed = false;
+    /** The current load still wants to start playing (cleared by pause / stop). */
+    private _autoplay = false;
     private _loadId = 0;
     private _playId = 0;
     private _engine: AudioEngine | null = null;
@@ -244,6 +242,10 @@ export class SegmentedSource implements PlaybackSource {
         const loadId = ++this._loadId;
         this._playId += 1;
         this._halt();
+        // The previous clip goes silent now (not when the new manifest is in), and
+        // nothing of its stem carries over to the new one.
+        this._disposeEngine();
+        this._clearStem();
         this._store?.dispose();
         this._store = null;
         this._scheduler = null;
@@ -256,6 +258,7 @@ export class SegmentedSource implements PlaybackSource {
         this._stats = SegmentedSource._freshStats();
         const url = new URL(clip.manifest, typeof location !== 'undefined' ? location.href : undefined).href;
         this._clipId = clip.id;
+        this._autoplay = autoplay;
         this._wantStem = clip.stem ?? null;
         this._playStartedAt = performance.now();
         this._loadStartedAt = this._playStartedAt;
@@ -291,21 +294,23 @@ export class SegmentedSource implements PlaybackSource {
             if (!out || loadId !== this._loadId) return false;
             this._engine = out.engine;
             const cacheSeconds = this._options.cacheSeconds ?? 60;
-            this._store = new SegmentStore(url, manifest, out.ctx, {
-                decode: this._options.decode,
+            this._store = new SegmentStore(url, manifest, {
                 fetchOptions: this._host.options.fetchOptions,
                 maxBytes: Math.max(1, cacheSeconds) * manifest.sampleRate * manifest.channels * 4,
             });
             this._store.onLoad((index) => this._onSegment(index));
+            this._store.onError((index, error, failures) => this._onSegmentError(index, error, failures));
             this._scheduler = new SegmentScheduler(out.ctx, out.input, manifest.segments.list, manifest.sampleRate);
             this._scheduler.setRate(this._state.processing.speed);
-            await this._createEngine(out.ctx, out.input, manifest);
+            await this._createEngine(out.ctx, out.input, manifest, loadId);
             if (loadId !== this._loadId) return false;
-            this._applyStems(manifest, out.ctx);
+            this._applyStems(manifest);
             settle();
             this._host.emit('load', { clipId: clip.id, duration: manifest.duration });
             if (this._view) this.setView(this._view.start, this._view.end);
-            if (autoplay) return this._startAt(this._pausedFrame, 'play');
+            // A pause or stop while the clip was being set up cancels the autoplay (a resume asks again).
+            if (this._autoplay) return this._startAt(this._pausedFrame, 'play');
+            if (autoplay) this._update({ buffering: false });
             void this._store.load(this._scheduler.segmentAt(this._pausedFrame));
             return true;
         } catch (error) {
@@ -325,14 +330,22 @@ export class SegmentedSource implements PlaybackSource {
     }
 
     async resume(): Promise<void> {
-        if (!this._manifest) return;
+        if (!this._manifest) {
+            // Still loading: play once it is set up.
+            if (this._state.status === 'loading') this._autoplay = true;
+            return;
+        }
         await this._startAt(this._pausedFrame, 'play');
     }
 
     pause = async (): Promise<void> => {
         this._playId += 1;
+        this._autoplay = false;
         const m = this._manifest;
-        if (!m || !this._scheduler) return;
+        if (!m || !this._scheduler) {
+            if (this._state.buffering) this._update({ buffering: false });
+            return;
+        }
         let frame = Math.floor((this.getCurrentTime() ?? 0) * m.sampleRate);
         if (this._state.pauseMode === 'reset') frame = this._frameOf(this._state.playbackStartPoint);
         if (this._eng) {
@@ -348,6 +361,7 @@ export class SegmentedSource implements PlaybackSource {
 
     stop = (): void => {
         this._playId += 1;
+        this._autoplay = false;
         if (this._eng) {
             this._eng.pause();
             this._eng.seek(0);
@@ -457,7 +471,7 @@ export class SegmentedSource implements PlaybackSource {
             assertManifest(next);
             if (loadId !== this._loadId || (next.revision ?? 1) <= (m.revision ?? 1)) return;
             this._manifest = { ...m, revision: next.revision, stems: next.stems };
-            this._applyStems(this._manifest, ctx);
+            this._applyStems(this._manifest);
         } catch (error) {
             console.warn('[AudioPlayer] manifest refresh failed', error);
         }
@@ -494,13 +508,13 @@ export class SegmentedSource implements PlaybackSource {
         if (!ctx || !this._store) return true;
         if (this._pickStem(m) === this._stemKey) return true;
         this._releaseStem();
-        this._applyStems(m, ctx);
+        this._applyStems(m);
         return true;
     }
 
     /** Let go of the active stem: its store, its segments in the engine, its overview. */
     private _releaseStem(): void {
-        if (this._eng) for (const i of this._eng.held('b')) this._eng.drop('b', i);
+        this._eng?.resetB();
         this._storeB?.dispose();
         this._storeB = null;
         this._stemB = null;
@@ -516,7 +530,7 @@ export class SegmentedSource implements PlaybackSource {
         }
     }
 
-    private _applyStems(manifest: AudioManifest, ctx: BaseAudioContext): void {
+    private _applyStems(manifest: AudioManifest): void {
         const key = this._pickStem(manifest);
         if (key !== this._stemKey && this._stemKey !== null) this._releaseStem();
         const stem = key ? manifest.stems![key] : null;
@@ -530,13 +544,19 @@ export class SegmentedSource implements PlaybackSource {
             const every = this._options.pollStemsMs ?? 0;
             if (every > 0) this._pollTimer = setInterval(() => void this.refreshManifest(), every);
         }
-        if (stem?.status === 'ready' && stem.segments && (was?.status !== 'ready' || !this._storeB)) {
+        // A new store for a stem that became ready, and for a ready one that was replaced
+        // (a newer revision re-processed it): the old B's segments are let go everywhere.
+        const replaced = !!was && was.status === 'ready' && stem?.status === 'ready' && SegmentedSource._stemSignature(was) !== SegmentedSource._stemSignature(stem);
+        if (replaced) this._eng?.resetB();
+        if (stem?.status === 'ready' && stem.segments && (was?.status !== 'ready' || !this._storeB || replaced)) {
             const shim = { ...manifest, segments: stem.segments } as AudioManifest;
             this._storeB?.dispose();
-            this._storeB = new SegmentStore(this._manifestUrl, shim, ctx, {
-                decode: this._options.decode,
+            this._storeB = new SegmentStore(this._manifestUrl, shim, {
                 fetchOptions: this._host.options.fetchOptions,
                 maxBytes: Math.max(1, this._options.cacheSeconds ?? 60) * manifest.sampleRate * manifest.channels * 4,
+            });
+            this._storeB.onError((index, error, failures) => {
+                if (failures >= SEGMENT_FAILURES_MAX) this._failStemB(index, error);
             });
             this._storeB.onLoad((index) => {
                 if (this._eng && this._bWanted()) this._feedEngine(this._wantedEngine(this._engPlaying ? this._eng.position() : this._pausedFrame));
@@ -559,6 +579,36 @@ export class SegmentedSource implements PlaybackSource {
         });
         this._applyMix();
         if (stem?.status === 'ready' && was?.status !== 'ready' && was) this._host.emit('bload', { clipId: this._clipId ?? '' });
+    }
+
+    /**
+     * A segment of A keeps failing. Where the playhead needs it, playback cannot go
+     * on: pause with an error (a seek elsewhere still plays; the store retries slowly).
+     */
+    private _onSegmentError(index: number, error: Error, failures: number): void {
+        const m = this._manifest;
+        const scheduler = this._scheduler;
+        if (!m || !scheduler || failures < SEGMENT_FAILURES_MAX || !this._state.isPlaying) return;
+        const frame = Math.floor((this.getCurrentTime() ?? 0) * m.sampleRate);
+        if (scheduler.segmentAt(Math.min(m.frames - 1, frame)) !== index && this._waiting !== index) return;
+        const err = new Error(`Segment ${index} failed ${failures} times: ${error.message}`);
+        void this.pause();
+        this._update({ error: err });
+        this._host.emit('error', err);
+    }
+
+    /** Stem B keeps failing: let it go, A plays on alone and statusB says why. */
+    private _failStemB(index: number, error: Error): void {
+        console.warn(`[AudioPlayer] stem B segment ${index} keeps failing; playing A alone`, error);
+        this._releaseStem();
+        this._applyMix();
+        this.capabilities = SegmentedSource._caps(this.capabilities.canPreservePitch, false, this.capabilities.stems);
+        this._update({ capabilities: this.capabilities, statusB: 'error' });
+    }
+
+    /** What tells two versions of a stem apart (a re-processed stem gets new files). */
+    private static _stemSignature(stem: ManifestStem): string {
+        return `${stem.id ?? ''}|${stem.updatedAt}|${stem.segments?.source.url ?? ''}`;
     }
 
     /** The manifest's stems, for `capabilities.stems` (ready ones, in manifest order). */
@@ -609,7 +659,7 @@ export class SegmentedSource implements PlaybackSource {
         this._update({ processing: { ...this._state.processing, speed: value }, pendingSpeed: null });
         if (this._eng) {
             // Realtime in the engine: the stretcher keeps the pitch; the blend in and out of it is smoothed.
-            this._eng.setRate(value * this._rateScale);
+            this._eng.setRate(value);
             return;
         }
         const scheduler = this._scheduler;
@@ -695,15 +745,22 @@ export class SegmentedSource implements PlaybackSource {
         return this._window;
     }
 
-    unload(): void {
-        this._loadId += 1;
-        this._playId += 1;
+    /** Forget the active stem entirely (a new clip, or unload): store, poll, overview flags. */
+    private _clearStem(): void {
         if (this._pollTimer) clearInterval(this._pollTimer);
         this._pollTimer = null;
         this._storeB?.dispose();
         this._storeB = null;
         this._stemB = null;
         this._stemKey = null;
+        this._bOverviewAsked = false;
+        this._bWantedUntil = 0;
+    }
+
+    unload(): void {
+        this._loadId += 1;
+        this._playId += 1;
+        this._clearStem();
         this._disposeEngine();
         this._halt();
         this._store?.dispose();
@@ -942,7 +999,7 @@ export class SegmentedSource implements PlaybackSource {
             this._waiting = null;
         }
         const frame = scheduler.positionAt(now);
-        const wanted = this._wanted(frame);
+        const wanted = store.withinBudget(this._wanted(frame));
         for (const i of wanted) if (!store.has(i)) void store.load(i);
         store.evict(wanted, 2);
         if (scheduler.endedAt(now)) {
@@ -978,25 +1035,25 @@ export class SegmentedSource implements PlaybackSource {
 
     // ---- engine path ------------------------------------------------------------------------
 
-    private async _createEngine(ctx: AudioContext, output: AudioNode, manifest: AudioManifest): Promise<void> {
+    private async _createEngine(ctx: AudioContext, output: AudioNode, manifest: AudioManifest, loadId: number): Promise<void> {
         this._disposeEngine();
         if (this._options.engine === false) return;
-        // The engine reads the timeline at the context's rate; a manifest at another rate is
-        // resampled by it (linear), and then the stretcher (made for the context rate) is off.
-        this._rateScale = manifest.sampleRate / ctx.sampleRate;
-        const stretch = this._options.realtimeStretch !== false && this._rateScale === 1;
-        if (!(await loadStreamEngine(ctx, stretch))) return;
+        // The engine runs at the clip's rate (the stretcher too) and resamples its output
+        // to the context's when they differ: a 44.1 or 16 kHz clip keeps realtime speed.
+        const stretch = this._options.realtimeStretch !== false;
+        const loaded = await loadStreamEngine(ctx, stretch);
+        // Another clip was asked for while the module loaded: that load makes its own engine.
+        if (!loaded || loadId !== this._loadId) return;
         const starts = [...manifest.segments.list.map((s) => s.startFrame), manifest.frames];
         let engine: StreamEngine;
         try {
-            engine = new StreamEngine(ctx, { channels: manifest.channels, starts, stretch });
+            engine = new StreamEngine(ctx, { channels: manifest.channels, starts, stretch, sampleRate: manifest.sampleRate });
         } catch (error) {
             console.warn('[AudioPlayer] stream engine unavailable; using the scheduler', error);
             return;
         }
         engine.node.connect(output);
-        engine.setRate(this._state.processing.speed * this._rateScale);
-        engine.setVolume(this._volume);
+        engine.setRate(this._state.processing.speed);
         this._eng = engine;
         this._applyMix();
         engine.onReport = (report) => this._onReport(report);
@@ -1005,7 +1062,23 @@ export class SegmentedSource implements PlaybackSource {
             this.capabilities = SegmentedSource._caps(state.ready, this.capabilities.canMixStemB, this.capabilities.stems);
             this._update({ capabilities: this.capabilities });
         };
+        engine.onError = (error) => this._onEngineError(engine, error);
         this._eng = engine;
+    }
+
+    /** The processor died (it is silent for good): carry on with the scheduler from the same place. */
+    private _onEngineError(engine: StreamEngine, error: Error): void {
+        if (this._eng !== engine) return;
+        console.warn('[AudioPlayer] stream engine failed; playing on with the scheduler', error);
+        const m = this._manifest;
+        const wasPlaying = this._engPlaying;
+        const frame = Math.floor(wasPlaying ? engine.position() : this._pausedFrame);
+        this._disposeEngine();
+        this._pausedFrame = frame;
+        const loop = this._state.loop;
+        this._scheduler?.setLoop(loop ? { start: this._frameOf(loop.start), end: Math.min(m?.frames ?? 0, this._frameOf(loop.end)) } : null);
+        this._scheduler?.setRate(this._state.processing.speed);
+        if (m && wasPlaying) void this._startAt(frame, 'play');
     }
 
     private _disposeEngine(): void {
@@ -1021,11 +1094,6 @@ export class SegmentedSource implements PlaybackSource {
         }
     }
 
-    /** Volume (linear), smoothed in the engine. */
-    setVolume(value: number): void {
-        this._volume = value;
-        this._eng?.setVolume(value);
-    }
 
     private async _startEngine(frame: number, reason: 'play' | 'seek'): Promise<boolean> {
         const m = this._manifest!;
@@ -1112,9 +1180,15 @@ export class SegmentedSource implements PlaybackSource {
             add(i);
             cursor = m.segments.list[i].startFrame + m.segments.list[i].frames;
         }
-        if (loopFrames) {
-            add(scheduler.segmentAt(loopFrames.start));
-            add(scheduler.segmentAt(Math.max(0, loopFrames.end - 1)));
+        if (loopFrames && loopFrames.end > loopFrames.start) {
+            // Both ends of the loop, as far as the engine reads across the wrap: its look-ahead
+            // past the end continues at the start, its history behind the start is the end.
+            const margin = historyFrames * Math.max(1, this._state.processing.speed);
+            const span = (from: number, to: number) => {
+                for (let i = scheduler.segmentAt(from); i <= scheduler.segmentAt(to); i += 1) add(i);
+            };
+            span(loopFrames.start, Math.min(loopFrames.end - 1, loopFrames.start + margin));
+            span(Math.max(loopFrames.start, loopFrames.end - margin), loopFrames.end - 1);
         }
         for (const i of this._visible) add(i);
         return out;
@@ -1131,26 +1205,29 @@ export class SegmentedSource implements PlaybackSource {
             void store.load(first, true);
             return;
         }
+        // Fetch only what the store can keep: more would be evicted and fetched again.
+        const fetchable = new Set(store.withinBudget(wanted.filter((i) => !engine.holds('a', i))));
         for (const i of wanted) {
             if (engine.holds('a', i)) continue;
             const buffer = store.get(i);
             if (buffer) {
                 const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c).slice());
                 engine.feed('a', i, channels);
-            } else {
+            } else if (fetchable.has(i)) {
                 void store.load(i, i === wanted[0]);
             }
         }
         // Stem B only while the mix wants it: the playhead's segments first.
         const storeB = this._storeB;
         if (!storeB || !this._bWanted()) return;
+        const fetchableB = new Set(storeB.withinBudget(wanted.filter((i) => !engine.holds('b', i))));
         for (const i of wanted) {
             if (engine.holds('b', i)) continue;
             const buffer = storeB.get(i);
             if (buffer) {
                 const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c).slice());
                 engine.feed('b', i, channels);
-            } else {
+            } else if (fetchableB.has(i)) {
                 void storeB.load(i, i === wanted[0]);
             }
         }

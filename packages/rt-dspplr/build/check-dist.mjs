@@ -104,9 +104,27 @@ for (const file of walkDist()) {
             errors.push(`${file} lost its MIT notice`);
         }
     }
+    // The source-run decoders: each chunk carries its license as data.
+    const decoders = [
+        { name: 'rtdDecodeMp3', notice: /dr_mp3 and dr_flac by David Reid/ },
+        { name: 'rtdDecodeFlac', notice: /dr_mp3 and dr_flac by David Reid/ },
+        { name: 'rtdDecodeOpus', notice: /libopus [\d.]+ \(https:\/\/opus-codec\.org\), BSD-3-Clause/ },
+    ];
+    if (!/## dr_mp3 and dr_flac/.test(notices) || !/ALTERNATIVE 1 - Public Domain/.test(notices)) errors.push('THIRD_PARTY_NOTICES.md lacks the dr_mp3/dr_flac notice');
+    if (!/## libopus/.test(notices) || !/Redistribution and use in source and binary forms/.test(notices)) errors.push('THIRD_PARTY_NOTICES.md lacks the libopus notice');
+    for (const d of decoders) {
+        const chunks = walkDist().filter((f) => f.startsWith(`chunks/${d.name}-`) && f.endsWith('.js'));
+        if (chunks.length !== 1) errors.push(`expected one ${d.name} chunk, found ${chunks.length}`);
+        for (const file of chunks) {
+            const code = read(file);
+            if (!d.notice.test(code)) errors.push(`${file} lost its notice`);
+            if (d.name === 'rtdDecodeOpus' && !/Redistribution and use in source and binary forms/.test(code)) errors.push(`${file} lost the BSD text`);
+        }
+    }
+    const known = new Set(['signalsmithStretch.ts', ...decoders.map((d) => `${d.name}.ts`)]);
     const vendorDir = path.join(root, 'src', 'vendor');
     for (const name of fs.existsSync(vendorDir) ? fs.readdirSync(vendorDir) : []) {
-        if (name !== 'signalsmithStretch.ts') errors.push(`src/vendor/${name}: new vendored code needs a notice check in check-dist and THIRD_PARTY_NOTICES.md`);
+        if (!known.has(name)) errors.push(`src/vendor/${name}: new vendored code needs a notice check in check-dist and THIRD_PARTY_NOTICES.md`);
     }
 }
 

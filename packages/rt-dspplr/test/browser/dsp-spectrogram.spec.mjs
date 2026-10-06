@@ -9,15 +9,25 @@ test.beforeEach(async ({ page }) => {
     await page.waitForFunction(() => window.h);
     await page.evaluate((base) => {
         window.longBase = base;
-        /** Mean brightness of rows [r0, r1) (fractions of the height) per column, and overall. */
+        /** The spectrogram's background (theme) as [r, g, b]; a pixel's ink is its distance from it (cleared pixels: none). */
+        window.spectrogramInk = (canvas) => {
+            const style = getComputedStyle(canvas);
+            const stops = h.colormapStops(style.getPropertyValue('--rtd-spectrogram-colormap').trim() || null);
+            const hex = (stops ? stops[0] : style.getPropertyValue('--rtd-spectrogram-bg').trim() || '#131315').replace('#', '');
+            const n = parseInt(hex.length === 3 ? hex.split('').map((c) => c + c).join('') : hex, 16);
+            const bg = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+            return (px, i) => (px[i + 3] === 0 ? 0 : Math.abs(px[i] - bg[0]) + Math.abs(px[i + 1] - bg[1]) + Math.abs(px[i + 2] - bg[2]));
+        };
+        /** Mean ink of rows [r0, r1) (fractions of the height) per column, and overall. */
         window.bands = (canvas, r0, r1) => {
             const { width, height } = canvas;
             const px = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+            const ink = spectrogramInk(canvas);
             const cols = new Float64Array(width);
             const y0 = Math.floor(r0 * height), y1 = Math.floor(r1 * height);
             for (let y = y0; y < y1; y += 1) for (let x = 0; x < width; x += 1) {
                 const i = (y * width + x) * 4;
-                cols[x] += (px[i] + px[i + 1] + px[i + 2]) / (y1 - y0);
+                cols[x] += ink(px, i) / (y1 - y0);
             }
             return { mean: cols.reduce((a, b) => a + b, 0) / width, cols: Array.from(cols) };
         };

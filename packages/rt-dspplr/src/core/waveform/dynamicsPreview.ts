@@ -8,7 +8,7 @@ import {
 
 // The dynamics stage of the waveform preview (compressor + output gain +
 // ceiling), applied to peaks at the rate of their bins. Shared by the peaks
-// worker (32-frame bins of a decoded clip) and the stream player's overview
+// worker (32-frame bins of a decoded clip) and a prepared clip's overview
 // approximation (stored 256-frame bins).
 
 export interface DynamicsState {

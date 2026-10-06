@@ -34,6 +34,7 @@ export interface UseAudioPlayerResult extends Pick<
     | 'setSpeed'
     | 'setHighPass'
     | 'setCompression'
+    | 'setInputGain'
     | 'setOutputGain'
     | 'setMix'
     | 'setProcessing'
@@ -84,6 +85,7 @@ export function useAudioPlayer(options?: AudioPlayerOptions): UseAudioPlayerResu
         setSpeed: player.setSpeed,
         setHighPass: player.setHighPass,
         setCompression: player.setCompression,
+        setInputGain: player.setInputGain,
         setOutputGain: player.setOutputGain,
         setMix: player.setMix,
         setProcessing: player.setProcessing,

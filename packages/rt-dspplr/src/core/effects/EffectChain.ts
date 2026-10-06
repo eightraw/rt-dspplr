@@ -3,7 +3,11 @@ import type { DspPlugin, PluginInstance, PluginParams } from './types';
 // ---------------------------------------------------------------------------
 // EffectChain — the player's master bus, built from plugins:
 //
-//   input ─ slot 1 ─ slot 2 ─ … ─ volume (smoothed) ─ analyser ─ destination
+//   input ─ input gain ─ slot 1 ─ slot 2 ─ … ─ output gain ─ ceiling ─ analyser ─ destination
+//
+//   The gains are smoothed (20 ms). The ceiling (-0.01 dBFS, a hard clip) is
+//   the last stage, so nothing before it (a boost, a third-party effect) can
+//   send the output over full scale.
 //
 //   slot:  in ─┬─ plugin ─ wet ─┬─ out      bypass crossfades wet/dry over 10 ms,
 //              └──────── dry ───┘          so it never clicks
@@ -14,7 +18,20 @@ import type { DspPlugin, PluginInstance, PluginParams } from './types';
 // ---------------------------------------------------------------------------
 
 const BYPASS_SECONDS = 0.01;
-const VOLUME_SECONDS = 0.02;
+const GAIN_SECONDS = 0.02;
+
+/** A transfer curve that passes the signal through and clips it at ±ceiling. */
+function ceilingCurve(ceiling: number): Float32Array {
+    // Identity sampled exactly (linear interpolation between points is exact on a line), clipped at the ceiling;
+    // a WaveShaper holds its end values for input beyond ±1.
+    const n = 65537;
+    const curve = new Float32Array(n);
+    for (let i = 0; i < n; i += 1) {
+        const x = (2 * i) / (n - 1) - 1;
+        curve[i] = Math.max(-ceiling, Math.min(ceiling, x));
+    }
+    return curve;
+}
 
 interface Slot {
     id: string;
@@ -89,19 +106,26 @@ export class EffectChain {
     readonly input: GainNode;
     readonly analyser: AnalyserNode;
     private readonly _ctx: BaseAudioContext;
-    private readonly _volume: GainNode;
+    private readonly _inputGain: GainNode;
+    private readonly _outputGain: GainNode;
+    private readonly _ceiling: WaveShaperNode;
     private _slots: Slot[] = [];
     private readonly _onError: (id: string, message: string) => void;
     private _disposed = false;
 
-    constructor(ctx: BaseAudioContext, onError: (id: string, message: string) => void) {
+    constructor(ctx: BaseAudioContext, onError: (id: string, message: string) => void, ceiling = 1) {
         this._ctx = ctx;
         this._onError = onError;
         this.input = ctx.createGain();
-        this._volume = ctx.createGain();
+        this._inputGain = ctx.createGain();
+        this._outputGain = ctx.createGain();
+        this._ceiling = ctx.createWaveShaper();
+        this._ceiling.curve = ceilingCurve(ceiling);
         this.analyser = ctx.createAnalyser();
         this.analyser.fftSize = 2048;
-        this._volume.connect(this.analyser);
+        this.input.connect(this._inputGain);
+        this._outputGain.connect(this._ceiling);
+        this._ceiling.connect(this.analyser);
         this.analyser.connect(ctx.destination);
         this._rewire();
     }
@@ -166,13 +190,21 @@ export class EffectChain {
         this._applyBypass(slot);
     }
 
-    /** The fader after the inserts, ramped so a move never clicks. */
-    setVolume(value: number): void {
+    /** Linear gain before the effects, ramped so a move never clicks. */
+    setInputGain(value: number): void {
+        this._ramp(this._inputGain.gain, value);
+    }
+
+    /** Linear gain after the effects (before the ceiling), ramped so a move never clicks. */
+    setOutputGain(value: number): void {
+        this._ramp(this._outputGain.gain, value);
+    }
+
+    private _ramp(g: AudioParam, value: number): void {
         const now = this._ctx.currentTime;
-        const g = this._volume.gain;
         g.cancelScheduledValues(now);
         g.setValueAtTime(g.value, now);
-        g.linearRampToValueAtTime(value, now + VOLUME_SECONDS);
+        g.linearRampToValueAtTime(value, now + GAIN_SECONDS);
     }
 
     /** Sum of the active effects' declared latencies, in frames. */
@@ -184,7 +216,7 @@ export class EffectChain {
         this._disposed = true;
         for (const slot of this._slots) this._dispose(slot);
         this._slots = [];
-        for (const node of [this.input, this._volume, this.analyser]) {
+        for (const node of [this.input, this._inputGain, this._outputGain, this._ceiling, this.analyser]) {
             try {
                 node.disconnect();
             } catch {
@@ -252,7 +284,7 @@ export class EffectChain {
 
     private _rewire(): void {
         try {
-            this.input.disconnect();
+            this._inputGain.disconnect();
         } catch {
             // no-op
         }
@@ -263,11 +295,11 @@ export class EffectChain {
                 // no-op
             }
         }
-        let head: AudioNode = this.input;
+        let head: AudioNode = this._inputGain;
         for (const slot of this._slots) {
             head.connect(slot.slotIn);
             head = slot.slotOut;
         }
-        head.connect(this._volume);
+        head.connect(this._outputGain);
     }
 }

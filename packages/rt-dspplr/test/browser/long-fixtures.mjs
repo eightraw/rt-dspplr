@@ -107,17 +107,46 @@ export default async function setup() {
     const items = [
         { name: 'stereo70', seconds: 70, rate: 48000, channels: 2, segmentSeconds: 10 },
         { name: 'mono30', seconds: 30, rate: 48000, channels: 1, segmentSeconds: 3 },
+        // Kept at 44.1 kHz by prepare: the player resamples it to the context's rate.
+        { name: 'stereo441', seconds: 20, rate: 44100, channels: 2, segmentSeconds: 4 },
     ];
     for (const item of items) {
         const src = path.join(FIXTURES, `${item.name}.wav`);
         const out = path.join(FIXTURES, item.name);
-        // Re-prepare when the fixture predates the current manifest version (v2: bands + spectrogram).
+        // Re-prepare when the fixture predates the current manifest version (v4: the source and its index).
         const manifestPath = path.join(out, 'manifest.json');
         if (fs.existsSync(manifestPath) && fs.existsSync(src)
-            && JSON.parse(fs.readFileSync(manifestPath, 'utf8')).formatVersion >= 3) continue;
+            && JSON.parse(fs.readFileSync(manifestPath, 'utf8')).formatVersion === 4) continue;
         wav16(src, item.seconds, item.rate, item.channels);
         fs.rmSync(out, { recursive: true, force: true });
         await prepareAudio(src, { outDir: out, segmentSeconds: item.segmentSeconds }).done;
     }
     await pairs();
+    await lossy();
+}
+
+/**
+ * MP3 and Opus clips (prepare's 2 s fixtures), kept as they are with 0.5 s segments, and the
+ * decoder's samples beside them (`<name>.f32`: planar float32, channel after channel).
+ */
+async function lossy() {
+    const { prepareAudio, builtinDecoder } = await loadPrepare();
+    const fixtures = path.resolve(root, '..', 'rt-dspplr-prepare', 'test', 'fixtures');
+    for (const codec of ['mp3', 'opus']) {
+        const src = path.join(fixtures, `sine-speech.${codec}`);
+        const out = path.join(FIXTURES, `${codec}clip`);
+        fs.rmSync(out, { recursive: true, force: true });
+        await prepareAudio(src, { outDir: out, segmentSeconds: 0.5 }).done;
+        const decoded = builtinDecoder(fs.createReadStream(src));
+        const parts = [];
+        for await (const block of decoded.blocks) parts.push(block);
+        const frames = parts.reduce((n, p) => n + p[0].length, 0);
+        const planar = new Float32Array(frames * parts[0].length);
+        let o = 0;
+        for (const p of parts) {
+            p.forEach((ch, c) => planar.set(ch, c * frames + o));
+            o += p[0].length;
+        }
+        fs.writeFileSync(path.join(FIXTURES, `${codec}clip.f32`), Buffer.from(planar.buffer));
+    }
 }

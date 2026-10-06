@@ -29,6 +29,11 @@ export interface StreamEngineOptions {
     starts: number[];
     /** Load the realtime stretcher (Signalsmith Stretch). Default true. */
     stretch?: boolean;
+    /**
+     * The clip's rate. Default: the context's. When it differs, the engine
+     * renders at the clip's rate and resamples its output to the context's.
+     */
+    sampleRate?: number;
 }
 
 const enginesLoaded = new WeakMap<BaseAudioContext, Promise<boolean>>();
@@ -73,23 +78,31 @@ export class StreamEngine {
     private readonly _ctx: BaseAudioContext;
     private _report: EngineReport = { position: 0, frame: 0, playing: false, stalled: false, underruns: 0, underrunFrames: 0, stretching: false, seq: 0 };
     private _seq = 0;
+    /** The speed. */
     private _rate = 1;
+    /** Clip frames per context frame at 1x. */
+    private readonly _scale: number;
     private _loop: { start: number; end: number } | null = null;
     private readonly _sent: Record<EngineStem, Set<number>> = { a: new Set(), b: new Set() };
     private _stretchState: { ready: boolean; latencyFrames: number; error?: string } = { ready: false, latencyFrames: 0 };
     onReport: ((report: EngineReport) => void) | null = null;
     onEnded: (() => void) | null = null;
     onStretch: ((state: { ready: boolean; latencyFrames: number; error?: string }) => void) | null = null;
+    /** The processor threw: it is silent for good (the source falls back to the scheduler). */
+    onError: ((error: Error) => void) | null = null;
 
     /** The context must have loaded the engine (loadStreamEngine). */
     constructor(ctx: BaseAudioContext, options: StreamEngineOptions) {
         this._ctx = ctx;
+        const clipRate = options.sampleRate && options.sampleRate > 0 ? options.sampleRate : ctx.sampleRate;
+        this._scale = clipRate / ctx.sampleRate;
         this.node = new AudioWorkletNode(ctx, 'rtd-stream-engine', {
             numberOfInputs: 0,
             numberOfOutputs: 1,
             outputChannelCount: [options.channels],
-            processorOptions: { channels: options.channels, starts: options.starts },
+            processorOptions: { channels: options.channels, starts: options.starts, sampleRate: clipRate },
         });
+        this.node.onprocessorerror = () => this.onError?.(new Error('stream engine: the audio processor failed'));
         this.node.port.onmessage = (event: MessageEvent<{ type: string } & Record<string, unknown>>) => {
             const m = event.data;
             if (m.type === 'pos') {
@@ -102,7 +115,8 @@ export class StreamEngine {
                 }
                 this.onReport?.(this._report);
             } else if (m.type === 'ended') {
-                this.onEnded?.();
+                // An end from before the last transport message (a play sent meanwhile) is stale.
+                if (Number(m.seq ?? 0) >= this._seq) this.onEnded?.();
             } else if (m.type === 'stretch') {
                 this._stretchState = { ready: !!m.ready, latencyFrames: Number(m.latencyFrames ?? 0), error: m.error as string | undefined };
                 this.onStretch?.(this._stretchState);
@@ -139,6 +153,13 @@ export class StreamEngine {
         this.post({ type: 'seg', stem, index, data: channels }, channels.map((c) => c.buffer as ArrayBuffer));
     }
 
+    /** Stem B is another stem now (or none): A plays on until the new B's segments arrive. */
+    resetB(): void {
+        for (const i of this._sent.b) this.post({ type: 'drop', stem: 'b', index: i });
+        this._sent.b.clear();
+        this.post({ type: 'resetB' });
+    }
+
     drop(stem: EngineStem, index: number): void {
         if (!this._sent[stem].delete(index)) return;
         this.post({ type: 'drop', stem, index });
@@ -164,7 +185,7 @@ export class StreamEngine {
         this.post(loop ? { type: 'loop', start: loop.start, end: loop.end } : { type: 'loop', start: null, end: null });
     }
 
-    /** Timeline frames per context frame: the speed, times manifest rate / context rate. */
+    /** The speed (1 = as recorded). */
     setRate(rate: number): void {
         this._rate = rate;
         this.post({ type: 'rate', rate });
@@ -183,7 +204,7 @@ export class StreamEngine {
         const r = this._report;
         if (!r.playing || r.stalled) return r.position;
         const elapsed = Math.max(0, this._nowFrame() - r.frame);
-        let p = r.position + elapsed * this._rate;
+        let p = r.position + elapsed * this._rate * this._scale;
         const loop = this._loop;
         if (loop && r.position < loop.end && p >= loop.end && loop.end > loop.start) {
             p = loop.start + ((p - loop.start) % (loop.end - loop.start));
@@ -191,14 +212,26 @@ export class StreamEngine {
         return p;
     }
 
+    /**
+     * Fade out (if sounding), then the processor lets go of its audio and stops
+     * running; the node is disconnected once the fade has played.
+     */
     dispose(): void {
-        this.post({ type: 'clear' });
+        this.post({ type: 'dispose' });
         this.node.port.onmessage = null;
-        try {
-            this.node.disconnect();
-        } catch {
-            // no-op
-        }
+        this.node.onprocessorerror = null;
+        this.onReport = null;
+        this.onEnded = null;
+        this.onStretch = null;
+        this.onError = null;
+        const node = this.node;
+        setTimeout(() => {
+            try {
+                node.disconnect();
+            } catch {
+                // no-op
+            }
+        }, 50);
     }
 
     private _nowFrame(): number {

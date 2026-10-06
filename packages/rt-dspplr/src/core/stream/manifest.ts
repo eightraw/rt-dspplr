@@ -1,30 +1,63 @@
 // ---------------------------------------------------------------------------
 // The prepared-audio manifest: what `prepareAudio()` writes and the stream
-// player reads. JSON, versioned. See docs/long-audio-experiment.md.
+// player reads. JSON, versioned. Specified in docs/manifest.md.
 // ---------------------------------------------------------------------------
 
 export const MANIFEST_FORMAT = 'rtd-audio-manifest';
 /**
- * Version of the manifest layout. 2 added the optional `bands` and
- * `spectrogram` outputs; 3 added `stems` (a server-processed stem B on the
- * same grid) and `revision`. Older manifests still play.
+ * Version of the manifest layout. 4: the audio is the original file itself
+ * (`segments.source`) and the segments are an index into it - byte ranges the
+ * player fetches and decodes; nothing is cut up or saved again. Versions 1-3
+ * (16-bit WAV segment files) are not read.
  */
-export const MANIFEST_FORMAT_VERSION = 3;
+export const MANIFEST_FORMAT_VERSION = 4;
 /**
  * Version of the analysis that produced segments, peaks and loudness. Hosts
  * re-run prepare when it changes (e.g. a new peak level layout).
  */
-export const ANALYZER_VERSION = '1.2.0';
+export const ANALYZER_VERSION = '2.0.0';
 
+/** Codecs of a source the player decodes itself. */
+export const SOURCE_CODECS = ['wav', 'mp3', 'flac', 'opus'] as const;
+export type SourceCodec = (typeof SOURCE_CODECS)[number];
+
+/**
+ * The audio of a timeline: one file, as it was given (or, for a format the
+ * player does not read, one WAV made from it). The segments are byte ranges of it.
+ */
+export interface ManifestSource {
+    /** The file, relative to the manifest's URL (or absolute). */
+    url: string;
+    bytes: number;
+    codec: SourceCodec;
+    /** What it decodes to: for A, the timeline's rate and channels. */
+    sampleRate: number;
+    channels: number;
+    /** wav: the layout of its samples. */
+    pcm?: { encoding: 'int' | 'float'; bitsPerSample: number; blockAlign: number };
+    /** flac and opus: the stream's header, put before a run of frames or pages to decode it (base64). */
+    header?: string;
+}
+
+/**
+ * A stretch of the timeline and the bytes of the source that hold it. The bytes
+ * [range[0], range[1]) are fetched and decoded as one run: it starts a little
+ * early (a decoder's warm-up), and `tail` counts the run's samples from the
+ * segment's first one to the run's end - counted from the end because a
+ * decoder may give nothing for the run's first frame. `lead` frames of
+ * silence come first (a stem that starts after A), `trail` frames of silence
+ * last (a stem that ends before A); a segment the source does not reach is
+ * silence (`range` null).
+ */
 export interface ManifestSegment {
     index: number;
     /** First frame of the segment on the playback timeline. */
     startFrame: number;
     frames: number;
-    /** Relative to the manifest's URL. */
-    url: string;
-    bytes: number;
-    sha256?: string;
+    range: [number, number] | null;
+    tail: number;
+    lead?: number;
+    trail?: number;
 }
 
 export interface ManifestPeakLevel {
@@ -106,9 +139,11 @@ export interface ManifestStem {
     alignment?: {
         offsetFrames: number;
         offsetMs: number;
-        /** Median normalised correlation peak of the windows that agree (0..1). */
+        /** Share of the measured windows that agree on the offset (agreeing / windows, 0..1). */
         confidence: number;
+        /** Windows measured (where A and the stem both sound). */
         windows: number;
+        /** Windows whose correlation peak sits at the offset (±2 frames). */
         agreeing: number;
     };
     /** Zero-lag correlation of A and the aligned stem: the whole clip, and per segment. */
@@ -144,7 +179,7 @@ export interface AudioManifest {
     duration: number;
     /** Playback sample rate (of segments and peaks). */
     sampleRate: number;
-    /** Sample rate of the original. */
+    /** Sample rate of the original (the timeline's: nothing is resampled). */
     sourceSampleRate: number;
     channels: number;
     /** Frames on the playback timeline. */
@@ -156,18 +191,9 @@ export interface AudioManifest {
         bitsPerSample: number;
         frames: number;
     };
-    /** Present when the playback rate differs from the source rate. */
-    resample: {
-        from: number;
-        to: number;
-        method: string;
-        passbandHz: number;
-        stopbandHz: number;
-        stopbandDb: number;
-    } | null;
     segments: {
-        codec: 'wav-pcm16';
         framesPerSegment: number;
+        source: ManifestSource;
         list: ManifestSegment[];
     };
     peaks: {
@@ -208,16 +234,73 @@ const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const isInt = (v: unknown, min = 0): v is number => Number.isInteger(v) && (v as number) >= min;
 const isStr = (v: unknown): v is string => typeof v === 'string';
+// Optional fields: absent, or of the schema's type.
+const optNum = (v: unknown) => v === undefined || isNum(v);
+const optInt = (v: unknown, min = 0) => v === undefined || isInt(v, min);
+const optStr = (v: unknown) => v === undefined || isStr(v);
+const optObj = (v: unknown) => v === undefined || isObj(v);
+const optNums = (v: unknown) => v === undefined || (Array.isArray(v) && v.every(isNum));
+
+/** The trim a stem may carry, in dB (the schema's range). */
+export const STEM_GAIN_DB_MIN = -60;
+export const STEM_GAIN_DB_MAX = 12;
+
+function checkSource(src: unknown, where: string): string | null {
+    if (!isObj(src) || !isStr(src.url) || !isInt(src.bytes) || !(SOURCE_CODECS as readonly unknown[]).includes(src.codec) || !isInt(src.sampleRate, 1) || !isInt(src.channels, 1)) {
+        return `${where} needs url, bytes, codec (${SOURCE_CODECS.join(', ')}), sampleRate and channels`;
+    }
+    if (src.codec === 'wav') {
+        const p = src.pcm;
+        if (!isObj(p) || (p.encoding !== 'int' && p.encoding !== 'float') || !isInt(p.bitsPerSample, 8) || !isInt(p.blockAlign, 1)) {
+            return `${where}.pcm needs encoding ('int' | 'float'), bitsPerSample and blockAlign`;
+        }
+    }
+    if ((src.codec === 'flac' || src.codec === 'opus') && !isStr(src.header)) return `${where}.header is needed for ${src.codec}`;
+    return null;
+}
 
 function checkSegments(s: unknown, where: string): string | null {
     if (!isObj(s)) return `${where} is missing`;
-    if (s.codec !== 'wav-pcm16') return `Unsupported segment codec ${String(s.codec)}`;
     if (!isInt(s.framesPerSegment, 1)) return `${where}.framesPerSegment must be a positive integer`;
+    const source = checkSource(s.source, `${where}.source`);
+    if (source) return source;
+    const bytes = (s.source as ManifestSource).bytes;
     if (!Array.isArray(s.list)) return `${where}.list must be an array`;
     for (const [i, seg] of s.list.entries()) {
-        if (!isObj(seg) || !isInt(seg.index) || !isInt(seg.startFrame) || !isInt(seg.frames) || !isStr(seg.url) || !isInt(seg.bytes)) {
-            return `${where}.list[${i}] needs index, startFrame, frames, url and bytes`;
+        if (!isObj(seg) || !isInt(seg.index) || !isInt(seg.startFrame) || !isInt(seg.frames) || !isInt(seg.tail) || !optInt(seg.lead) || !optInt(seg.trail)) {
+            return `${where}.list[${i}] needs index, startFrame, frames and tail (lead and trail counts)`;
         }
+        if ((seg.lead ?? 0) + (seg.trail ?? 0) > seg.frames) return `${where}.list[${i}]: lead + trail exceed its frames`;
+        const r = seg.range;
+        if (r !== null && !(Array.isArray(r) && r.length === 2 && isInt(r[0]) && isInt(r[1]) && r[1] > r[0] && r[1] <= bytes)) {
+            return `${where}.list[${i}].range must be null or [start, end) within the source`;
+        }
+    }
+    return null;
+}
+
+/**
+ * Segments that tile the timeline: in order from frame 0, back to back, none
+ * empty, ending at `frames` (docs/manifest.md; the schema cannot say it).
+ */
+function checkTiling(list: ManifestSegment[], frames: number, where: string): string | null {
+    if (list.length === 0) return `${where}.list is empty`;
+    let next = 0;
+    for (const [i, seg] of list.entries()) {
+        if (seg.index !== i) return `${where}.list[${i}].index must be ${i}`;
+        if (seg.startFrame !== next) return `${where}.list[${i}] must start at frame ${next} (segments tile the timeline)`;
+        if (seg.frames < 1) return `${where}.list[${i}] is empty`;
+        next += seg.frames;
+    }
+    if (next !== frames) return `${where} cover ${next} frames, the timeline has ${frames}`;
+    return null;
+}
+
+/** A ready stem's segments sit on A's grid: the same frames in the same places. */
+function checkGrid(list: ManifestSegment[], grid: ManifestSegment[], where: string): string | null {
+    if (list.length !== grid.length) return `${where} has ${list.length} segments, A has ${grid.length} (stems are on A's grid)`;
+    for (const [i, seg] of list.entries()) {
+        if (seg.startFrame !== grid[i].startFrame || seg.frames !== grid[i].frames) return `${where}.list[${i}] is off A's grid`;
     }
     return null;
 }
@@ -226,6 +309,7 @@ function checkPeaks(p: unknown, where: string): string | null {
     if (!isObj(p) || !isStr(p.url) || !isInt(p.bytes) || p.format !== 'rtd-peaks' || !isInt(p.version, 1) || !Array.isArray(p.levels)) {
         return `${where} needs url, bytes, format 'rtd-peaks', version and levels`;
     }
+    if (p.encoding !== undefined && p.encoding !== 'int16-min-max-rms') return `${where}.encoding must be 'int16-min-max-rms'`;
     for (const [i, l] of p.levels.entries()) {
         if (!isObj(l) || !isInt(l.framesPerPeak, 1) || !isInt(l.peaks) || !isInt(l.byteOffset) || !isInt(l.byteLength)) {
             return `${where}.levels[${i}] needs framesPerPeak, peaks, byteOffset and byteLength`;
@@ -239,6 +323,22 @@ function checkBlock(b: unknown, where: string, format: string): string | null {
     if (!isObj(b) || !isStr(b.url) || !isInt(b.bytes) || b.format !== format || !isInt(b.version, 1)) {
         return `${where} needs url, bytes, format '${format}' and version`;
     }
+    if (format === 'rtd-bands' && !(optInt(b.framesPerBin, 1) && optInt(b.bins) && optNums(b.cutoffsHz))) {
+        return `${where}: framesPerBin must be a positive integer, bins a count, cutoffsHz numbers`;
+    }
+    if (format === 'rtd-spectrogram') {
+        if (!(optInt(b.rows, 1) && optNum(b.minHz) && optNum(b.maxHz) && optNum(b.topDb) && optNum(b.rangeDb))) {
+            return `${where}: rows must be a positive integer; minHz, maxHz, topDb and rangeDb numbers`;
+        }
+        if (b.levels !== undefined) {
+            if (!Array.isArray(b.levels)) return `${where}.levels must be an array`;
+            for (const [i, l] of b.levels.entries()) {
+                if (!isObj(l) || !optInt(l.framesPerColumn, 1) || !optInt(l.columns) || !optInt(l.byteOffset) || !optInt(l.byteLength)) {
+                    return `${where}.levels[${i}]: framesPerColumn must be a positive integer; columns, byteOffset and byteLength counts`;
+                }
+            }
+        }
+    }
     return null;
 }
 
@@ -246,6 +346,33 @@ function checkLoudness(l: unknown, where: string): string | null {
     if (!isObj(l) || !isNum(l.peak) || !isNum(l.peakDb) || !isNum(l.rmsDb) || !isNum(l.gatedRmsDb) || !Array.isArray(l.perChannel)) {
         return `${where} needs peak, peakDb, rmsDb, gatedRmsDb and perChannel`;
     }
+    for (const [i, c] of l.perChannel.entries()) {
+        if (!isObj(c) || !optNum(c.peakDb) || !optNum(c.rmsDb)) return `${where}.perChannel[${i}] needs numeric peakDb and rmsDb`;
+    }
+    return null;
+}
+
+/** The optional descriptive fields of a stem, as the schema types them. */
+function checkStemFields(stem: Record<string, unknown>, where: string): string | null {
+    if (!optStr(stem.error) || !optStr(stem.aSourceId) || !optStr(stem.id)) return `${where}: error, aSourceId and id must be strings`;
+    const p = stem.processor;
+    if (p !== undefined && !(isObj(p) && isStr(p.id) && isStr(p.version) && optObj(p.params) && optNum(p.durationMs))) {
+        return `${where}.processor needs id and version (params an object, durationMs a number)`;
+    }
+    const src = stem.source;
+    if (src !== undefined && !(isObj(src) && (src.name === undefined || src.name === null || isStr(src.name)) && optInt(src.bytes)
+        && optInt(src.sampleRate, 1) && optInt(src.channels, 1) && optInt(src.frames) && optNum(src.bandwidthHz))) {
+        return `${where}.source has a field of the wrong type`;
+    }
+    const al = stem.alignment;
+    if (al !== undefined && !(isObj(al) && (al.offsetFrames === undefined || Number.isInteger(al.offsetFrames)) && optNum(al.offsetMs)
+        && optNum(al.confidence) && optInt(al.windows) && optInt(al.agreeing))) {
+        return `${where}.alignment: offsetFrames must be an integer, windows and agreeing counts`;
+    }
+    const co = stem.correlation;
+    if (co !== undefined && !(isObj(co) && optNum(co.global) && optNums(co.perSegment))) return `${where}.correlation must hold numbers`;
+    if (!optNum(stem.loudnessDeltaDb)) return `${where}.loudnessDeltaDb must be a number`;
+    if (stem.loudness !== undefined) return checkLoudness(stem.loudness, `${where}.loudness`);
     return null;
 }
 
@@ -259,8 +386,8 @@ export function manifestProblem(value: unknown): string | null {
     if (!isObj(value) || value.format !== MANIFEST_FORMAT) return 'Not an rtd audio manifest';
     const m = value;
     if (!isInt(m.formatVersion, 1)) return `Unsupported manifest version ${String(m.formatVersion)}`;
-    if (m.formatVersion > MANIFEST_FORMAT_VERSION) {
-        return `Unsupported manifest version ${String(m.formatVersion)} (this player reads ${MANIFEST_FORMAT_VERSION} and older)`;
+    if (m.formatVersion !== MANIFEST_FORMAT_VERSION) {
+        return `Unsupported manifest version ${String(m.formatVersion)} (this player reads version ${MANIFEST_FORMAT_VERSION}: prepare the recording again)`;
     }
     if (!isStr(m.analyzerVersion) || !isStr(m.id) || !isStr(m.createdAt)) return 'Manifest is missing required fields (analyzerVersion, id, createdAt)';
     if (!isNum(m.duration) || m.duration < 0 || !isInt(m.sampleRate, 1) || !isInt(m.sourceSampleRate, 1) || !isInt(m.channels, 1) || !isInt(m.frames)) {
@@ -271,10 +398,12 @@ export function manifestProblem(value: unknown): string | null {
     if (!isObj(src) || !(src.name === null || isStr(src.name)) || !isInt(src.bytes) || !isStr(src.encoding) || !isInt(src.bitsPerSample, 1) || !isInt(src.frames)) {
         return 'Manifest is missing required fields (source)';
     }
-    if (m.resample !== null && !(isObj(m.resample) && isInt(m.resample.from, 1) && isInt(m.resample.to, 1))) return 'resample must be null or { from, to, ... }';
     const problem = checkSegments(m.segments, 'segments') ?? checkPeaks(m.peaks, 'peaks') ?? checkLoudness(m.loudness, 'loudness')
         ?? checkBlock(m.bands, 'bands', 'rtd-bands') ?? checkBlock(m.spectrogram, 'spectrogram', 'rtd-spectrogram');
     if (problem) return problem;
+    const grid = (m.segments as AudioManifest['segments']).list;
+    const tiling = checkTiling(grid, m.frames, 'segments');
+    if (tiling) return tiling;
     if (m.stems !== undefined) {
         if (!isObj(m.stems)) return 'stems must be an object of named stems';
         const seen = new Set<string>();
@@ -286,14 +415,23 @@ export function manifestProblem(value: unknown): string | null {
             if (!isObj(stem) || !['processing', 'ready', 'failed'].includes(stem.status as string) || !isStr(stem.updatedAt)) {
                 return `${where} needs status ('processing' | 'ready' | 'failed') and updatedAt`;
             }
-            if (stem.label !== undefined && !(isStr(stem.label) && stem.label.length > 0 && stem.label.length <= 120)) return `${where}.label must be a string of 1-120 characters`;
-            if (stem.gainDb !== undefined && !isNum(stem.gainDb)) return `${where}.gainDb must be a number`;
-            if (stem.processor !== undefined && !(isObj(stem.processor) && isStr(stem.processor.id) && isStr(stem.processor.version))) return `${where}.processor needs id and version`;
+            // Characters as the schema counts them (code points, not UTF-16 units).
+            if (stem.label !== undefined && !(isStr(stem.label) && stem.label.length > 0 && [...stem.label].length <= 120)) return `${where}.label must be a string of 1-120 characters`;
+            if (stem.gainDb !== undefined && !(isNum(stem.gainDb) && stem.gainDb >= STEM_GAIN_DB_MIN && stem.gainDb <= STEM_GAIN_DB_MAX)) {
+                return `${where}.gainDb must be a number from ${STEM_GAIN_DB_MIN} to ${STEM_GAIN_DB_MAX}`;
+            }
             if (stem.mixLaw !== undefined && stem.mixLaw !== 'crossfade' && stem.mixLaw !== 'equal-power') return `${where}.mixLaw must be 'crossfade' or 'equal-power'`;
+            const fields = checkStemFields(stem, where);
+            if (fields) return fields;
+            // The blocks are checked whenever present; a ready stem must have segments and peaks.
+            if (stem.status === 'ready' && (stem.segments === undefined || stem.peaks === undefined)) return `${where} is ready but has no segments or peaks`;
+            const p = (stem.segments === undefined ? null : checkSegments(stem.segments, `${where}.segments`))
+                ?? (stem.peaks === undefined ? null : checkPeaks(stem.peaks, `${where}.peaks`))
+                ?? checkBlock(stem.bands, `${where}.bands`, 'rtd-bands') ?? checkBlock(stem.spectrogram, `${where}.spectrogram`, 'rtd-spectrogram');
+            if (p) return p;
             if (stem.status === 'ready') {
-                const p = checkSegments(stem.segments, `${where}.segments`) ?? checkPeaks(stem.peaks, `${where}.peaks`)
-                    ?? checkBlock(stem.bands, `${where}.bands`, 'rtd-bands') ?? checkBlock(stem.spectrogram, `${where}.spectrogram`, 'rtd-spectrogram');
-                if (p) return p;
+                const g = checkGrid((stem.segments as AudioManifest['segments']).list, grid, `${where}.segments`);
+                if (g) return g;
             }
         }
     }

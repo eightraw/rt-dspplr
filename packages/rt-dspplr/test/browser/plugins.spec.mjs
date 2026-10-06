@@ -40,11 +40,22 @@ test.beforeEach(async ({ page }) => {
             return out;
         };
         window.diff = (a, b) => { let d = 0; for (let i = 0; i < a.length; i += 1) if (Math.abs(a[i] - b[i]) > 8) d += 1; return d / Math.max(1, a.length); };
+        /** The spectrogram's background (theme) as [r, g, b]; a pixel's ink is its distance from it (cleared pixels: none). */
+        window.spectrogramInk = (canvas) => {
+            const style = getComputedStyle(canvas);
+            const stops = h.colormapStops(style.getPropertyValue('--rtd-spectrogram-colormap').trim() || null);
+            const hex = (stops ? stops[0] : style.getPropertyValue('--rtd-spectrogram-bg').trim() || '#131315').replace('#', '');
+            const n = parseInt(hex.length === 3 ? hex.split('').map((c) => c + c).join('') : hex, 16);
+            const bg = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+            return (px, i) => (px[i + 3] === 0 ? 0 : Math.abs(px[i] - bg[0]) + Math.abs(px[i + 1] - bg[1]) + Math.abs(px[i + 2] - bg[2]));
+        };
+        /** Mean ink of rows [r0, r1) (fractions of the height). */
         window.rowsBrightness = (canvas, r0, r1) => {
             const { width, height } = canvas;
             const px = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+            const ink = spectrogramInk(canvas);
             let s = 0, n = 0;
-            for (let y = Math.floor(r0 * height); y < Math.floor(r1 * height); y += 1) for (let x = 0; x < width; x += 1) { const i = (y * width + x) * 4; s += px[i] + px[i + 1] + px[i + 2]; n += 1; }
+            for (let y = Math.floor(r0 * height); y < Math.floor(r1 * height); y += 1) for (let x = 0; x < width; x += 1) { s += ink(px, (y * width + x) * 4); n += 1; }
             return s / Math.max(1, n);
         };
         /** A tone at `hz` as a whole clip. */
@@ -206,20 +217,93 @@ test('a plugin whose processor throws is bypassed, reported, and playback goes o
     expect(r.rms).toBeGreaterThan(0.02);
 });
 
-test('volume is the fader after the effects: smoothed, and it does not change the compression', async ({ page }) => {
+test('input gain drives the compressor; output gain comes after it', async ({ page }) => {
     const r = await page.evaluate(async () => {
         const { player } = mk();
         await player.play(toneBuffer(440));
         player.setCompression(1);
         await h.sleep(400);
-        const full = h.rms(player);
-        player.setVolume(0.5);
+        const base = h.rms(player);
+        // +12 dB into the compressor comes out at much less than +12 dB.
+        player.setInputGain(12);
+        await h.sleep(500);
+        const inBoost = h.rms(player);
+        player.setInputGain(0);
+        await h.sleep(500);
+        // -6 dB after the compressor is exactly -6 dB.
+        player.setOutputGain(-6);
         await h.sleep(300);
-        const half = h.rms(player);
+        const outCut = h.rms(player);
+        const p = player.getState().processing;
         player.dispose();
-        return { ratio: half / full };
+        return { inRatio: inBoost / base, outRatio: outCut / base, inputGainDb: p.inputGainDb, outputGainDb: p.outputGainDb };
     });
-    // Post-insert fader: exactly half, whatever the compressor does.
-    expect(r.ratio).toBeGreaterThan(0.47);
-    expect(r.ratio).toBeLessThan(0.53);
+    expect(r.inRatio).toBeGreaterThan(1.05);
+    expect(r.inRatio).toBeLessThan(3); // +12 dB would be 3.98
+    expect(r.outRatio).toBeGreaterThan(0.48);
+    expect(r.outRatio).toBeLessThan(0.52);
+    expect(r.inputGainDb).toBe(0);
+    expect(r.outputGainDb).toBe(-6);
 });
+
+test('the ceiling is the last stage: +24 dB output with a boosting plugin never passes -0.01 dBFS', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const { player } = mk();
+        const loud = new AudioBuffer({ length: 48000 * 4, sampleRate: 48000, numberOfChannels: 1 });
+        const d = loud.getChannelData(0);
+        for (let i = 0; i < d.length; i += 1) d[i] = 0.8 * Math.sin(2 * Math.PI * 120 * i / 48000);
+        await player.play(loud);
+        player.effects.add(eq, { params: { low: 12 } });
+        player.setInputGain(12);
+        player.setOutputGain(24);
+        await h.sleep(800);
+        const a = player.analyser;
+        const buf = new Float32Array(a.fftSize);
+        let peak = 0;
+        for (let k = 0; k < 20; k += 1) {
+            a.getFloatTimeDomainData(buf);
+            for (const v of buf) peak = Math.max(peak, Math.abs(v));
+            await h.sleep(30);
+        }
+        player.dispose();
+        return { peak };
+    });
+    expect(r.peak).toBeGreaterThan(0.99);
+    expect(r.peak).toBeLessThanOrEqual(Math.pow(10, -0.01 / 20) + 1e-6);
+});
+
+for (const kind of ['buffer', 'segmented']) {
+    test(`input and output gain show on the waveform and the spectrogram (${kind})`, async ({ page }) => {
+        const r = await page.evaluate(async (kind) => {
+            const wave = mk({ processing: { highPassHz: 0, compression: 0 } });
+            const spec = (() => {
+                const box = wave.box.parentElement.appendChild(document.createElement('div'));
+                box.style.height = '160px';
+                h.createTimeline(box, wave.player, { display: 'spectrogram', ruler: false });
+                return box;
+            })();
+            const { player, box } = wave;
+            await player.load(kind === 'buffer' ? { src: `${longBase}/mono30.wav` } : { manifest: `${longBase}/mono30/manifest.json` });
+            const canvas = spec.querySelector('canvas.rtd-spectrogram');
+            await until(() => rowsBrightness(canvas, 0, 1) > 30);
+            await h.sleep(900);
+            const wave0 = snap(box, '.rtd-wave');
+            const bright0 = rowsBrightness(canvas, 0, 1);
+            player.setOutputGain(-18);
+            await h.sleep(900);
+            const waveOut = snap(box, '.rtd-wave');
+            const brightOut = rowsBrightness(canvas, 0, 1);
+            player.setOutputGain(0);
+            player.setInputGain(-18);
+            await h.sleep(900);
+            const waveIn = snap(box, '.rtd-wave');
+            const brightIn = rowsBrightness(canvas, 0, 1);
+            player.dispose();
+            return { outChange: diff(wave0, waveOut), inChange: diff(wave0, waveIn), bright0, brightOut, brightIn };
+        }, kind);
+        expect(r.outChange).toBeGreaterThan(0.01);
+        expect(r.inChange).toBeGreaterThan(0.01);
+        expect(r.brightOut).toBeLessThan(r.bright0 * 0.9);
+        expect(r.brightIn).toBeLessThan(r.bright0 * 0.9);
+    });
+}

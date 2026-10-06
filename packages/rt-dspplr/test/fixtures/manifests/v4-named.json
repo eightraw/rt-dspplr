@@ -1,0 +1,511 @@
+{
+ "format": "rtd-audio-manifest",
+ "formatVersion": 4,
+ "analyzerVersion": "2.0.0",
+ "revision": 1,
+ "id": "sha256:ba79cdb3822214434540befc8885164388dc5be9c4cdc0d514d6e0542624cc75",
+ "createdAt": "2026-10-06T21:07:51.484Z",
+ "duration": 20,
+ "sampleRate": 48000,
+ "sourceSampleRate": 48000,
+ "channels": 1,
+ "frames": 960000,
+ "source": {
+  "name": "pairA.wav",
+  "bytes": 1920044,
+  "encoding": "pcm-int",
+  "bitsPerSample": 16,
+  "frames": 960000
+ },
+ "segments": {
+  "framesPerSegment": 192000,
+  "source": {
+   "url": "source.wav",
+   "bytes": 1920044,
+   "codec": "wav",
+   "sampleRate": 48000,
+   "channels": 1,
+   "pcm": {
+    "encoding": "int",
+    "bitsPerSample": 16,
+    "blockAlign": 2
+   }
+  },
+  "list": [
+   {
+    "index": 0,
+    "startFrame": 0,
+    "frames": 192000,
+    "range": [
+     44,
+     384044
+    ],
+    "tail": 192000
+   },
+   {
+    "index": 1,
+    "startFrame": 192000,
+    "frames": 192000,
+    "range": [
+     384044,
+     768044
+    ],
+    "tail": 192000
+   },
+   {
+    "index": 2,
+    "startFrame": 384000,
+    "frames": 192000,
+    "range": [
+     768044,
+     1152044
+    ],
+    "tail": 192000
+   },
+   {
+    "index": 3,
+    "startFrame": 576000,
+    "frames": 192000,
+    "range": [
+     1152044,
+     1536044
+    ],
+    "tail": 192000
+   },
+   {
+    "index": 4,
+    "startFrame": 768000,
+    "frames": 192000,
+    "range": [
+     1536044,
+     1920044
+    ],
+    "tail": 192000
+   }
+  ]
+ },
+ "peaks": {
+  "url": "peaks.bin",
+  "bytes": 25384,
+  "format": "rtd-peaks",
+  "version": 1,
+  "encoding": "int16-min-max-rms",
+  "levels": [
+   {
+    "framesPerPeak": 256,
+    "peaks": 3750,
+    "byteOffset": 2880,
+    "byteLength": 22500
+   },
+   {
+    "framesPerPeak": 2048,
+    "peaks": 469,
+    "byteOffset": 64,
+    "byteLength": 2814
+   }
+  ]
+ },
+ "loudness": {
+  "peak": 0.397308,
+  "peakDb": -8.02,
+  "rmsDb": -20,
+  "gatedRmsDb": -20,
+  "perChannel": [
+   {
+    "peakDb": -8.02,
+    "rmsDb": -20
+   }
+  ]
+ },
+ "bands": {
+  "url": "bands.bin",
+  "bytes": 10382,
+  "format": "rtd-bands",
+  "version": 1,
+  "framesPerBin": 2048,
+  "bins": 469,
+  "cutoffsHz": [
+   25,
+   35,
+   50,
+   71,
+   100,
+   141,
+   200,
+   283,
+   400,
+   566
+  ]
+ },
+ "spectrogram": {
+  "url": "spectrogram.bin",
+  "bytes": 30144,
+  "format": "rtd-spectrogram",
+  "version": 1,
+  "rows": 128,
+  "minHz": 30,
+  "maxHz": 16000,
+  "topDb": 60,
+  "rangeDb": 120,
+  "levels": [
+   {
+    "framesPerColumn": 4096,
+    "columns": 235,
+    "byteOffset": 64,
+    "byteLength": 30080
+   }
+  ]
+ },
+ "stems": {
+  "b": {
+   "status": "ready",
+   "label": "Noise reduction",
+   "updatedAt": "2026-10-06T21:07:51.702Z",
+   "aSourceId": "sha256:ba79cdb3822214434540befc8885164388dc5be9c4cdc0d514d6e0542624cc75",
+   "id": "sha256:f7f2015f0d83a4288432b7c18ccc0a08347eac8448937718a341d4ecfdb6b05e",
+   "source": {
+    "name": "pairB0.wav",
+    "bytes": 1920044,
+    "sampleRate": 48000,
+    "channels": 1,
+    "frames": 960000,
+    "bandwidthHz": 24000
+   },
+   "alignment": {
+    "offsetFrames": 1776,
+    "offsetMs": 37,
+    "confidence": 1,
+    "windows": 8,
+    "agreeing": 8
+   },
+   "correlation": {
+    "global": 0.999,
+    "perSegment": [
+     1,
+     1,
+     1,
+     1,
+     0.995
+    ]
+   },
+   "mixLaw": "crossfade",
+   "loudnessDeltaDb": -0.01,
+   "gainDb": 0,
+   "loudness": {
+    "peak": 0.397308,
+    "peakDb": -8.02,
+    "rmsDb": -20.01,
+    "gatedRmsDb": -20.01,
+    "perChannel": [
+     {
+      "peakDb": -8.02,
+      "rmsDb": -20.01
+     }
+    ]
+   },
+   "segments": {
+    "framesPerSegment": 192000,
+    "source": {
+     "url": "b/r1/source.wav",
+     "bytes": 1920044,
+     "codec": "wav",
+     "sampleRate": 48000,
+     "channels": 1,
+     "pcm": {
+      "encoding": "int",
+      "bitsPerSample": 16,
+      "blockAlign": 2
+     }
+    },
+    "list": [
+     {
+      "index": 0,
+      "startFrame": 0,
+      "frames": 192000,
+      "range": [
+       3596,
+       387596
+      ],
+      "tail": 192000
+     },
+     {
+      "index": 1,
+      "startFrame": 192000,
+      "frames": 192000,
+      "range": [
+       387596,
+       771596
+      ],
+      "tail": 192000
+     },
+     {
+      "index": 2,
+      "startFrame": 384000,
+      "frames": 192000,
+      "range": [
+       771596,
+       1155596
+      ],
+      "tail": 192000
+     },
+     {
+      "index": 3,
+      "startFrame": 576000,
+      "frames": 192000,
+      "range": [
+       1155596,
+       1539596
+      ],
+      "tail": 192000
+     },
+     {
+      "index": 4,
+      "startFrame": 768000,
+      "frames": 192000,
+      "range": [
+       1539596,
+       1920044
+      ],
+      "tail": 190224,
+      "trail": 1776
+     }
+    ]
+   },
+   "peaks": {
+    "url": "b/r1/peaks.bin",
+    "bytes": 25384,
+    "format": "rtd-peaks",
+    "version": 1,
+    "encoding": "int16-min-max-rms",
+    "levels": [
+     {
+      "framesPerPeak": 256,
+      "peaks": 3750,
+      "byteOffset": 2880,
+      "byteLength": 22500
+     },
+     {
+      "framesPerPeak": 2048,
+      "peaks": 469,
+      "byteOffset": 64,
+      "byteLength": 2814
+     }
+    ]
+   },
+   "bands": {
+    "url": "b/r1/bands.bin",
+    "bytes": 10382,
+    "format": "rtd-bands",
+    "version": 1,
+    "framesPerBin": 2048,
+    "bins": 469,
+    "cutoffsHz": [
+     25,
+     35,
+     50,
+     71,
+     100,
+     141,
+     200,
+     283,
+     400,
+     566
+    ]
+   },
+   "spectrogram": {
+    "url": "b/r1/spectrogram.bin",
+    "bytes": 30144,
+    "format": "rtd-spectrogram",
+    "version": 1,
+    "rows": 128,
+    "minHz": 30,
+    "maxHz": 16000,
+    "topDb": 60,
+    "rangeDb": 120,
+    "levels": [
+     {
+      "framesPerColumn": 4096,
+      "columns": 235,
+      "byteOffset": 64,
+      "byteLength": 30080
+     }
+    ]
+   }
+  },
+  "v1": {
+   "status": "ready",
+   "label": "Voice conversion",
+   "updatedAt": "2026-10-06T21:07:51.703Z",
+   "aSourceId": "sha256:ba79cdb3822214434540befc8885164388dc5be9c4cdc0d514d6e0542624cc75",
+   "id": "sha256:98733c4921a57d33e326d2dfc44823b8b90f01ebac4d5a9abd108ce140d9d788",
+   "source": {
+    "name": "pairB6.wav",
+    "bytes": 1920044,
+    "sampleRate": 48000,
+    "channels": 1,
+    "frames": 960000,
+    "bandwidthHz": 24000
+   },
+   "alignment": {
+    "offsetFrames": 1776,
+    "offsetMs": 37,
+    "confidence": 1,
+    "windows": 8,
+    "agreeing": 8
+   },
+   "correlation": {
+    "global": 0.999,
+    "perSegment": [
+     1,
+     1,
+     1,
+     1,
+     0.995
+    ]
+   },
+   "mixLaw": "crossfade",
+   "loudnessDeltaDb": -6.03,
+   "gainDb": 0,
+   "loudness": {
+    "peak": 0.198669,
+    "peakDb": -14.04,
+    "rmsDb": -26.03,
+    "gatedRmsDb": -26.03,
+    "perChannel": [
+     {
+      "peakDb": -14.04,
+      "rmsDb": -26.03
+     }
+    ]
+   },
+   "segments": {
+    "framesPerSegment": 192000,
+    "source": {
+     "url": "v1/r1/source.wav",
+     "bytes": 1920044,
+     "codec": "wav",
+     "sampleRate": 48000,
+     "channels": 1,
+     "pcm": {
+      "encoding": "int",
+      "bitsPerSample": 16,
+      "blockAlign": 2
+     }
+    },
+    "list": [
+     {
+      "index": 0,
+      "startFrame": 0,
+      "frames": 192000,
+      "range": [
+       3596,
+       387596
+      ],
+      "tail": 192000
+     },
+     {
+      "index": 1,
+      "startFrame": 192000,
+      "frames": 192000,
+      "range": [
+       387596,
+       771596
+      ],
+      "tail": 192000
+     },
+     {
+      "index": 2,
+      "startFrame": 384000,
+      "frames": 192000,
+      "range": [
+       771596,
+       1155596
+      ],
+      "tail": 192000
+     },
+     {
+      "index": 3,
+      "startFrame": 576000,
+      "frames": 192000,
+      "range": [
+       1155596,
+       1539596
+      ],
+      "tail": 192000
+     },
+     {
+      "index": 4,
+      "startFrame": 768000,
+      "frames": 192000,
+      "range": [
+       1539596,
+       1920044
+      ],
+      "tail": 190224,
+      "trail": 1776
+     }
+    ]
+   },
+   "peaks": {
+    "url": "v1/r1/peaks.bin",
+    "bytes": 25384,
+    "format": "rtd-peaks",
+    "version": 1,
+    "encoding": "int16-min-max-rms",
+    "levels": [
+     {
+      "framesPerPeak": 256,
+      "peaks": 3750,
+      "byteOffset": 2880,
+      "byteLength": 22500
+     },
+     {
+      "framesPerPeak": 2048,
+      "peaks": 469,
+      "byteOffset": 64,
+      "byteLength": 2814
+     }
+    ]
+   },
+   "bands": {
+    "url": "v1/r1/bands.bin",
+    "bytes": 10382,
+    "format": "rtd-bands",
+    "version": 1,
+    "framesPerBin": 2048,
+    "bins": 469,
+    "cutoffsHz": [
+     25,
+     35,
+     50,
+     71,
+     100,
+     141,
+     200,
+     283,
+     400,
+     566
+    ]
+   },
+   "spectrogram": {
+    "url": "v1/r1/spectrogram.bin",
+    "bytes": 30144,
+    "format": "rtd-spectrogram",
+    "version": 1,
+    "rows": 128,
+    "minHz": 30,
+    "maxHz": 16000,
+    "topDb": 60,
+    "rangeDb": 120,
+    "levels": [
+     {
+      "framesPerColumn": 4096,
+      "columns": 235,
+      "byteOffset": 64,
+      "byteLength": 30080
+     }
+    ]
+   }
+  }
+ }
+}

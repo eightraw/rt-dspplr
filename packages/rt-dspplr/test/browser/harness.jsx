@@ -10,6 +10,12 @@ import { StrictMode, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import '../../dist/styles.css';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+/** A prepared WAV clip's segments, planar: their ranges of the source, cut out as the player does. */
+async function preparedSegments(base, manifest) {
+    const src = manifest.segments.source;
+    const bytes = new Uint8Array(await (await fetch(`${base}/${src.url}`)).arrayBuffer());
+    return manifest.segments.list.map((s) => format.segmentFromRun(s.range ? format.decodePcmRun(bytes.subarray(s.range[0], s.range[1]), src) : null, s, manifest.channels));
+}
 const buffer = (seconds = 8, frequency = 440) => {
     const b = new AudioBuffer({ length: Math.round(seconds * 48000), sampleRate: 48000, numberOfChannels: 1 });
     const data = b.getChannelData(0);
@@ -72,7 +78,7 @@ function CardPage({ clip, options }) {
     useEffect(() => { window.cardPlayer = player.player; void player.load(clip); }, [player.player, clip]);
     return <div style={{ width: 720 }}><AudioPlayer player={player} title="Card" /></div>;
 }
-window.h = { ...api, advanced, format, internals: { StreamEngine, loadStreamEngine, stretchAvailable, SegmentScheduler, applyDspToSpectrogram }, sleep, buffer, wav, slowBlob, delayedStrategy, make, rms,
+window.h = { ...api, advanced, format, internals: { StreamEngine, loadStreamEngine, stretchAvailable, SegmentScheduler, applyDspToSpectrogram }, preparedSegments, sleep, buffer, wav, slowBlob, delayedStrategy, make, rms,
     mountMenu(layout, options) { const root = createRoot(document.getElementById('root')); root.render(<AudioPlayer layout={layout} title="Example" options={options} />); return root; },
     renderMenu(root, layout) { root.render(<AudioPlayer layout={layout} title="Example" />); },
     mountCustom() { const root = createRoot(document.getElementById('root')); root.render(<StrictMode><CustomPlayer /></StrictMode>); return root; },

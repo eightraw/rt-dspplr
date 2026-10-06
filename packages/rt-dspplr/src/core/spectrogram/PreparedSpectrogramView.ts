@@ -3,7 +3,8 @@ import { mixGains } from '../controls';
 import { SpectrogramAnalyzer, type SpectrogramData } from './SpectrogramAnalyzer';
 import type { SpectralPyramid } from './protocol';
 import { sampleSpectralPyramid } from './sample';
-import { DEFAULT_SPECTROGRAM_PALETTE, paintSpectrogram } from './paint';
+import { paintSpectrogram, spectrogramBackground, type SpectrogramPalette } from './paint';
+import { resolvePalette, themePalette } from './themePalette';
 import { chooseFft, type SpectrogramOptions, type SpectrogramView } from './SpectrogramView';
 import { applyDspToSpectrogram } from './dspPaint';
 import { previewSettings } from '../effects/preview';
@@ -68,10 +69,13 @@ export function createPreparedSpectrogram(
         schedulePaint();
     });
 
+    // The theme's palette, read once and again after refreshColors(); options.palette wins.
+    let themed: SpectrogramPalette | null = null;
     function look() {
+        themed ??= themePalette(canvas);
         return {
             colorMode: options.colorMode ?? 'single',
-            palette: { ...DEFAULT_SPECTROGRAM_PALETTE, ...options.palette },
+            palette: resolvePalette(themed, options.palette),
             floorDb: options.floorDb ?? 66,
         };
     }
@@ -125,9 +129,13 @@ export function createPreparedSpectrogram(
         const context = canvas.getContext('2d');
         if (!context || disposed) return;
         const current = look();
-        context.fillStyle = current.palette.background;
+        if (!pyramid) {
+            // Nothing of the clip yet: no panel either (the card's empty state shows through).
+            context.clearRect(0, 0, canvas.width, canvas.height);
+            return;
+        }
+        context.fillStyle = spectrogramBackground(current.palette);
         context.fillRect(0, 0, canvas.width, canvas.height);
-        if (!pyramid) return;
         const w = view();
         const width = canvas.width;
         const key = `${w.start}|${w.end}|${width}`;
@@ -218,6 +226,10 @@ export function createPreparedSpectrogram(
             options = next;
             asked = '';
             request();
+            schedulePaint();
+        },
+        refreshColors() {
+            themed = null;
             schedulePaint();
         },
         dispose() {
