@@ -13,8 +13,11 @@ export type PreviewStage =
     | { kind: 'process'; id: string; code: string; params: PluginParams; /** measure its level change for the spectrogram */ level: boolean };
 
 export interface PreviewSettings {
+    /** Before all processing. */
+    inputGainDb: number;
     highPassHz: number;
     compression: number;
+    /** After all processing, before the ceiling. */
     outputGainDb: number;
     /** Sample-level stages in chain order, when a third-party effect has a process() preview. */
     stages: PreviewStage[] | null;
@@ -60,13 +63,15 @@ export function previewSettings(state: AudioPlayerState): PreviewSettings {
     }
     const lti = third.filter((e) => e.plugin.preview?.magnitudeResponse).map((e) => ({ plugin: e.plugin, params: e.params }));
     const settings = {
+        inputGainDb: state.processing.inputGainDb,
         highPassHz: hp ? hp.params.hz : 0,
         compression: dyn ? dyn.params.amount : 0,
-        outputGainDb: dyn ? dyn.params.outputGainDb : 0,
+        outputGainDb: state.processing.outputGainDb,
         stages,
         lti,
     };
-    const key = JSON.stringify([settings.highPassHz, settings.compression, settings.outputGainDb,
+    // The output gain is left out: a gain track is rescaled for it without a recompute.
+    const key = JSON.stringify([settings.inputGainDb, settings.highPassHz, settings.compression,
         third.map((e) => [e.id, e.plugin.id, e.params])]);
     return { ...settings, key };
 }

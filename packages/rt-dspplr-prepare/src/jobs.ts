@@ -1,6 +1,12 @@
 import { designResampler, resampleRange, type ResamplerOptions } from './resampler';
+import { runCorrelate, type CorrelateJob, type CorrelateResult } from './correlate';
 import { quantizePeak } from './analysis';
 import { BandEnergyAnalyzer, OverviewSpectrogramAnalyzer } from './overviewAnalysis';
+import { installSpectralBackend } from './wasm/spectral';
+import { wasmPeaksStereo } from './wasm/kernels';
+
+// The spectrogram's FFT on pffft, here and in every worker (this module is the jobs' code in both).
+installSpectralBackend();
 
 // ---------------------------------------------------------------------------
 // The analyses of prepare (peaks, band energies, overview spectrogram) cut
@@ -55,6 +61,61 @@ export function jobFrames(framesPerPeak: number, bandBin: number, hop: number): 
     return lcm * Math.max(1, Math.ceil(614400 / lcm));
 }
 
+/** One channel's finest peaks (min, max, Σx² per bin); returns its peak |x|. */
+function peakBins(x: Float32Array, warmup: number, frames: number, fpp: number, bins: number, min: Int16Array, max: Int16Array, sumSq: Float64Array, binFrames: Float64Array): number {
+    let p = 0;
+    for (let b = 0; b < bins; b += 1) {
+        const from = warmup + b * fpp;
+        const to = Math.min(warmup + frames, from + fpp);
+        let lo = Infinity;
+        let hi = -Infinity;
+        let sq = 0;
+        for (let i = from; i < to; i += 1) {
+            const v = x[i];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+            sq += v * v;
+        }
+        min[b] = quantizePeak(lo);
+        max[b] = quantizePeak(hi);
+        sumSq[b] = sq;
+        binFrames[b] = to - from;
+        const a = Math.max(-lo, hi);
+        if (a > p) p = a;
+    }
+    return p;
+}
+
+/** peakBins()'s outputs for two channels from wasmPeaksStereo()'s lanes (lo, hi, Σx² per bin, each l then r). */
+function peaksFromLanes(v: Float64Array, frames: number, fpp: number, bins: number, min: Int16Array[], max: Int16Array[], sumSq: Float64Array[], binFrames: Float64Array, peak: number[]): void {
+    for (let b = 0; b < bins; b += 1) {
+        const o = 6 * b;
+        for (let c = 0; c < 2; c += 1) {
+            const lo = v[o + c];
+            const hi = v[o + 2 + c];
+            min[c][b] = quantizePeak(lo);
+            max[c][b] = quantizePeak(hi);
+            sumSq[c][b] = v[o + 4 + c];
+            const a = Math.max(-lo, hi);
+            if (a > peak[c]) peak[c] = a;
+        }
+        binFrames[b] = Math.min(frames, (b + 1) * fpp) - b * fpp;
+    }
+}
+
+/**
+ * channels[from, to) into an analyzer in chunks of PUSH_CHUNK frames. Both analyzers are
+ * chunk-invariant (their sums see the samples in the same order), and a chunk keeps their
+ * scratch buffers small and in cache instead of job-sized (2 × 4.9 MB of Float64 per job).
+ */
+const PUSH_CHUNK = 16384;
+function pushChunked(analyzer: { push(block: Float32Array[]): void }, channels: Float32Array[], from: number, to: number): void {
+    for (let o = from; o < to; o += PUSH_CHUNK) {
+        const e = Math.min(to, o + PUSH_CHUNK);
+        analyzer.push(channels.map((x) => x.subarray(o, e)));
+    }
+}
+
 export function analyzeJob(job: JobSpec): JobResult {
     const { channels, warmup, frames, framesPerPeak: fpp } = job;
     const C = channels.length;
@@ -65,30 +126,10 @@ export function analyzeJob(job: JobSpec): JobResult {
     const sumSq = Array.from({ length: C }, () => new Float64Array(bins));
     const binFrames = new Float64Array(bins);
     const peak = new Array<number>(C).fill(0);
-    for (let c = 0; c < C; c += 1) {
-        const x = channels[c];
-        let p = 0;
-        for (let b = 0; b < bins; b += 1) {
-            const from = warmup + b * fpp;
-            const to = Math.min(warmup + frames, from + fpp);
-            let lo = Infinity;
-            let hi = -Infinity;
-            let sq = 0;
-            for (let i = from; i < to; i += 1) {
-                const v = x[i];
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
-                sq += v * v;
-            }
-            min[c][b] = quantizePeak(lo);
-            max[c][b] = quantizePeak(hi);
-            sumSq[c][b] = sq;
-            binFrames[b] = to - from;
-            const a = Math.max(-lo, hi);
-            if (a > p) p = a;
-        }
-        peak[c] = p;
-    }
+    // Two channels in WebAssembly (both at once, the same numbers), else channel by channel.
+    const both = C === 2 ? wasmPeaksStereo(channels[0].subarray(warmup), channels[1].subarray(warmup), frames, fpp) : null;
+    if (both) peaksFromLanes(both, frames, fpp, bins, min, max, sumSq, binFrames, peak);
+    else for (let c = 0; c < C; c += 1) peak[c] = peakBins(channels[c], warmup, frames, fpp, bins, min[c], max[c], sumSq[c], binFrames);
 
     // ---- band energies ----------------------------------------------------------------
     let bands: JobResult['bands'] = null;
@@ -96,10 +137,10 @@ export function analyzeJob(job: JobSpec): JobResult {
         const analyzer = new BandEnergyAnalyzer(C, job.sampleRate, undefined, undefined, frames);
         analyzer.setFramePosition(job.startFrame - warmup);
         if (warmup > 0) {
-            analyzer.push(channels.map((x) => x.subarray(0, warmup)));
+            pushChunked(analyzer, channels, 0, warmup);
             analyzer.startMeasuring();
         }
-        analyzer.push(channels.map((x) => x.subarray(warmup, warmup + frames)));
+        pushChunked(analyzer, channels, warmup, warmup + frames);
         const file = analyzer.finish();
         bands = { meanSquares: file.meanSquares, bins: file.bins, cutoffs: file.cutoffs, framesPerBin: file.framesPerBin };
     }
@@ -108,7 +149,7 @@ export function analyzeJob(job: JobSpec): JobResult {
     let spectrogram: JobResult['spectrogram'] = null;
     if (job.spectrogram) {
         const analyzer = new OverviewSpectrogramAnalyzer(C, job.sampleRate, {}, frames);
-        analyzer.push(channels.map((x) => x.subarray(warmup, warmup + frames)));
+        pushChunked(analyzer, channels, warmup, warmup + frames);
         const file = analyzer.finish();
         const level = file.levels[0];
         spectrogram = {
@@ -161,8 +202,8 @@ export interface ResampleResult {
     channels: Float32Array[];
 }
 
-export type AnyJob = JobSpec | ResampleJob;
-export type AnyResult = JobResult | ResampleResult;
+export type AnyJob = JobSpec | ResampleJob | CorrelateJob;
+export type AnyResult = JobResult | ResampleResult | CorrelateResult;
 
 const designs = new Map<string, ReturnType<typeof designResampler>>();
 
@@ -177,6 +218,7 @@ export function resamplerDesign(from: number, to: number, options?: ResamplerOpt
 }
 
 export function runJob(job: AnyJob): AnyResult {
+    if ((job as CorrelateJob).kind === 'correlate') return runCorrelate(job as CorrelateJob);
     if ((job as ResampleJob).kind === 'resample') {
         const r = job as ResampleJob;
         return { kind: 'resample', index: r.index, channels: resampleRange(resamplerDesign(r.from, r.to, r.options), r.channels, r.xStart, r.inFrames, r.n0, r.n1) };
@@ -184,7 +226,14 @@ export function runJob(job: AnyJob): AnyResult {
     return analyzeJob(job as JobSpec);
 }
 
+/** What a job hands over to its worker: its channels (a correlate job's windows are copied, they are small). */
+export function jobTransfers(job: AnyJob): ArrayBuffer[] {
+    if ((job as CorrelateJob).kind === 'correlate') return [];
+    return (job as JobSpec | ResampleJob).channels.map((c) => c.buffer as ArrayBuffer);
+}
+
 export function anyResultTransfers(r: AnyResult): ArrayBuffer[] {
+    if ((r as CorrelateResult).kind === 'correlate') return [(r as CorrelateResult).power.buffer as ArrayBuffer];
     if ((r as ResampleResult).kind === 'resample') return (r as ResampleResult).channels.map((c) => c.buffer as ArrayBuffer);
     return resultTransfers(r as JobResult);
 }

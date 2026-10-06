@@ -1,11 +1,10 @@
 import type { AudioPlayerCore } from '../AudioPlayer';
 
 /**
- * What the timeline needs from a player: the classic AudioPlayerCore, or any
- * player with the same transport surface (the stream player).
+ * The player a timeline follows: an AudioPlayerCore (whole clips and prepared
+ * clips alike). Only the player's own core, which carries the author credit.
  */
-export type TimelinePlayer = Pick<AudioPlayerCore, 'getState' | 'subscribe' | 'getCurrentTime' | 'seek' | 'setLoop'>
-    & Partial<Pick<AudioPlayerCore, 'on' | 'setView' | 'getWindowAudio'>>;
+export type TimelinePlayer = AudioPlayerCore;
 import type { LoopRange } from '../engine';
 import { createSpectrogram, type SpectrogramOptions, type SpectrogramView } from '../spectrogram/SpectrogramView';
 import type { WaveformPeakPyramid } from '../waveform/pyramid';
@@ -84,7 +83,7 @@ export interface TimelineCoreInput {
     ruler: boolean;
     /**
      * Told the visible range (seconds) and the track's width (CSS px) whenever
-     * either changes. The stream player uses it to refine deep zooms.
+     * either changes. A prepared clip uses it to refine deep zooms.
      */
     onView?: (startSeconds: number, endSeconds: number, widthPx: number) => void;
 }
@@ -313,6 +312,7 @@ export class TimelineCore {
 
     /** Redraw with the current colours, after a theme change. */
     refreshColors(): void {
+        this._spectro?.refreshColors();
         this._draw();
     }
 

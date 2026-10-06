@@ -21,7 +21,10 @@ export interface AudioEngineOptions {
     latencyHint?: AudioContextLatencyCategory | number;
 }
 
+/** The rate used when the device's is neither 44.1 nor 48 kHz (and before a context exists). */
 const DEFAULT_SAMPLE_RATE = 48000;
+/** Device rates the context keeps: the output then needs no resampling. */
+const DEVICE_RATES = [44100, 48000];
 
 class AudioEngine {
     private static instance: AudioEngine | null = null;
@@ -172,8 +175,16 @@ class AudioEngine {
             return false;
         }
 
-        const sampleRate = options?.sampleRate ?? DEFAULT_SAMPLE_RATE;
-        this._context = new AudioContextCtor({ sampleRate, latencyHint: options?.latencyHint ?? 'playback' });
+        // The device's own rate when it is 44.1 or 48 kHz (no resampling at the output);
+        // otherwise (a 96 kHz interface, a 16 kHz headset) 48 kHz, which bounds the work
+        // per second. A clip at another rate is converted by the player (see StreamEngine).
+        const latencyHint = options?.latencyHint ?? 'playback';
+        let context = options?.sampleRate ? new AudioContextCtor({ sampleRate: options.sampleRate, latencyHint }) : new AudioContextCtor({ latencyHint });
+        if (!options?.sampleRate && !DEVICE_RATES.includes(context.sampleRate)) {
+            void context.close().catch(() => undefined);
+            context = new AudioContextCtor({ sampleRate: DEFAULT_SAMPLE_RATE, latencyHint });
+        }
+        this._context = context;
 
         // Register dynamics worklet
         this._workletAvailable = await this._loadWorklet();

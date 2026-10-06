@@ -8,7 +8,7 @@ const rootDir = path.dirname(fileURLToPath(import.meta.url));
 const version = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8')).version as string;
 
 /** Modules of the "./format" entry: pure code, no DOM / worker / Node APIs (check-dist verifies). */
-const FORMAT_MODULES = /[\\/]src[\\/]core[\\/](stream[\\/](manifest|peaksFile|bandsFile|spectrogramFile|wavFormat)|spectrogram[\\/]spectral|dsp[\\/]highPass)\.ts$/;
+const FORMAT_MODULES = /[\\/]src[\\/]core[\\/](stream[\\/](manifest|peaksFile|bandsFile|spectrogramFile|wavFormat|sourceRuns)|spectrogram[\\/]spectral|dsp[\\/]highPass)\.ts$/;
 
 // Library build for the ".", "./react", "./advanced" and "./format" entries. The optional
 // "./stretch-rubberband" entry is built separately by build/build-rubberband.mjs

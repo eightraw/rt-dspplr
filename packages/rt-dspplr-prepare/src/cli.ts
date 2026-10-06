@@ -1,10 +1,10 @@
-import { ffmpegDecoder, prepareAudio, type PrepareOptions, type StemSpec } from './index';
+import { checkFramesPerPeak, ffmpegDecoder, prepareAudio, type PrepareOptions, type StemSpec } from './index';
 
-// rtd-prepare <input.wav> <outDir> [--segment 10] [--rate 48000|auto|keep] [--peak 256] [--concurrency N]
+// rtd-prepare <input> <outDir> [--segment 10] [--peak 256 (a power of two, 16-65536)] [--concurrency N]
 //             [--stem <key>=<file.wav>]... [--label <key>=<text>]... [--quiet]
-//             [--decoder ffmpeg | docker:<image>]   (experimental: non-WAV input through ffmpeg)
+//             [--decoder ffmpeg | docker:<image>]   (experimental: formats other than WAV, MP3, Opus and FLAC through ffmpeg)
 
-const USAGE = 'usage: rtd-prepare <input.wav> <outDir> [--segment <seconds>] [--rate <hz>|auto|keep] [--peak <framesPerPeak>] [--concurrency <threads>] '
+const USAGE = 'usage: rtd-prepare <input> <outDir> [--segment <seconds>] [--peak <framesPerPeak>] [--concurrency <threads>] '
     + '[--stem <key>=<file>]... [--label <key>=<text>]... [--decoder ffmpeg|docker:<image>] [--quiet]';
 
 /** `key=value` → [key, value]; the value may contain '='. */
@@ -44,18 +44,25 @@ export async function main(argv: string[]): Promise<number> {
         return flags.help ? 0 : 2;
     }
     const [input, outDir] = positional;
-    const rate = flags.rate === undefined || flags.rate === 'auto' ? 'auto' : flags.rate === 'keep' ? 'keep' : Number(flags.rate);
+    let framesPerPeak: number | undefined;
+    if (flags.peak !== undefined) {
+        try {
+            framesPerPeak = checkFramesPerPeak(/^\d+$/.test(flags.peak) ? Number(flags.peak) : flags.peak);
+        } catch (error) {
+            console.error(`rtd-prepare: --peak: ${error instanceof Error ? error.message : String(error)}\n${USAGE}`);
+            return 2;
+        }
+    }
     const options: PrepareOptions = {
         outDir,
         segmentSeconds: flags.segment ? Number(flags.segment) : undefined,
-        targetRate: rate as PrepareOptions['targetRate'],
-        framesPerPeak: flags.peak ? Number(flags.peak) : undefined,
+        framesPerPeak,
         concurrency: flags.concurrency ? Number(flags.concurrency) : undefined,
         ...(Object.keys(stems).length ? { stems } : {}),
     };
     if (flags.decoder === 'ffmpeg') options.decoder = ffmpegDecoder();
     else if (flags.decoder?.startsWith('docker:')) {
-        options.decoder = ffmpegDecoder({ command: ['docker', 'run', '--rm', '-i', '--network', 'none', flags.decoder.slice(7), 'ffmpeg'] });
+        options.decoder = ffmpegDecoder({ command: ['docker', 'run', '--rm', '-i', '--network', 'none', '--security-opt', 'no-new-privileges', flags.decoder.slice(7), 'ffmpeg'] });
     } else if (flags.decoder) {
         console.error(`unknown --decoder ${flags.decoder}`);
         return 2;
@@ -82,8 +89,8 @@ export async function main(argv: string[]): Promise<number> {
             id: manifest.id,
             duration: manifest.duration,
             sampleRate: manifest.sampleRate,
-            sourceSampleRate: manifest.sourceSampleRate,
             channels: manifest.channels,
+            source: manifest.segments.source.url,
             segments: manifest.segments.list.length,
             peaksBytes: manifest.peaks.bytes,
             outputBytes: job.stats?.outputBytes,

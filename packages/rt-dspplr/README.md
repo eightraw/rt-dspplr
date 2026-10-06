@@ -2,7 +2,8 @@
 
 **Web audio player by SAIT Digital.**
 
-Source and the demo: [github.com/eightraw/rt-dspplr](https://github.com/eightraw/rt-dspplr).
+Documentation, live demo and API reference: [sait.digital/research/rt-dspplr](https://sait.digital/research/rt-dspplr).
+Source: [github.com/eightraw/rt-dspplr](https://github.com/eightraw/rt-dspplr).
 Free to use under a one-page [license](./LICENSE.md), see [Licensing](#licensing).
 
 A web audio player with real-time DSP, pitch-preserving speed controls,
@@ -16,9 +17,9 @@ and played segment by segment with `play({ manifest })`, see
   off the main thread. Playback continues at the applied speed while a new
   variant is prepared, then switches at the live position.
 - **Loop** any range, with boundaries snapped to zero crossings (no clicks).
-- **Real-time DSP chain** on the output: 24 dB/oct high-pass, a peak
-  compressor, output gain, and a -0.01 dBFS ceiling. Everything but the
-  ceiling is off by default. It runs in an AudioWorklet, with native nodes
+- **Real-time DSP chain** on the output: input gain, a 24 dB/oct high-pass,
+  a peak compressor, your own effects, output gain, and a -0.01 dBFS ceiling
+  as the last stage. Everything but the ceiling is off by default. It runs in an AudioWorklet, with native nodes
   as the fallback.
 - **Two-track mixer**: stem B, any second recording on the clip's timeline,
   plays in sync with stem A under one slider: a unity-sum crossfade, or a
@@ -156,7 +157,7 @@ Construction is free. No AudioContext, node, or worker exists until the first
 | `prefetchB` | `boolean` | `false` | Fetch stem B right after load instead of waiting for mix > 0. |
 | `fetchOptions` | `RequestInit` | none | Extra `fetch()` options for URL sources (credentials, headers). |
 | `cacheBudgetBytes` | `number` | 150 MiB | Shared PCM budget for every player on the page, see [Memory](#memory). |
-| `sampleRate` | `number` | `48000` | Sample rate of the shared AudioContext (the first player to start decides). |
+| `sampleRate` | `number` | the device's (44100 or 48000), else 48000 | Sample rate of the shared AudioContext (the first player to start decides). Clips at other rates are converted by the player. |
 | `latencyHint` | `'playback' \| 'interactive' \| 'balanced' \| number` | `'playback'` | Output buffering of the shared AudioContext (the first player to start decides). `'playback'` keeps the sound clean while the page is busy. |
 | `element` | `HTMLElement` | none | The element your interface lives in; same as `mount(element)`. |
 | `infoButton` | `'always' \| 'touch'` | `'always'` | The ⓘ button of the author menu: on every device, or only on devices with a touch screen. See [The author credit](#the-author-credit). |
@@ -180,8 +181,8 @@ source can do is reported in `state.capabilities`.
 | `setLoop({ start, end } \| null)` | In seconds. Snapped to zero crossings. Changing or dropping the loop while playing keeps the position; a loop set behind the playhead starts from its beginning. |
 | `setHighPass(hz)` | `0` bypasses. UI range 0–500 Hz. |
 | `setCompression(amount)` | 0–1. |
-| `setOutputGain(db)` | -24…+24 dB; `-Infinity` mutes. |
-| `setVolume(linear)` | Volume before the post-FX chain (1 = unity), smoothed so a fader move never clicks: a 20 ms ramp in the stream engine for prepared clips, a 5 ms time constant for whole clips. In `state.volume`. |
+| `setInputGain(db)` | Before all processing: it drives the compressor and the effects. -24…+24 dB; `-Infinity` mutes. Smoothed, previewed. |
+| `setOutputGain(db)` | After all processing, before the -0.01 dBFS ceiling. -24…+24 dB; `-Infinity` mutes. Smoothed, previewed. |
 | `setMix(mix)` | 0 = stem A … 1 = stem B; the gains follow `mixLaw`. Fetches stem B on first use. |
 | `setProcessing(patch)` | Any subset of `ProcessingState`. |
 | `setSourceB(input \| null)` | Install (or remove) stem B for the current clip directly (whole clips). |
@@ -195,11 +196,11 @@ source can do is reported in `state.capabilities`.
 | `analyser`, `audioContext` | Post-DSP `AnalyserNode` for custom meters, and the shared context. |
 | `dispose()` | Stops playback and releases this player's nodes. The shared AudioContext stays open. A disposed player ignores `load`/`play` until `reactivate()` (the React hook does this for StrictMode). Mounted elements stay mounted. |
 
-`ProcessingState`: `{ highPassHz: 0, compression: 0, outputGainDb: 0, speed: 1, mix: 0 }`
+`ProcessingState`: `{ inputGainDb: 0, highPassHz: 0, compression: 0, outputGainDb: 0, speed: 1, mix: 0 }`
 (defaults shown).
 
 With these defaults the DSP leaves the audio as decoded: the high-pass is
-bypassed, the compressor and the output gain do nothing, and only samples
+bypassed, the compressor and the two gains do nothing, and only samples
 above the -0.01 dBFS ceiling are clipped to it. Where the AudioWorklet cannot
 start (a CSP that blocks `blob:`, a browser without it), native nodes take
 over: they add a few milliseconds of look-ahead delay and limit softly near
@@ -246,8 +247,9 @@ prepared clips (segment store, scheduler, stream engine) are not exported.
 
 `@saitdigital/rt-dspplr/format` holds the prepared-file formats as pure code that
 runs in browsers, workers and Node: the manifest types, `assertManifest()`, stem key
-rules (`isStemKey`, `STEM_KEY_PATTERN`), and the readers and writers of peaks.bin,
-bands.bin, spectrogram.bin and the WAV segments. The JSON Schema of the manifest is
+rules (`isStemKey`, `STEM_KEY_PATTERN`), the readers and writers of peaks.bin,
+bands.bin, spectrogram.bin and WAV, and the source runs (a segment's bytes of the
+original, decoded and cut out). The JSON Schema of the manifest is
 `@saitdigital/rt-dspplr/manifest.schema.json`.
 
 ## API: React
@@ -286,7 +288,8 @@ An inline card that sits in the page flow and fills its container's width:
   visible window while zoomed; elapsed / total time on the right;
 - a tool row: speed as a segmented control, a **Loop** toggle, the
   **Stem A ⇄ Stem B** mix slider, and a **Post FX** popover with
-  High-pass, Compression and Output gain sliders plus Reset.
+  Input gain, High-pass, Compression, your effects' parameters and Output gain
+  (in chain order) plus Reset.
 
 Below `compactBreakpoint` (default 420 px of the component's own width, not
 the viewport) it folds into a single row (play, waveform, time, settings
@@ -391,9 +394,10 @@ createAudioPlayer({
 A whole file is decoded before it plays, which is instant for a voice note and
 heavy for an hour. For long recordings, prepare them once on the server with
 **[@saitdigital/rt-dspplr-prepare](https://github.com/eightraw/rt-dspplr/tree/main/packages/rt-dspplr-prepare#readme)** (Node, CLI and
-API). It writes a folder: a manifest, overview files (peaks, high-pass bands,
-spectrogram) and fixed-length WAV segments. The player opens it in milliseconds and
-fetches audio around the playhead only (decoded audio stays near 60 s):
+API). It writes a folder: the original file as it is, a manifest with an index of
+it (the byte range of every segment) and overview files (peaks, high-pass bands,
+spectrogram). The player opens it in milliseconds and fetches audio around the
+playhead only, as HTTP Range requests of the original (decoded audio stays near 60 s):
 
 ```bash
 npx rtd-prepare talk.wav public/media/talk --stem b=talk.b.wav --label b="Noise reduction"
@@ -409,9 +413,15 @@ useEffect(() => { void p.load({ manifest }); }, [manifest]);
 
 - The waveform, the DSP preview and the spectrogram cover the whole recording at
   once (approximate in the overview, exact in a decoded window of up to 20 s).
+- Segments decode as the codec needs: WAV on the spot; MP3, Opus and FLAC with
+  WebAssembly (dr_mp3, libopus, dr_flac), one chunk per codec fetched the first
+  time a clip of that codec plays (30, 113 and 21 KB gzipped), in a worker. The
+  server must answer Range requests (one that ignores them sends the whole file
+  for every segment).
 - Speed keeps the pitch through a realtime stretcher in the stream engine
-  (AudioWorklet) when the manifest's rate equals the context's; otherwise pitch
-  follows speed and `capabilities.canPreservePitch` says so (the card shows it).
+  (AudioWorklet), which runs at the clip's rate and converts to the context's.
+  Without it pitch follows speed and `capabilities.canPreservePitch` says so (the
+  card shows it).
 - Options under `segmented`: `cacheSeconds`, `prefetchSegments`, `engine`,
   `realtimeStretch`, `pollStemsMs`. `player.getStreamStats()` reports cache,
   fetches and latencies.
@@ -435,11 +445,11 @@ The manifest format, its versions and its compatibility policy are specified in
 > helpers) may change in minor releases before 1.0.
 
 Every sound effect is a plugin in one chain per player, the built-ins included:
-`rtd.highpass` (the high-pass) and `rtd.dynamics` (compressor, output gain and
-ceiling as one plugin, because the gain sits between the compressor and the
-limiter). `setHighPass`, `setCompression` and `setOutputGain` drive them.
+`rtd.highpass` (the high-pass) and `rtd.dynamics` (the compressor);
+`setHighPass` and `setCompression` drive them. The two gains and the ceiling
+are the chain's own first and last stages, not plugins.
 
-Signal chain: **source (A/B mix → realtime stretch) → effects → volume → analyser → output.**
+Signal chain: **source (A/B mix → realtime stretch) → input gain → effects → output gain → ceiling (-0.01 dBFS) → analyser → output.**
 
 - The mix is first because the effects process what you hear: one compressor on the
   blend, not two compressors that are summed.
@@ -447,8 +457,11 @@ Signal chain: **source (A/B mix → realtime stretch) → effects → volume →
   constants stay in real time at any speed. The stretcher also sees the dry signal,
   without a limiter's pumping. The engine mixes A and B before it stretches them, so
   there is one stretcher, not two that drift apart.
-- Volume is a post-insert fader. It never changes how hard the compressor works.
-  The analyser and the meters sit after it.
+- The input gain drives everything after it (+6 dB in compresses harder); the
+  output gain only sets the level of the result. Both show on the waveform and
+  the spectrogram, like every effect with a preview.
+- The ceiling is last, so neither a boost nor a third-party effect can send the
+  output over full scale. The analyser and the meters sit after it.
 
 ```ts
 import { threeBandEq } from './three-band-eq.js';   // examples/plugins/three-band-eq.js
@@ -572,7 +585,7 @@ view.dispose();
 | Option | Default | |
 |---|---|---|
 | `colorMode` | `'single'` | `'single'`: one colour, taken from the mix position (stem A's, the mix colour, stem B's). `'dual'`: each cell coloured by the stem it comes from. |
-| `palette` | `DEFAULT_SPECTROGRAM_PALETTE` | `{ background, colorA, colorB, colorMix, peak }` as hex colours. The default is a dark panel with orange A, blue B and purple for both. |
+| `palette` | the theme's | `colormap`: a scientific colormap for the level, by name (`'magma'`, `'inferno'`, `'plasma'`, `'viridis'`, `'grey'`; `'_r'` reverses it, e.g. `'magma_r'`) or as its colours from quiet to loud (`['#fff', '#f97316', '#111']`); its first colour is the background. Or three colours per stem, `{ background, colorA, colorB, colorMix, peak }`, a ramp from the background through the stem's colour to the peak (used by `colorMode: 'dual'`, and by any palette given without a `colormap`). Default: the `--rtd-spectrogram-*` tokens, `magma_r` in the light theme and `magma` in the dark one. `COLORMAPS` holds the named maps. |
 | `floorDb` | `66` | How far below the clip's loudest bin is drawn as background. |
 | `minHz`, `maxHz` | `30`, `16000` | Frequency axis. |
 | `fftSize` | `'auto'` | `'auto'`: 2048 points for the harmonics; zoomed in, 4096 below 300 Hz and 1024 above 3 kHz (512 when very close), blended at the edges; a whole long clip uses 4096. Or one power of two from 256 to 16384. |
@@ -677,9 +690,9 @@ WASM fails to load at runtime, each job falls back to the built-in vocoder.
 
 The core and React entries contain six small scripts as strings: the
 dynamics AudioWorklet (~2 KB), the vocoder worker (~5 KB), the waveform
-peaks worker (~5 KB), the spectrogram worker (~7 KB), the overview
-preview worker of prepared clips (~3 KB) and the stream engine AudioWorklet
-of prepared clips (~6 KB). The realtime stretcher of prepared clips
+peaks worker (~8 KB), the spectrogram worker (~7 KB), the overview
+preview worker of prepared clips (~6 KB) and the stream engine AudioWorklet
+of prepared clips (~10 KB). The realtime stretcher of prepared clips
 (Signalsmith Stretch, MIT, ~100 KB of WASM; its notice is in the chunk and in
 THIRD_PARTY_NOTICES.md) is a separate chunk, loaded by a
 dynamic `import()` only when a prepared clip plays. Each is started from
@@ -688,9 +701,11 @@ same build is verified in Vite (dev and build) and webpack 5. Nothing in it is
 bundler-specific, so other ESM bundlers should behave the same.
 
 With a Content-Security-Policy, allow `blob:` in `worker-src` (workers) and
-`script-src` (the AudioWorklet module). If they are blocked, the player still
-works: DSP falls back to native nodes, speed to `playbackRate`, and the
-waveform and the spectrogram stay empty. A warning is logged, also when a
+`script-src` (the AudioWorklet modules), and `'wasm-unsafe-eval'` in `script-src`
+for the realtime stretcher of prepared clips (it compiles its WASM in the
+AudioWorklet). If they are blocked, the player still works: DSP falls back to
+native nodes, speed to `playbackRate` (prepared clips: resampling, the pitch
+follows), and the waveform and the spectrogram stay empty. A warning is logged, also when a
 worker fails after it started.
 
 ## Styling and themes
@@ -730,10 +745,15 @@ the default look; `theme="dark"` and `theme="auto"` switch the token set.
 | `--rtd-shadow`, `--rtd-popover-shadow` | soft | |
 | `--rtd-radius`, `--rtd-control-radius` | `14px`, `8px` | |
 | `--rtd-wave-height`, `--rtd-play-size`, `--rtd-padding` | `56px`, `48px`, `16px` | Compact: `36px`, `40px`, `10px`. |
+| `--rtd-spectrogram-colormap` | `magma_r` (dark: `magma`) | The colormap of the level (`none` or empty: the three-colour ramp). |
+| `--rtd-spectrogram-bg`, `-a`, `-b`, `-mix`, `-peak` | `#f3f4f6`, orange, blue, purple, `#1b1f24` | The three-colour ramp: `colorMode: 'dual'`, or without a colormap. Hex colours. |
+| `--rtd-overlay-wave`, `-wave-rms`, `-played`, `-played-rms` | translucent ink / accent | The waveform outline drawn over the spectrogram (`display: 'both'`). |
 
 The dark set (`theme="dark"`, or `"auto"` with a dark OS setting) uses a
 `#17191c` card and a `#2dd4bf` accent. The waveform canvases read the
-`--rtd-wave*` tokens when they draw and redraw on theme changes.
+`--rtd-wave*`, `--rtd-spectrogram-*` and `--rtd-overlay-*` tokens when they draw
+and redraw on theme changes. Before a clip is loaded the spectrogram paints
+nothing, so the empty state looks the same in every display.
 
 The card is not positioned; place it anywhere. It is a size container
 (`container: rtd / inline-size`), so its own `@container rtd` rules react
@@ -785,8 +805,12 @@ Web Workers, CSS container queries (2023+ browsers; older ones just skip the
 narrow-width tweaks). The Rubber Band entry needs module workers (Firefox
 114+). Formats: whatever the browser's `decodeAudioData` supports (WAV, MP3,
 AAC/M4A, FLAC everywhere; Ogg/Opus and WebM depend on the browser). The shared
-AudioContext runs at 48 kHz unless the first player asks for another
-`sampleRate`; material at another rate is resampled by the browser's decoder.
+AudioContext runs at the device's rate when it is 44.1 or 48 kHz (else at
+48 kHz) unless the first player asks for another `sampleRate`. Whole clips at
+another rate are resampled by the browser's decoder; prepared clips by the
+stream engine, which plays them at their own rate (mix, realtime stretch) and
+converts its output with a windowed-sinc resampler (residual below −90 dB,
+about 1 % of a core for stereo), so realtime speed works at any rate.
 
 ## Sizes
 

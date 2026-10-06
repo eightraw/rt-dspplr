@@ -74,10 +74,11 @@ export function applyDspToSpectrogram(data: SpectrogramData, input: DspPaintInpu
     const { state, preview } = input;
     const p = previewSettings(state);
     const outputGain = outputGainDbToGain(p.outputGainDb);
+    const inputGain = outputGainDbToGain(p.inputGainDb);
     const track = preview?.gain ?? null;
     const windowTrack = preview?.windowGain ?? null;
     const hp = p.highPassHz > 0;
-    if (!hp && !track && !windowTrack && outputGain === 1 && p.lti.length === 0) return data;
+    if (!hp && !track && !windowTrack && outputGain === 1 && inputGain === 1 && p.lti.length === 0) return data;
     const { rows, columns } = data;
     const sampleRate = state.audioContext?.sampleRate ?? 48000;
     const key = `${rows}|${input.minHz}|${input.maxHz}|${sampleRate}|${p.key}`;
@@ -102,7 +103,8 @@ export function applyDspToSpectrogram(data: SpectrogramData, input: DspPaintInpu
     for (let c = 0; c < columns; c += 1) {
         const from = (data.start + c * span) * input.timelineRate;
         const to = Math.max(from + 1, (data.start + (c + 1) * span) * input.timelineRate);
-        let g = outputGain;
+        // Without a gain track yet: both gains as they are (the compressor's part comes with the track).
+        let g = inputGain * outputGain;
         const t = windowTrack && gainCovers(windowTrack, from, to) ? windowTrack : track;
         if (t) g = gainOver(t, from, to) * (t.outputGain && t.outputGain > 0 ? outputGain / t.outputGain : 1);
         colGain[c] = g;

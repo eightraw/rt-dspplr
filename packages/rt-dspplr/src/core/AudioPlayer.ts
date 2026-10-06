@@ -2,16 +2,20 @@ import { AudioEngine, type LoopRange } from './engine';
 import { EffectChain } from './effects/EffectChain';
 import { dynamicsPlugin, highPassPlugin } from './effects/builtins';
 import { previewCoverage } from './effects/preview';
+import { dbToGain } from './dsp/compression';
 import { resolveParams, validateParam, type DspPlugin, type EffectState, type PluginParams, type PreviewCoverage } from './effects/types';
 import {
     DEFAULT_PROCESSING,
     DEFAULT_SPEEDS,
+    LIMITER_CEILING_DB,
     SPEED_MIN,
     SPEED_MAX,
     clamp01,
     normalizeHighPassHz,
+    normalizeInputGainDb,
     normalizeOutputGainDb,
     normalizeSpeed,
+    outputGainDbToGain,
     type MixLaw,
     type ProcessingState,
 } from './controls';
@@ -142,7 +146,11 @@ export interface AudioPlayerOptions {
      * the page share one cache). Default 150 MiB. Not a total memory cap.
      */
     cacheBudgetBytes?: number;
-    /** Sample rate of the shared AudioContext; only the first player to start decides. Default 48000. */
+    /**
+     * Sample rate of the shared AudioContext; only the first player to start
+     * decides. Default: the device's rate when it is 44100 or 48000, else 48000.
+     * Clips at other rates are converted by the player.
+     */
     sampleRate?: number;
     /**
      * Output buffering of the shared AudioContext; only the first player to start
@@ -216,8 +224,6 @@ export interface AudioPlayerState {
     buffering: boolean;
     /** Peaks, bands and spectrogram of a prepared clip, as they arrive. */
     prepared: PreparedOverview | null;
-    /** Volume (linear): the fader after the effects, see setVolume(). */
-    volume: number;
     /** The effect chain, in order (built-ins included). See `player.effects`. */
     effects: EffectState[];
     /** Sum of the active effects' declared latencies, in frames. */
@@ -302,12 +308,13 @@ function normalizeClip(input: ClipInput): ClipInfo {
 }
 
 function isManifestUrl(url: string): boolean {
-    return /.json$/i.test(url.split(/[?#]/)[0]);
+    return /\.json$/i.test(url.split(/[?#]/)[0]);
 }
 
 function normalizeProcessing(partial?: Partial<ProcessingState>): ProcessingState {
     const merged = { ...DEFAULT_PROCESSING, ...partial };
     return {
+        inputGainDb: normalizeInputGainDb(merged.inputGainDb),
         highPassHz: normalizeHighPassHz(merged.highPassHz),
         compression: clamp01(merged.compression),
         outputGainDb: normalizeOutputGainDb(merged.outputGainDb),
@@ -360,7 +367,13 @@ export class AudioPlayerCore {
             return id;
         },
         remove: (id: string): void => {
-            if (!this._state.effects.some((e) => e.id === id)) return;
+            const effect = this._state.effects.find((e) => e.id === id);
+            if (!effect) return;
+            if (effect.plugin.builtin) {
+                // The card's high-pass and dynamics controls drive these (and dynamics holds the ceiling).
+                console.warn(`[AudioPlayer] the built-in ${JSON.stringify(id)} effect cannot be removed; bypass it instead`);
+                return;
+            }
             this._setEffects(this._state.effects.filter((e) => e.id !== id));
             this._output?.remove(id);
         },
@@ -399,7 +412,6 @@ export class AudioPlayerCore {
         this._output?.setParam(effect.id, param, value);
         if (effect.plugin.builtin === 'highpass' && param === 'hz') this._updateProcessing({ highPassHz: value });
         if (effect.plugin.builtin === 'dynamics' && param === 'amount') this._updateProcessing({ compression: value });
-        if (effect.plugin.builtin === 'dynamics' && param === 'outputGainDb') this._updateProcessing({ outputGainDb: value });
     }
 
     private _builtin(kind: 'highpass' | 'dynamics'): EffectState | undefined {
@@ -525,8 +537,9 @@ export class AudioPlayerCore {
 
     /**
      * Whether speed changes keep the pitch for the current clip: false for the
-     * native strategy, when workers are blocked, and for prepared (segmented)
-     * clips, which use playbackRate. See also `state.capabilities`.
+     * native strategy and when workers are blocked; for prepared (segmented)
+     * clips, whether the engine's realtime stretcher is running. See also
+     * `state.capabilities`.
      */
     get stretchAvailable(): boolean {
         return this._source.kind === 'buffer' ? !!this._stretch?.available : this._source.capabilities.canPreservePitch;
@@ -656,22 +669,26 @@ export class AudioPlayerCore {
     };
 
     /** Output gain in dB (-24..+24); -Infinity mutes. */
+    /**
+     * Gain after all processing, before the -0.01 dBFS ceiling, in dB
+     * (-24..+24; -Infinity mutes), ramped over 20 ms. A boost meets the
+     * ceiling, the last stage; the previews show it.
+     */
     setOutputGain = (db: number): void => {
-        const value = normalizeOutputGainDb(db); // may be -Infinity (mute): not clamped to the schema
-        const effect = this._builtin('dynamics');
-        if (effect) this._setEffectParam(effect, 'outputGainDb', value);
-        else this._updateProcessing({ outputGainDb: value });
+        const value = normalizeOutputGainDb(db); // may be -Infinity (mute)
+        this._output?.setOutputGain(outputGainDbToGain(value));
+        this._updateProcessing({ outputGainDb: value });
     };
 
     /**
-     * Volume, linear (1 = unity): the fader after the effects, ramped over 20 ms
-     * so a move never clicks. It does not change how the effects react (a
-     * compressor sees the same signal whatever the volume), as on a mixing desk.
+     * Gain before all processing (high-pass, compressor, plugins), in dB
+     * (-24..+24; -Infinity mutes), ramped over 20 ms. It drives the compressor
+     * and the effects: +6 dB in compresses harder. The previews show it.
      */
-    setVolume = (value: number): void => {
-        const v = Number.isFinite(value) ? Math.max(0, Math.min(4, value)) : 1;
-        this._output?.setVolume(v);
-        this._update({ volume: v });
+    setInputGain = (db: number): void => {
+        const value = normalizeInputGainDb(db);
+        this._output?.setInputGain(outputGainDbToGain(value));
+        this._updateProcessing({ inputGainDb: value });
     };
 
     /** Linear crossfade between stem A (0) and stem B (1). Fetches stem B on first use. */
@@ -684,13 +701,15 @@ export class AudioPlayerCore {
     /**
      * Change the speed, keeping the position. A whole clip prepares a
      * pitch-preserving variant in the background and switches at the live
-     * position (latest request wins); a prepared clip changes playbackRate at
-     * once, so its pitch follows (`state.capabilities.canPreservePitch` false).
+     * position (latest request wins); a prepared clip changes at once in the
+     * engine's realtime stretcher, keeping the pitch (where the stretcher is not
+     * available, `state.capabilities.canPreservePitch` is false and the pitch follows).
      */
     setSpeed = async (speed: number): Promise<void> => this._source.setSpeed(normalizeSpeed(speed));
 
     /** Set several processing values at once. */
     setProcessing = (patch: Partial<ProcessingState>): void => {
+        if (patch.inputGainDb !== undefined) this.setInputGain(patch.inputGainDb);
         if (patch.highPassHz !== undefined) this.setHighPass(patch.highPassHz);
         if (patch.compression !== undefined) this.setCompression(patch.compression);
         if (patch.outputGainDb !== undefined) this.setOutputGain(patch.outputGainDb);
@@ -700,8 +719,8 @@ export class AudioPlayerCore {
 
     /**
      * Install (or remove) stem B for the current clip (overrides `srcB` and
-     * `loadB`). Resolves true when installed; false for prepared clips, which
-     * have no stem B yet.
+     * `loadB`). Resolves true when installed; false for prepared clips, whose
+     * stems come from the manifest (see `setStem()`).
      */
     setSourceB = async (input: AudioInput | null): Promise<boolean> => this._source.setSourceB(input);
 
@@ -804,9 +823,10 @@ export class AudioPlayerCore {
                 const ok = await engine.initialize({ sampleRate: this._options.sampleRate, latencyHint: this._options.latencyHint });
                 const ctx = engine.context;
                 if (!ok || !ctx || generation !== this._outputGeneration || this._disposed) return null;
-                const chain = new EffectChain(ctx, (id, message) => this._onEffectError(id, message));
+                const chain = new EffectChain(ctx, (id, message) => this._onEffectError(id, message), dbToGain(LIMITER_CEILING_DB));
                 this._state.effects.forEach((e, i) => chain.add(e.id, e.plugin, e.params, e.bypassed || !!e.error, i));
-                chain.setVolume(this._state.volume);
+                chain.setInputGain(outputGainDbToGain(this._state.processing.inputGainDb));
+                chain.setOutputGain(outputGainDbToGain(this._state.processing.outputGainDb));
                 this._engine = engine;
                 this._output = chain;
                 this._update({ audioContext: ctx });
@@ -847,7 +867,6 @@ export class AudioPlayerCore {
             stem: null,
             buffering: false,
             prepared: null,
-            volume: this._state?.volume ?? 1,
             effects: this._state?.effects ?? defaultEffects(processing),
             effectsLatencyFrames: this._state?.effectsLatencyFrames ?? 0,
             previewCoverage: this._state?.previewCoverage ?? { waveform: true, spectrogram: true, overview: true, missing: [] },
@@ -885,7 +904,7 @@ export class AudioPlayerCore {
 function defaultEffects(processing: ProcessingState): EffectState[] {
     return [
         { id: 'highpass', plugin: highPassPlugin, params: { hz: processing.highPassHz }, bypassed: false, error: null },
-        { id: 'dynamics', plugin: dynamicsPlugin, params: { amount: processing.compression, outputGainDb: processing.outputGainDb }, bypassed: false, error: null },
+        { id: 'dynamics', plugin: dynamicsPlugin, params: { amount: processing.compression }, bypassed: false, error: null },
     ];
 }
 

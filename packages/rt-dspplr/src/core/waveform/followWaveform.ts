@@ -34,6 +34,7 @@ const DEBOUNCE_MS = 16;
 function processingOf(state: AudioPlayerState): WaveformProcessing {
     const fx = previewSettings(state);
     return {
+        inputGain: outputGainDbToGain(fx.inputGainDb),
         highPassHz: fx.highPassHz,
         compression: fx.compression,
         outputGain: outputGainDbToGain(fx.outputGainDb),
@@ -45,7 +46,7 @@ function processingOf(state: AudioPlayerState): WaveformProcessing {
 }
 
 function sameProcessing(a: WaveformProcessing | null, b: WaveformProcessing): boolean {
-    return a !== null && a.highPassHz === b.highPassHz && a.compression === b.compression
+    return a !== null && a.inputGain === b.inputGain && a.highPassHz === b.highPassHz && a.compression === b.compression
         && a.outputGain === b.outputGain && a.mix === b.mix && a.mixLaw === b.mixLaw && a.key === b.key;
 }
 

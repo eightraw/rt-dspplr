@@ -1,8 +1,9 @@
 // `@saitdigital/rt-dspplr/format` — the prepared-audio formats, shared by the
 // player and `@saitdigital/rt-dspplr-prepare`: the manifest (types,
 // validation, stem keys), the binary overview files (peaks.bin, bands.bin,
-// spectrogram.bin) and the WAV segments. Pure code: no DOM, no Node APIs, no
-// workers, so it runs in browsers, Node and workers alike.
+// spectrogram.bin), the source's runs (the segments: byte ranges of the
+// original, decoded) and WAV. Pure code: no DOM, no Node APIs, no workers, so it
+// runs in browsers, Node and workers alike.
 //
 // The normative description is docs/manifest.md in the repository; the JSON
 // Schema ships as `@saitdigital/rt-dspplr/manifest.schema.json`.
@@ -29,7 +30,22 @@ export {
     type ManifestLoudness,
     type ManifestStem,
     type ManifestStems,
+    type ManifestSource,
+    type SourceCodec,
+    SOURCE_CODECS,
 } from './core/stream/manifest';
+
+// ---- the source's runs (manifest v4: segments are byte ranges of the original) --------------
+export {
+    segmentFromRun,
+    decodePcmRun,
+    decodeStreamRun,
+    decodeOpusRun,
+    oggPackets,
+    opusHead,
+    base64Bytes,
+    type DecodedRun,
+} from './core/stream/sourceRuns';
 
 // ---- binary overview files ---------------------------------------------------------------
 export {
@@ -63,7 +79,7 @@ export {
     type SpectrogramLevelLayout,
 } from './core/stream/spectrogramFile';
 
-// ---- WAV segments --------------------------------------------------------------------------
+// ---- WAV ------------------------------------------------------------------------------------
 export {
     looksLikeWav,
     parseWavHeader,
@@ -82,5 +98,7 @@ export {
 // coefficients), so the prepared previews match what the player computes.
 /** @experimental Shared with `@saitdigital/rt-dspplr-prepare`; may change in minor releases. */
 export { frameRows, planBands, quantizeRows, PYRAMID_BANDS, type Band } from './core/spectrogram/spectral';
+// For a host with a faster real FFT (the prepare step plugs its WebAssembly in).
+export { setSpectralBackend, transformJs, type Fft } from './core/spectrogram/spectral';
 /** @experimental Shared with `@saitdigital/rt-dspplr-prepare`; may change in minor releases. */
 export { computeHighPassCoefficients, HIGH_PASS_SECTION_Q, type HighPassCoefficients } from './core/dsp/highPass';

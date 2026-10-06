@@ -4,6 +4,7 @@ import {
     COMPRESSION_DEFAULT,
     HIGH_PASS_DEFAULT_HZ,
     HIGH_PASS_MAX_HZ,
+    INPUT_DEFAULT_DB,
     OUTPUT_DEFAULT_DB,
     OUTPUT_MAX_DB,
     OUTPUT_MIN_DB,
@@ -182,13 +183,25 @@ function SoundRow({ label, readout, min, max, step, value, onChange, onReset }: 
 }
 
 export function SoundPanel({ core, state }: { core: AudioPlayerCore; state: AudioPlayerState }) {
-    const { highPassHz, compression, outputGainDb } = state.processing;
-    const isDefault = highPassHz === HIGH_PASS_DEFAULT_HZ
+    const { inputGainDb, highPassHz, compression, outputGainDb } = state.processing;
+    const isDefault = inputGainDb === INPUT_DEFAULT_DB
+        && highPassHz === HIGH_PASS_DEFAULT_HZ
         && compression === COMPRESSION_DEFAULT
         && outputGainDb === OUTPUT_DEFAULT_DB;
 
+    // In chain order: what comes first is listed first.
     return (
         <div className="rtd-sound">
+            <SoundRow
+                label="Input gain"
+                readout={formatOutputGainLabel(inputGainDb)}
+                min={0}
+                max={OUTPUT_STEPS + 1}
+                step={1}
+                value={outputDbToStep(inputGainDb)}
+                onChange={(step) => core.setInputGain(stepToOutputDb(step))}
+                onReset={() => core.setInputGain(INPUT_DEFAULT_DB)}
+            />
             <SoundRow
                 label="High-pass"
                 readout={formatHighPassLabel(highPassHz)}
@@ -209,6 +222,9 @@ export function SoundPanel({ core, state }: { core: AudioPlayerCore; state: Audi
                 onChange={(pct) => core.setCompression(pct / 100)}
                 onReset={() => core.setCompression(COMPRESSION_DEFAULT)}
             />
+            {state.effects.filter((e) => !e.plugin.builtin).map((effect) => (
+                <PluginRows key={effect.id} core={core} effect={effect} />
+            ))}
             <SoundRow
                 label="Output gain"
                 readout={formatOutputGainLabel(outputGainDb)}
@@ -219,9 +235,6 @@ export function SoundPanel({ core, state }: { core: AudioPlayerCore; state: Audi
                 onChange={(step) => core.setOutputGain(stepToOutputDb(step))}
                 onReset={() => core.setOutputGain(OUTPUT_DEFAULT_DB)}
             />
-            {state.effects.filter((e) => !e.plugin.builtin).map((effect) => (
-                <PluginRows key={effect.id} core={core} effect={effect} />
-            ))}
             <div className="rtd-sound-foot">
                 <span className="rtd-sound-note" data-preview-missing={state.previewCoverage.missing.length > 0 || undefined}>
                     {state.previewCoverage.missing.length > 0
@@ -233,6 +246,7 @@ export function SoundPanel({ core, state }: { core: AudioPlayerCore; state: Audi
                     className="rtd-btn rtd-btn-quiet"
                     disabled={isDefault}
                     onClick={() => core.setProcessing({
+                        inputGainDb: INPUT_DEFAULT_DB,
                         highPassHz: HIGH_PASS_DEFAULT_HZ,
                         compression: COMPRESSION_DEFAULT,
                         outputGainDb: OUTPUT_DEFAULT_DB,

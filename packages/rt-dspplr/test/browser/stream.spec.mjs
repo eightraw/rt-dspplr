@@ -1,16 +1,17 @@
 // Prepared (manifest) clips on the one player core, and the same transport
 // suite on both sources. Fixtures from long-fixtures.mjs: stereo70 (70 s
 // stereo, 10 s segments) and mono30 (30 s mono, 3 s segments), each also as
-// the source WAV for the whole-clip source.
+// the source WAV for the whole-clip source; mp3clip and opusclip (2 s, 0.5 s
+// segments) with the decoder's samples beside them.
 import { test, expect } from '@playwright/test';
 
 const BASE = '/node_modules/.cache/rtd-long';
 
-/** Hold segment requests until release() (the overview must not need them). */
+/** Hold segment requests (Range requests of the source) until release() (the overview must not need them). */
 async function gateSegments(page) {
     let open;
     const opened = new Promise((resolve) => { open = resolve; });
-    await page.route('**/seg/*.wav', async (route) => {
+    await page.route('**/source.*', async (route) => {
         await opened;
         await route.continue();
     });
@@ -182,12 +183,11 @@ test('segment boundaries and a loop across one are sample-exact (OfflineAudioCon
         const manifest = await (await fetch(`${base}/manifest.json`)).json();
         const ref = h.format.parseWavFile(await (await fetch(`${longBase}/mono30.wav`)).arrayBuffer()).channels[0];
         const sr = manifest.sampleRate;
-        const segs = await Promise.all(manifest.segments.list.map(async (s) => {
-            const wav = h.format.parseWavFile(await (await fetch(`${base}/${s.url}`)).arrayBuffer());
-            const b = new AudioBuffer({ length: wav.frames, sampleRate: sr, numberOfChannels: 1 });
-            b.copyToChannel(wav.channels[0], 0);
+        const segs = (await h.preparedSegments(base, manifest)).map((planes) => {
+            const b = new AudioBuffer({ length: planes[0].length, sampleRate: sr, numberOfChannels: 1 });
+            b.copyToChannel(planes[0], 0);
             return b;
-        }));
+        });
         const render = async (frames, setup) => {
             const ctx = new OfflineAudioContext(1, frames, sr);
             const s = new h.internals.SegmentScheduler(ctx, ctx.destination, manifest.segments.list, sr);
@@ -210,6 +210,35 @@ test('segment boundaries and a loop across one are sample-exact (OfflineAudioCon
     expect(result.maxErr).toBeLessThan(1e-6);
     expect(result.loopErr).toBeLessThan(1e-6);
 });
+
+for (const codec of ['mp3', 'opus']) {
+    test(`a ${codec} source: segments are Range requests of the file, decoded in a worker to the decoder's samples`, async ({ page }) => {
+        const ranges = [];
+        page.on('request', (req) => { if (req.url().endsWith(`/${codec}clip/source.${codec}`)) ranges.push(req.headers().range ?? ''); });
+        const r = await page.evaluate(async (codec) => {
+            const { player } = mk();
+            await player.load({ manifest: `${longBase}/${codec}clip/manifest.json` });
+            const w = await until(() => player.getWindowAudio(), 10000);
+            // The decoder's samples (prepare's built-in decoder, the whole file), planar float32.
+            const ref = new Float32Array(await (await fetch(`${longBase}/${codec}clip.f32`)).arrayBuffer());
+            const total = ref.length / w.buffer.numberOfChannels;
+            let worst = 0;
+            for (let c = 0; c < w.buffer.numberOfChannels; c += 1) {
+                const x = w.buffer.getChannelData(c);
+                for (let i = 0; i < x.length; i += 1) worst = Math.max(worst, Math.abs(x[i] - ref[c * total + w.startFrame + i]));
+            }
+            const out = { worst, frames: w.buffer.length, total, rate: w.sampleRate, fetches: player.getStreamStats().fetches };
+            player.dispose();
+            return out;
+        }, codec);
+        expect(r.frames).toBeGreaterThan(r.total / 2);
+        expect(r.rate).toBe(codec === 'mp3' ? 44100 : 48000);
+        // MP3: the same samples; Opus: within float rounding (a run starts with a fresh decoder).
+        expect(r.worst).toBeLessThan(codec === 'mp3' ? 1e-12 : 1e-6);
+        expect(ranges.length).toBeGreaterThan(1);
+        expect(ranges.every((h) => /^bytes=\d+-\d+$/.test(h))).toBe(true);
+    });
+}
 
 test('decoded audio stays within the cache cap while seeking around', async ({ page }) => {
     const result = await page.evaluate(async () => {

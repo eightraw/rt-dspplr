@@ -2,11 +2,11 @@ import { decodeInterleaved, looksLikeWav, parseWavHeader, WavFormatError, type W
 
 // ---------------------------------------------------------------------------
 // Decoder hook. A decoder turns the source's bytes into planar Float32 blocks.
-// The built-in one reads WAV (integer PCM 8/16/24/32, float 32/64, any
-// channel count and rate) without holding more than one input chunk. Other
-// formats need ffmpeg, which is not part of this experiment: plug it in with
-// `prepareAudio(input, { decoder })` — e.g. spawn `ffmpeg -i - -f f32le -`
-// and yield its output (see docs/long-audio-experiment.md).
+// The WAV reader here takes integer PCM 8/16/24/32 and float 32/64, any
+// channel count and rate, without holding more than one input chunk; the
+// built-in decoder (wasm/decoders.ts, the default) uses it for WAV and reads
+// MP3, Opus and FLAC itself. Other formats need a decoder passed in:
+// `prepareAudio(input, { decoder: ffmpegDecoder() })`, or your own.
 // ---------------------------------------------------------------------------
 
 export interface SourceFormat {
@@ -17,7 +17,18 @@ export interface SourceFormat {
     bitsPerSample: number;
     /** Expected frames when known up front (for progress and preallocation). */
     frames: number | null;
+    /**
+     * Where the input file keeps its samples, for its index (manifest v4: the player reads the
+     * file itself). Set by the built-in readers; absent, the source is written once as a WAV.
+     */
+    layout?: SourceLayout;
 }
+
+export type SourceLayout =
+    | { kind: 'wav'; dataOffset: number; blockAlign: number; encoding: 'int' | 'float'; bitsPerSample: number }
+    | { kind: 'mp3'; delay: number }
+    | { kind: 'flac' }
+    | { kind: 'opus' };
 
 export interface DecodedStream {
     /** Resolves once the format is known (before the first block). */
@@ -26,12 +37,72 @@ export interface DecodedStream {
     blocks: AsyncIterable<Float32Array[]>;
 }
 
-export type AudioDecoder = (bytes: AsyncIterable<Uint8Array>) => DecodedStream;
+export interface DecoderOptions {
+    /** The job's cancellation: a decoder that runs a process stops it on abort. */
+    signal?: AbortSignal;
+}
+
+export type AudioDecoder = (bytes: AsyncIterable<Uint8Array>, options?: DecoderOptions) => DecodedStream;
 
 export class UnsupportedFormatError extends Error {
     constructor(message: string) {
         super(message);
         this.name = 'UnsupportedFormatError';
+    }
+}
+
+/**
+ * The blocks with every non-finite sample replaced (NaN → 0, ±Infinity → ±1),
+ * as a float WAV or a custom decoder may hold them. A channel is copied only
+ * when it has one; `counter.replaced` counts them. Whatever the decoder,
+ * prepare runs its blocks through this before anything else sees them.
+ */
+/** Index of the first non-finite sample, or −1. */
+function firstNonFinite(x: Float32Array): number {
+    for (let i = 0; i < x.length; i += 1) {
+        const v = x[i];
+        if (v - v !== 0) return i;
+    }
+    return -1;
+}
+
+/** NaN → 0, ±Infinity → ±1 in place; returns how many. */
+function replaceNonFinite(y: Float32Array): number {
+    let n = 0;
+    for (let i = 0; i < y.length; i += 1) {
+        const v = y[i];
+        if (v - v === 0) continue;
+        y[i] = v !== v ? 0 : v > 0 ? 1 : -1;
+        n += 1;
+    }
+    return n;
+}
+
+/** Encodings whose samples are finite by construction (integers, and what the built-in FLAC, MP3 and Opus decoders make of them). */
+const FINITE_ENCODINGS = new Set(['pcm-int', 'flac', 'mp3', 'opus']);
+
+export async function* finiteBlocks(blocks: AsyncIterable<Float32Array[]>, counter: { replaced: number }, format?: Promise<SourceFormat>): AsyncGenerator<Float32Array[]> {
+    // Integer PCM (and FLAC, MP3, Opus) cannot hold anything but finite samples: nothing to look at. The format is
+    // known once the decoder has produced its first block (the WAV reader learns it from the
+    // header it reads for that block), so it is looked at there, never before: awaiting it
+    // first would wait for a read that nobody starts.
+    let integer: boolean | null = null;
+    for await (const block of blocks) {
+        if (integer === null) integer = format ? FINITE_ENCODINGS.has((await format.catch(() => null))?.encoding ?? '') : false;
+        if (integer) {
+            yield block;
+            continue;
+        }
+        let out = block;
+        for (let c = 0; c < block.length; c += 1) {
+            const x = block[c];
+            if (firstNonFinite(x) < 0) continue;
+            const y = x.slice();
+            if (out === block) out = block.slice();
+            out[c] = y;
+            counter.replaced += replaceNonFinite(y);
+        }
+        yield out;
     }
 }
 
@@ -64,8 +135,8 @@ export const wavDecoder: AudioDecoder = (bytes) => {
                 if (!wav) {
                     pending = concat(pending, chunk);
                     if (pending.length >= 12 && !looksLikeWav(pending)) {
-                        throw new UnsupportedFormatError('Input is not a WAV file. Other formats need ffmpeg, '
-                            + 'which is not part of this experiment: pass a `decoder` to prepareAudio() to plug one in.');
+                        throw new UnsupportedFormatError('Input is not a WAV file. The default decoder also reads MP3, Opus and FLAC; '
+                            + 'other formats need ffmpeg or another decoder: pass a `decoder` to prepareAudio().');
                     }
                     if (pending.length > 16 * 1024 * 1024) throw new WavFormatError('WAV header larger than 16 MiB');
                     wav = parseWavHeader(pending);
@@ -77,6 +148,7 @@ export const wavDecoder: AudioDecoder = (bytes) => {
                         encoding: wav.encoding === 'float' ? 'pcm-float' : 'pcm-int',
                         bitsPerSample: wav.bitsPerSample,
                         frames: wav.dataBytes === null ? null : Math.floor(wav.dataBytes / wav.blockAlign),
+                        layout: { kind: 'wav', dataOffset: wav.dataOffset, blockAlign: wav.blockAlign, encoding: wav.encoding, bitsPerSample: wav.bitsPerSample },
                     });
                     chunk = pending.subarray(wav.dataOffset);
                     pending = new Uint8Array(0);

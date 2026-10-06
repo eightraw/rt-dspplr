@@ -1,0 +1,152 @@
+{
+ "format": "rtd-audio-manifest",
+ "formatVersion": 4,
+ "analyzerVersion": "2.0.0",
+ "revision": 1,
+ "id": "sha256:eec1aa1a65bf841bc45ee245a464587a306b4402feeb55b1bb158d5f1a845cb6",
+ "createdAt": "2026-10-06T21:07:51.764Z",
+ "duration": 2.0075510204081635,
+ "sampleRate": 44100,
+ "sourceSampleRate": 44100,
+ "channels": 2,
+ "frames": 88533,
+ "source": {
+  "name": "sine-speech.mp3",
+  "bytes": 33062,
+  "encoding": "mp3",
+  "bitsPerSample": 32,
+  "frames": 88533
+ },
+ "segments": {
+  "framesPerSegment": 22050,
+  "source": {
+   "url": "source.mp3",
+   "bytes": 33062,
+   "codec": "mp3",
+   "sampleRate": 44100,
+   "channels": 2
+  },
+  "list": [
+   {
+    "index": 0,
+    "startFrame": 0,
+    "frames": 22050,
+    "range": [
+     462,
+     9239
+    ],
+    "tail": 23087
+   },
+   {
+    "index": 1,
+    "startFrame": 22050,
+    "frames": 22050,
+    "range": [
+     6313,
+     17180
+    ],
+    "tail": 22925
+   },
+   {
+    "index": 2,
+    "startFrame": 44100,
+    "frames": 22050,
+    "range": [
+     14254,
+     25121
+    ],
+    "tail": 22763
+   },
+   {
+    "index": 3,
+    "startFrame": 66150,
+    "frames": 22050,
+    "range": [
+     22195,
+     33062
+    ],
+    "tail": 22601
+   },
+   {
+    "index": 4,
+    "startFrame": 88200,
+    "frames": 333,
+    "range": [
+     30137,
+     33062
+    ],
+    "tail": 551
+   }
+  ]
+ },
+ "peaks": {
+  "url": "peaks.bin",
+  "bytes": 4200,
+  "format": "rtd-peaks",
+  "version": 1,
+  "encoding": "int16-min-max-rms",
+  "levels": [
+   {
+    "framesPerPeak": 256,
+    "peaks": 346,
+    "byteOffset": 48,
+    "byteLength": 4152
+   }
+  ]
+ },
+ "loudness": {
+  "peak": 0.606445,
+  "peakDb": -4.34,
+  "rmsDb": -14.53,
+  "gatedRmsDb": -14.52,
+  "perChannel": [
+   {
+    "peakDb": -4.34,
+    "rmsDb": -14.47
+   },
+   {
+    "peakDb": -4.42,
+    "rmsDb": -14.58
+   }
+  ]
+ },
+ "bands": {
+  "url": "bands.bin",
+  "bytes": 1032,
+  "format": "rtd-bands",
+  "version": 1,
+  "framesPerBin": 2048,
+  "bins": 44,
+  "cutoffsHz": [
+   25,
+   35,
+   50,
+   71,
+   100,
+   141,
+   200,
+   283,
+   400,
+   566
+  ]
+ },
+ "spectrogram": {
+  "url": "spectrogram.bin",
+  "bytes": 2880,
+  "format": "rtd-spectrogram",
+  "version": 1,
+  "rows": 128,
+  "minHz": 30,
+  "maxHz": 16000,
+  "topDb": 60,
+  "rangeDb": 120,
+  "levels": [
+   {
+    "framesPerColumn": 4096,
+    "columns": 22,
+    "byteOffset": 64,
+    "byteLength": 2816
+   }
+  ]
+ }
+}

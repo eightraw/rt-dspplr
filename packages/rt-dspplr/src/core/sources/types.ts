@@ -30,7 +30,7 @@ export interface StemSummary {
 
 export interface SourceCapabilities {
     kind: SourceKind;
-    /** Speed changes keep the pitch (a stretch worker). False: playbackRate, pitch follows speed. */
+    /** Speed changes keep the pitch (a stretcher is running). False: the pitch follows the speed. */
     canPreservePitch: boolean;
     /** A second stem (stem B) can be mixed in. */
     canMixStemB: boolean;
@@ -81,8 +81,6 @@ export interface PlaybackSource {
     /** The mix value changed (the core has stored it). */
     setMix(mix: number): void;
     setSourceB(input: AudioInput | null): Promise<boolean>;
-    /** Volume (linear gain before the post-FX chain), smoothed so a move never clicks. */
-    setVolume(value: number): void;
     getCurrentTime(): number | null;
     /** Stop and forget the clip (another source takes over). */
     unload(): void;

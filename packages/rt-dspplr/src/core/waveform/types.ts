@@ -3,9 +3,11 @@ import type { PreviewStage } from '../effects/preview';
 
 /** DSP settings the waveform preview mirrors (linear output gain). */
 export interface WaveformProcessing {
+    /** Linear gain before all processing (it drives the compressor), 0 = muted. */
+    inputGain: number;
     highPassHz: number;
     compression: number;
-    /** Linear gain, 0 = muted. */
+    /** Linear gain after all processing, before the ceiling, 0 = muted. */
     outputGain: number;
     mix: number;
     mixLaw?: MixLaw;

@@ -99,3 +99,78 @@ test('one worker serves every spectrogram, and one off screen computes nothing',
     // The viewport is 720 px tall and views start computing 200 px before they show.
     expect(result.painted).toEqual([true, true, false, false, false]);
 });
+
+test('the spectrogram follows the theme, and nothing is painted before a clip', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const out = {};
+        for (const theme of ['light', 'dark']) {
+            const ui = document.body.appendChild(document.createElement('div'));
+            ui.style.width = '600px';
+            const box = ui.appendChild(document.createElement('div'));
+            box.style.height = '120px';
+            const player = h.createAudioPlayer({ element: ui, prewarmSpeeds: false, stretcher: 'native' });
+            const view = h.createTimeline(box, player, { display: 'spectrogram', theme });
+            const canvas = box.querySelector('canvas.rtd-spectrogram');
+            await h.sleep(300);
+            const pixel = (x, y) => Array.from(canvas.getContext('2d').getImageData(x, y, 1, 1).data);
+            const empty = pixel(10, 10);
+            // A low tone: the top rows (towards 16 kHz) stay background.
+            await player.load(h.buffer(4, 220));
+            const t0 = performance.now();
+            while (pixel(10, 2)[3] === 0 && performance.now() - t0 < 5000) await h.sleep(20);
+            await h.sleep(300);
+            out[theme] = { empty, top: pixel(10, 2) };
+            view.dispose();
+            player.dispose();
+            ui.remove();
+        }
+        return out;
+    });
+    expect(r.light.empty[3]).toBe(0);
+    expect(r.dark.empty[3]).toBe(0);
+    // Light: magma reversed, quiet cells near its cream end; dark: magma, near black.
+    const mean = (p) => (p[0] + p[1] + p[2]) / 3;
+    expect(mean(r.light.top)).toBeGreaterThan(200);
+    expect(mean(r.dark.top)).toBeLessThan(40);
+});
+
+test('palette.colormap: a named map, reversed with _r, or stops; a palette without one keeps its own colours', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const out = {};
+        const cases = {
+            viridis: { palette: { colormap: 'viridis' } },
+            viridis_r: { palette: { colormap: 'viridis_r' } },
+            stops: { palette: { colormap: ['#ff0000', '#0000ff'] } },
+            three: { palette: { background: '#00ff00', colorA: '#ff00ff', colorB: '#00ffff', colorMix: '#ffff00', peak: '#000000' } },
+        };
+        for (const [name, spectrogram] of Object.entries(cases)) {
+            const ui = document.body.appendChild(document.createElement('div'));
+            ui.style.width = '600px';
+            const box = ui.appendChild(document.createElement('div'));
+            box.style.height = '120px';
+            const player = h.createAudioPlayer({ element: ui, prewarmSpeeds: false, stretcher: 'native' });
+            const view = h.createTimeline(box, player, { display: 'spectrogram', theme: 'light', spectrogram });
+            const canvas = box.querySelector('canvas.rtd-spectrogram');
+            await player.load(h.buffer(4, 220));
+            const pixel = (x, y) => Array.from(canvas.getContext('2d').getImageData(x, y, 1, 1).data);
+            const t0 = performance.now();
+            while (pixel(10, 2)[3] === 0 && performance.now() - t0 < 5000) await h.sleep(20);
+            await h.sleep(300);
+            out[name] = pixel(10, 2).slice(0, 3);
+            view.dispose();
+            player.dispose();
+            ui.remove();
+        }
+        return out;
+    });
+    const near = (p, hex) => {
+        const n = parseInt(hex.slice(1), 16);
+        return Math.abs(p[0] - ((n >> 16) & 255)) + Math.abs(p[1] - ((n >> 8) & 255)) + Math.abs(p[2] - (n & 255)) < 30;
+    };
+    // The top rows (no energy there) are each map's quiet end.
+    expect(near(r.viridis, '#440154')).toBe(true);
+    expect(near(r.viridis_r, '#fde725')).toBe(true);
+    expect(near(r.stops, '#ff0000')).toBe(true);
+    // A palette of its own colours turns the theme's colormap off.
+    expect(near(r.three, '#00ff00')).toBe(true);
+});

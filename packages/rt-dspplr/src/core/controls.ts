@@ -10,6 +10,9 @@ export const COMPRESSION_DEFAULT = 0;
 export const OUTPUT_MIN_DB = -24;
 export const OUTPUT_MAX_DB = 24;
 export const OUTPUT_DEFAULT_DB = 0;
+export const INPUT_MIN_DB = -24;
+export const INPUT_MAX_DB = 24;
+export const INPUT_DEFAULT_DB = 0;
 export const LIMITER_CEILING_DB = -0.01;
 export const DEFAULT_SPEEDS = [1, 1.25, 1.5, 2] as const;
 /** Playback speeds outside this range are clamped: slower renders a buffer many times the clip, faster has no use. */
@@ -22,11 +25,13 @@ export const MIX_DEFAULT = 0;
  * stored, synced, or set from any UI.
  */
 export interface ProcessingState {
+    /** Gain before all processing (high-pass, compressor, plugins), in dB. -Infinity = muted. */
+    inputGainDb: number;
     /** 4th-order (24 dB/oct) high-pass cutoff in Hz. 0 = bypassed. */
     highPassHz: number;
     /** Peak compressor amount, 0 (off) to 1 (maximum). */
     compression: number;
-    /** Make-up gain before the -0.01 dBFS limiter, in dB. -Infinity = muted. */
+    /** Gain after all processing, before the -0.01 dBFS ceiling, in dB. -Infinity = muted. */
     outputGainDb: number;
     /** Playback speed. Pitch is preserved when a stretch strategy is available. */
     speed: number;
@@ -53,6 +58,7 @@ export function mixGains(mix: number, law: MixLaw = 'crossfade'): [number, numbe
 }
 
 export const DEFAULT_PROCESSING: Readonly<ProcessingState> = Object.freeze({
+    inputGainDb: INPUT_DEFAULT_DB,
     highPassHz: HIGH_PASS_DEFAULT_HZ,
     compression: COMPRESSION_DEFAULT,
     outputGainDb: OUTPUT_DEFAULT_DB,
@@ -77,6 +83,12 @@ export function normalizeOutputGainDb(db: number): number {
     if (db === -Infinity) return -Infinity;
     if (!Number.isFinite(db)) return OUTPUT_DEFAULT_DB;
     return clamp(db, OUTPUT_MIN_DB, OUTPUT_MAX_DB);
+}
+
+export function normalizeInputGainDb(db: number): number {
+    if (db === -Infinity) return -Infinity;
+    if (!Number.isFinite(db)) return INPUT_DEFAULT_DB;
+    return clamp(db, INPUT_MIN_DB, INPUT_MAX_DB);
 }
 
 export function normalizeSpeed(speed: number): number {

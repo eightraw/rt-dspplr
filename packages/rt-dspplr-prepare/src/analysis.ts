@@ -11,6 +11,18 @@ export const DEFAULT_FRAMES_PER_PEAK = 256;
 export const LEVEL_STEP = 8;
 export const MAX_COARSEST_PEAKS = 2048;
 
+/**
+ * framesPerPeak, checked: a power of two from 16 to 65536. The analysis jobs
+ * are cut on a common multiple of it, the band bin and the spectrogram hop
+ * (powers of two too), so anything else would make them huge.
+ */
+export function checkFramesPerPeak(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 16 || value > 65536 || (value & (value - 1)) !== 0) {
+        throw new Error(`framesPerPeak must be a power of two from 16 to 65536, got ${String(value)}`);
+    }
+    return value;
+}
+
 function quantize(value: number): number {
     const v = Math.round(value * 32768);
     return v > 32767 ? 32767 : v < -32768 ? -32768 : v;

@@ -11,13 +11,15 @@ import type { SpectrogramData } from './SpectrogramAnalyzer';
 //
 // - 'single': one colour for the whole picture, taken from the mix position:
 //   stem A's colour at A alone, the mix colour with both, stem B's at B alone.
+//   With a colormap (palette.colormap) the level runs through the map's stops
+//   instead, whatever the mix.
 // - 'dual': each cell coloured by which stem it comes from, so the picture
 //   shows where the two parts are and fades one as the mix moves away from it.
 
 export type SpectrogramColorMode = 'single' | 'dual';
 
 export interface SpectrogramPalette {
-    /** Empty cells, and the bottom of every ramp. */
+    /** Empty cells, and the bottom of every ramp (a colormap's first colour replaces it). */
     background: string;
     /** Stem A alone. */
     colorA: string;
@@ -27,6 +29,44 @@ export interface SpectrogramPalette {
     colorMix: string;
     /** What the loudest cells run towards. */
     peak: string;
+    /**
+     * A colormap for colorMode 'single': a name of COLORMAPS ('magma', 'inferno',
+     * 'plasma', 'viridis', 'grey'; with '_r' reversed, e.g. 'magma_r'), or its
+     * colours from quiet to loud. Its first colour is the background. null or
+     * absent: the three-colour ramp above. 'dual' keeps the stem colours.
+     */
+    colormap?: ColormapName | `${ColormapName}_r` | readonly string[] | null;
+}
+
+/** The named colormaps. */
+export type ColormapName = 'magma' | 'inferno' | 'plasma' | 'viridis' | 'grey';
+
+/**
+ * Matplotlib's perceptually uniform colormaps (CC0), sampled at 11 points
+ * from quiet to loud; the painter interpolates between them.
+ */
+export const COLORMAPS: Readonly<Record<ColormapName, readonly string[]>> = Object.freeze({
+    magma: ['#000004', '#140e36', '#3b0f70', '#641a80', '#8c2981', '#b73779', '#de4968', '#f7705c', '#fe9f6d', '#fecf92', '#fcfdbf'],
+    inferno: ['#000004', '#160b39', '#420a68', '#6a176e', '#932667', '#bc3754', '#dd513a', '#f37819', '#fca50a', '#f6d746', '#fcffa4'],
+    plasma: ['#0d0887', '#41049d', '#6a00a8', '#8f0da4', '#b12a90', '#cc4778', '#e16462', '#f2844b', '#fca636', '#fcce25', '#f0f921'],
+    viridis: ['#440154', '#482475', '#414487', '#355f8d', '#2a788e', '#21918c', '#22a884', '#44bf70', '#7ad151', '#bddf26', '#fde725'],
+    grey: ['#000000', '#ffffff'],
+});
+
+/** A colormap's colours from quiet to loud, or null for none. */
+export function colormapStops(map: SpectrogramPalette['colormap']): readonly string[] | null {
+    if (!map) return null;
+    if (typeof map !== 'string') return map.length >= 2 ? map : null;
+    const name = map.trim();
+    const reversed = name.endsWith('_r');
+    const stops = COLORMAPS[(reversed ? name.slice(0, -2) : name) as ColormapName];
+    if (!stops) return null;
+    return reversed ? [...stops].reverse() : stops;
+}
+
+/** What empty cells are painted with: the colormap's first colour, else the background. */
+export function spectrogramBackground(palette: SpectrogramPalette): string {
+    return colormapStops(palette.colormap)?.[0] ?? palette.background;
 }
 
 /** Orange for stem A, blue for stem B, purple for both, on a dark panel: the colours of EQSEP 2. */
@@ -67,6 +107,35 @@ function lerp(a: Rgb, b: Rgb, k: number): Rgb {
 /** Stem A's colour at 0, the mix colour at 0.5, stem B's at 1. */
 function blend(palette: { a: Rgb; mix: Rgb; b: Rgb }, ratio: number): Rgb {
     return ratio <= 0.5 ? lerp(palette.a, palette.mix, ratio * 2) : lerp(palette.mix, palette.b, ratio * 2 - 1);
+}
+
+/** 256 RGBA entries through a colormap's stops, evenly spaced. */
+function rampStops(stops: readonly Rgb[]): Uint8ClampedArray {
+    const out = new Uint8ClampedArray(256 * 4);
+    const last = stops.length - 1;
+    for (let i = 0; i < 256; i += 1) {
+        const x = (i / 255) * last;
+        const k = Math.min(last - 1, Math.floor(x));
+        const c = lerp(stops[k], stops[k + 1], x - k);
+        out[i * 4] = c[0];
+        out[i * 4 + 1] = c[1];
+        out[i * 4 + 2] = c[2];
+        out[i * 4 + 3] = 255;
+    }
+    return out;
+}
+
+const mapLuts = new Map<string, Uint8ClampedArray>();
+
+function colormapLut(stops: readonly string[]): Uint8ClampedArray {
+    const key = stops.join(',');
+    let lut = mapLuts.get(key);
+    if (!lut) {
+        lut = rampStops(stops.map(parseColor));
+        if (mapLuts.size > 16) mapLuts.clear();
+        mapLuts.set(key, lut);
+    }
+    return lut;
 }
 
 /** 256 RGBA entries from the background through `color` to `peak`. */
@@ -130,7 +199,8 @@ export function paintSpectrogram(
 ): void {
     const pixels = target.data;
     const cells = Math.min(data.columns * data.rows, target.width * target.height);
-    const background = parseColor(look.palette.background);
+    const stops = colormapStops(look.palette.colormap);
+    const background = parseColor(spectrogramBackground(look.palette));
     const peak = parseColor(look.palette.peak);
     const colors = { a: parseColor(look.palette.colorA), mix: parseColor(look.palette.colorMix), b: parseColor(look.palette.colorB) };
     const referenceDb = 20 * Math.log10(reference + 1e-9);
@@ -145,7 +215,7 @@ export function paintSpectrogram(
 
     if (look.colorMode === 'single' || !magB) {
         const total = effectiveA + gainB;
-        const lut = ramp(background, blend(colors, total > 0 ? gainB / total : 0), peak);
+        const lut = stops ? colormapLut(stops) : ramp(background, blend(colors, total > 0 ? gainB / total : 0), peak);
         for (let i = 0; i < cells; i += 1) {
             const m = effectiveA * data.magA[i] + (magB ? gainB * magB[i] : 0);
             const o = levelIndex(m, scale, offset) * 4;

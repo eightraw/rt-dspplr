@@ -1,24 +1,21 @@
 import type { AudioManifest } from './manifest';
-import { parseWavFile } from './wavFormat';
+import { decodeRun } from './RunDecoder';
+import { segmentFromRun } from './sourceRuns';
 
 // ---------------------------------------------------------------------------
-// SegmentStore — fetches and decodes segments on demand and keeps a
-// byte-bounded LRU of decoded ones. The player tells it, on every pump, which
+// SegmentStore — fetches segments on demand (byte ranges of the clip's source,
+// decoded by RunDecoder) and keeps a byte-bounded LRU of decoded ones. The player tells it, on every pump, which
 // segments matter and in what order (playing, next, loop start, on screen,
 // prefetch); eviction drops everything else first, least recently used first,
 // then the least important wanted ones, but never the first `essential`.
+// A segment that fails (HTTP error, bad data) is retried with a growing pause
+// (250 ms doubling to 8 s), never on every pump; onError() reports each failure.
 // ---------------------------------------------------------------------------
 
-/**
- * 'pcm' parses the 16-bit WAV on the main thread into an AudioBuffer at the
- * manifest's rate (no resampling, sample-exact). 'native' uses
- * decodeAudioData (off the main thread, but resamples to the context's rate
- * when it differs).
- */
-export type SegmentDecode = 'pcm' | 'native';
+const RETRY_FIRST_MS = 250;
+const RETRY_MAX_MS = 8000;
 
 export interface SegmentStoreOptions {
-    decode?: SegmentDecode;
     fetchOptions?: RequestInit;
     /** Decoded-audio budget in bytes. */
     maxBytes: number;
@@ -55,8 +52,7 @@ interface Job {
 }
 
 export class SegmentStore {
-    private readonly _urls: string[];
-    private readonly _ctx: BaseAudioContext;
+    private readonly _sourceUrl: string;
     private readonly _manifest: AudioManifest;
     private readonly _options: Required<Omit<SegmentStoreOptions, 'fetchOptions'>> & { fetchOptions?: RequestInit };
     private readonly _cache = new Map<number, Entry>();
@@ -67,17 +63,15 @@ export class SegmentStore {
     private _bytes = 0;
     private _disposed = false;
     private _listeners = new Set<(index: number) => void>();
+    private _errorListeners = new Set<(index: number, error: Error, failures: number) => void>();
+    /** Segments that failed: how often in a row, and when the next try may start. */
+    private readonly _failures = new Map<number, { count: number; retryAt: number }>();
     private readonly _stats = { peak: 0, fetches: 0, fetchedBytes: 0, fetchMs: 0, decodeMs: 0, evictions: 0 };
 
-    constructor(manifestUrl: string, manifest: AudioManifest, ctx: BaseAudioContext, options: SegmentStoreOptions) {
+    constructor(manifestUrl: string, manifest: AudioManifest, options: SegmentStoreOptions) {
         this._manifest = manifest;
-        this._ctx = ctx;
-        this._urls = manifest.segments.list.map((s) => new URL(s.url, manifestUrl).href);
-        this._options = { decode: 'pcm', concurrency: 3, ...options };
-    }
-
-    get decode(): SegmentDecode {
-        return this._options.decode;
+        this._sourceUrl = new URL(manifest.segments.source.url, manifestUrl).href;
+        this._options = { concurrency: 3, ...options };
     }
 
     /** A decoded segment, or null. Marks it as used. */
@@ -102,11 +96,27 @@ export class SegmentStore {
         return () => this._listeners.delete(listener);
     }
 
-    /** Fetch + decode (deduplicated). `urgent` jumps the queue. Resolves null if cancelled. */
+    /** Called when a segment fails, with how many times in a row it has. */
+    onError(listener: (index: number, error: Error, failures: number) => void): () => void {
+        this._errorListeners.add(listener);
+        return () => this._errorListeners.delete(listener);
+    }
+
+    /** Failures in a row of a segment (0 once it loads). */
+    failures(index: number): number {
+        return this._failures.get(index)?.count ?? 0;
+    }
+
+    /**
+     * Fetch + decode (deduplicated). `urgent` jumps the queue. Resolves null if
+     * cancelled, or at once while a failed segment waits for its next retry.
+     */
     load(index: number, urgent = false): Promise<AudioBuffer | null> {
         const cached = this.get(index);
         if (cached) return Promise.resolve(cached);
-        if (index < 0 || index >= this._urls.length || this._disposed) return Promise.resolve(null);
+        if (index < 0 || index >= this._manifest.segments.list.length || this._disposed) return Promise.resolve(null);
+        const failed = this._failures.get(index);
+        if (failed && performance.now() < failed.retryAt && !this._jobs.has(index)) return Promise.resolve(null);
         const existing = this._jobs.get(index);
         if (existing) {
             if (urgent && !existing.started) {
@@ -160,6 +170,24 @@ export class SegmentStore {
 
     private _retain: { wanted: number[]; essential: number } = { wanted: [], essential: 2 };
 
+    /**
+     * The leading part of `wanted` (priority order) whose decoded audio fits the
+     * budget: loading more would only evict it again on the next pump.
+     */
+    withinBudget(wanted: number[]): number[] {
+        const list = this._manifest.segments.list;
+        const out: number[] = [];
+        let bytes = 0;
+        for (const i of wanted) {
+            const seg = list[i];
+            if (!seg) continue;
+            bytes += seg.frames * this._manifest.channels * 4;
+            if (bytes > this._options.maxBytes && out.length > 0) break;
+            out.push(i);
+        }
+        return out;
+    }
+
     stats(): SegmentStoreStats {
         const loaded = Math.max(1, this._stats.fetches);
         return {
@@ -184,6 +212,8 @@ export class SegmentStore {
         this._cache.clear();
         this._bytes = 0;
         this._listeners.clear();
+        this._errorListeners.clear();
+        this._failures.clear();
     }
 
     private _drop(index: number): void {
@@ -215,18 +245,31 @@ export class SegmentStore {
     private async _run(job: Job): Promise<void> {
         const t0 = performance.now();
         try {
-            const response = await fetch(this._urls[job.index], { ...this._options.fetchOptions, signal: job.controller.signal });
-            if (!response.ok) throw new Error(`Segment ${job.index}: HTTP ${response.status}`);
-            const bytes = await response.arrayBuffer();
+            const seg = this._manifest.segments.list[job.index];
+            let bytes: ArrayBuffer | null = null;
+            let fetched = 0;
+            if (seg.range) {
+                const [start, end] = seg.range;
+                const headers = new Headers(this._options.fetchOptions?.headers);
+                headers.set('range', `bytes=${start}-${end - 1}`);
+                const response = await fetch(this._sourceUrl, { ...this._options.fetchOptions, headers, signal: job.controller.signal });
+                if (!response.ok) throw new Error(`Segment ${job.index}: HTTP ${response.status}`);
+                bytes = await response.arrayBuffer();
+                fetched = bytes.byteLength;
+                // A server that ignores ranges sends the whole file: the run is cut out of it.
+                if (response.status === 200 && bytes.byteLength > end - start) bytes = bytes.slice(start, end);
+            }
             const t1 = performance.now();
-            const buffer = await this._decode(bytes);
+            const run = bytes ? await decodeRun(this._manifest.segments.source, bytes) : null;
+            const buffer = this._toBuffer(segmentFromRun(run, seg, this._manifest.channels));
             const t2 = performance.now();
             if (job.controller.signal.aborted || this._disposed) {
                 this._finish(job, null);
                 return;
             }
+            this._failures.delete(job.index);
             this._stats.fetches += 1;
-            this._stats.fetchedBytes += bytes.byteLength;
+            this._stats.fetchedBytes += fetched;
             this._stats.fetchMs += t1 - t0;
             this._stats.decodeMs += t2 - t1;
             const size = buffer.length * buffer.numberOfChannels * 4;
@@ -237,18 +280,23 @@ export class SegmentStore {
             this._finish(job, buffer);
             for (const listener of [...this._listeners]) listener(job.index);
         } catch (error) {
-            if (!job.controller.signal.aborted) console.warn('[StreamPlayer] segment failed', job.index, error);
+            if (job.controller.signal.aborted || this._disposed) {
+                this._finish(job, null);
+                return;
+            }
+            const count = (this._failures.get(job.index)?.count ?? 0) + 1;
+            this._failures.set(job.index, { count, retryAt: performance.now() + Math.min(RETRY_MAX_MS, RETRY_FIRST_MS * 2 ** (count - 1)) });
+            console.warn('[AudioPlayer] segment failed', job.index, error);
             this._finish(job, null);
+            const err = error instanceof Error ? error : new Error(String(error));
+            for (const listener of [...this._errorListeners]) listener(job.index, err, count);
         }
     }
 
-    private async _decode(bytes: ArrayBuffer): Promise<AudioBuffer> {
-        if (this._options.decode === 'native') {
-            return this._ctx.decodeAudioData(bytes);
-        }
-        const wav = parseWavFile(bytes);
-        const buffer = new AudioBuffer({ length: Math.max(1, wav.frames), numberOfChannels: wav.channels.length, sampleRate: wav.sampleRate || this._manifest.sampleRate });
-        wav.channels.forEach((data, c) => buffer.copyToChannel(data, c));
+    /** The segment's frames at the timeline's rate (the engine converts to the context's). */
+    private _toBuffer(planes: Float32Array[]): AudioBuffer {
+        const buffer = new AudioBuffer({ length: Math.max(1, planes[0]?.length ?? 1), numberOfChannels: planes.length, sampleRate: this._manifest.sampleRate });
+        planes.forEach((data, c) => buffer.copyToChannel(data, c));
         return buffer;
     }
 }

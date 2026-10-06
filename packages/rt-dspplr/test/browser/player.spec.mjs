@@ -297,6 +297,43 @@ test('switching from URL to bytes cancels an older fetch', async ({ page }) => {
     expect(result).toEqual({ id: 'new-buffer', duration: 4, playing: true });
 });
 
+test('a new player loading a cached A/B pair keeps stem B in its state (B may land before A)', async ({ page }) => {
+    // A page left and opened again: a new player, both stems already decoded in the shared cache.
+    // B was installed before A's load finished, and A's "ready" wiped state.bufferB: the knob
+    // still moved the sound, but the spectrogram drew A alone and stopped following the mix.
+    const result = await page.evaluate(async () => {
+        const originalFetch = window.fetch;
+        window.fetch = async (url, options) => {
+            if (/\/pair-[ab]\.wav$/.test(String(url))) return new Response(h.wav(3));
+            return originalFetch(url, options);
+        };
+        const clip = { id: 'pair', src: '/pair-a.wav', srcB: '/pair-b.wav' };
+        const options = { mixLaw: 'separation', processing: { highPassHz: 0, compression: 0, mix: 0.5 } };
+        const settled = async (p) => {
+            const t0 = performance.now();
+            while (p.getState().statusB !== 'ready' && performance.now() - t0 < 4000) await h.sleep(10);
+            await h.sleep(60);
+            const s = p.getState();
+            return { statusB: s.statusB, bufferB: !!s.bufferB };
+        };
+        const first = h.make(options);
+        await first.load(clip);
+        const firstVisit = await settled(first);
+        first.dispose();
+        const visits = [];
+        for (let i = 0; i < 5; i += 1) {
+            const p = h.make(options);
+            await p.load(clip);
+            visits.push(await settled(p));
+            p.dispose();
+        }
+        window.fetch = originalFetch;
+        return { firstVisit, visits };
+    });
+    expect(result.firstVisit).toEqual({ statusB: 'ready', bufferB: true });
+    for (const visit of result.visits) expect(visit).toEqual({ statusB: 'ready', bufferB: true });
+});
+
 test('seek during speed preparation cancels the stale speed switch', async ({ page }) => {
     const result = await page.evaluate(async () => {
         const p = h.make({ stretcher: h.delayedStrategy(150) }); await p.play(h.buffer());

@@ -358,10 +358,13 @@ function buildProcessedPyramid(processing: WaveformProcessing): WaveformPeakPyra
     const [gainA, gainB] = mixGains(processing.mix ?? 0, processing.mixLaw);
     const mixesB = channelDataB.length > 0 && (gainA !== 1 || gainB !== 0);
 
+    // The input gain comes first in the chain: the plugins' previews see it (the linear stages do not care).
+    const inGain = Math.max(0, processing.inputGain ?? 1);
+    const staged = !!processing.stages && processing.stages.length > 0;
     let levelRatio: Float32Array | null = null;
-    if (processing.stages && processing.stages.length > 0) {
+    if (staged) {
         // Plugins with a process() preview: every sample-level stage in chain order.
-        levelRatio = computeStagedPeaks(minPeaks, maxPeaks, rmsSq, processing.stages, mixesB ? gainA : 1, mixesB ? gainB : 0);
+        levelRatio = computeStagedPeaks(minPeaks, maxPeaks, rmsSq, processing.stages!, (mixesB ? gainA : 1) * inGain, (mixesB ? gainB : 0) * inGain);
     } else if (hpEnabled) {
         if (mixesB) {
             computeMixedHighPassFilteredPeaks(minPeaks, maxPeaks, rmsSq, processing.highPassHz, gainA, gainB);
@@ -394,8 +397,17 @@ function buildProcessedPyramid(processing: WaveformProcessing): WaveformPeakPyra
     const outGain = Math.max(0, processing.outputGain);
     const ceilingGain = dbToGain(LIMITER_CEILING_DB);
 
+    if (!staged && inGain !== 1) {
+        for (let i = 0; i < rmsPeaks.length; i += 1) {
+            minPeaks[i] *= inGain;
+            maxPeaks[i] *= inGain;
+            rmsPeaks[i] *= inGain;
+        }
+    }
     const gains = new Float32Array(rmsPeaks.length);
     applyDynamicsAtBinRate(minPeaks, maxPeaks, rmsPeaks, compAmount, outGain, ceilingGain, currentSampleRate / BASE_BIN_SIZE, undefined, gains);
+    // The gain track is relative to the unprocessed clip: the input gain is part of it.
+    if (inGain !== 1) for (let i = 0; i < gains.length; i += 1) gains[i] *= inGain;
     const gainValues = downsampleGains(gains, GAIN_FACTOR);
     // The measured level change of plugins without a magnitude response joins the column gain.
     if (levelRatio) for (let i = 0; i < gainValues.length; i += 1) gainValues[i] *= levelRatio[i] ?? 1;

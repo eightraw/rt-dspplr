@@ -28,6 +28,9 @@ export {
     HIGH_PASS_DEFAULT_HZ,
     HIGH_PASS_MAX_HZ,
     COMPRESSION_DEFAULT,
+    INPUT_DEFAULT_DB,
+    INPUT_MAX_DB,
+    INPUT_MIN_DB,
     OUTPUT_DEFAULT_DB,
     OUTPUT_MAX_DB,
     OUTPUT_MIN_DB,
@@ -126,7 +129,10 @@ export {
     type SpectrogramView,
 } from './core/spectrogram/SpectrogramView';
 export {
+    COLORMAPS,
     DEFAULT_SPECTROGRAM_PALETTE,
+    colormapStops,
+    type ColormapName,
     type SpectrogramPalette,
     type SpectrogramColorMode,
 } from './core/spectrogram/paint';
