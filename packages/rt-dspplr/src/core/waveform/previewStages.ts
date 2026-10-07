@@ -6,33 +6,54 @@ import { HIGH_PASS_SECTION_Q, clampHighPassHz, computeHighPassCoefficients } fro
 // Sample-level preview stages, run in a preview worker over the clip's audio,
 // chunk by chunk: the built-in high-pass (stateful biquads) and third-party
 // plugins' process() functions (their source compiled once per worker, from a
-// Blob URL with importScripts, so no eval). A stage that throws is skipped from
-// then on and reported; the rest of the preview goes on.
+// Blob URL with importScripts, so no eval). A source that does not compile is
+// reported back (the player counts its plugin as missing from the previews). A
+// stage that throws is skipped from then on and reported; the rest of the
+// preview goes on.
 // ---------------------------------------------------------------------------
 
 declare const importScripts: ((...urls: string[]) => void) | undefined;
 
 const compiled = new Map<string, PluginPreviewProcess | null>();
+/** Sources that did not compile here (and will not anywhere). */
+const uncompilable = new Set<string>();
+
+/** The value of `expression`, evaluated from a Blob URL. Throws what the script throws (a SyntaxError when it does not parse). */
+function evaluate(expression: string): unknown {
+    const scope = self as unknown as { __rtdStage?: unknown };
+    scope.__rtdStage = undefined;
+    const url = URL.createObjectURL(new Blob([`self.__rtdStage = ${expression};`], { type: 'text/javascript' }));
+    try {
+        importScripts!(url);
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+    return scope.__rtdStage;
+}
 
 function compile(code: string): PluginPreviewProcess | null {
     if (compiled.has(code)) return compiled.get(code)!;
-    let fn: PluginPreviewProcess | null = null;
+    if (typeof importScripts !== 'function') return null;
+    let fn: unknown = null;
     try {
-        const scope = self as unknown as { __rtdStage?: PluginPreviewProcess };
-        scope.__rtdStage = undefined;
-        const url = URL.createObjectURL(new Blob([`self.__rtdStage = (${code});`], { type: 'text/javascript' }));
+        // A function or an arrow is an expression as it stands. A method of any kind
+        // (`process(…) {…}`, `async process…`, `'process'(…)`, `['process'](…)`) is
+        // one inside an object literal.
         try {
-            if (typeof importScripts === 'function') importScripts(url);
-        } finally {
-            URL.revokeObjectURL(url);
+            fn = evaluate(`(${code}\n)`);
+        } catch (error) {
+            if (!(error instanceof SyntaxError)) throw error;
+            fn = evaluate(`Object.values({${code}\n})[0]`);
         }
-        fn = typeof scope.__rtdStage === 'function' ? scope.__rtdStage : null;
+        // Called synchronously on buffers that are reused as soon as it returns.
+        if (Object.prototype.toString.call(fn) !== '[object Function]') throw new TypeError('not a plain (synchronous) function');
     } catch (error) {
         console.warn('[preview] a plugin preview could not be compiled; it is left out', error);
         fn = null;
+        uncompilable.add(code);
     }
-    compiled.set(code, fn);
-    return fn;
+    compiled.set(code, fn as PluginPreviewProcess | null);
+    return fn as PluginPreviewProcess | null;
 }
 
 export interface StageRunner {
@@ -41,6 +62,8 @@ export interface StageRunner {
     /** Per-gain-bin level ratio of the stages that asked to be measured (out / in, RMS), or null. */
     readonly levelRatio: Float32Array | null;
     readonly failed: string[];
+    /** Sources of the stages that did not compile (left out from the start). */
+    readonly uncompiled: string[];
 }
 
 /**
@@ -57,6 +80,7 @@ export function createStageRunner(stages: PreviewStage[], channelCount: number, 
     const before = measure ? new Float64Array(bins) : null;
     const after = measure ? new Float64Array(bins) : null;
     const failed: string[] = [];
+    const uncompiled = stages.flatMap((s) => (s.kind === 'process' && uncompilable.has(s.code) ? [s.code] : []));
     let position = 0;
 
     const sumSquares = (chunk: Float32Array[], into: Float64Array) => {
@@ -73,6 +97,7 @@ export function createStageRunner(stages: PreviewStage[], channelCount: number, 
             return out;
         },
         failed,
+        uncompiled,
         run(chunk, sampleRate) {
             stages.forEach((stage, k) => {
                 const levelStage = stage.kind === 'process' && stage.level;

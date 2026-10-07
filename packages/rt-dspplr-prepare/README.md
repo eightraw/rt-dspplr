@@ -57,16 +57,19 @@ npx rtd-prepare talk.wav prepared/talk --stem b=talk.processed.wav --label b="No
 
 | Option | Default | |
 |---|---|---|
-| `--segment <seconds>` | `10` | Segment length: what the player fetches at a time. |
+| `--segment <seconds>` | `10` | Segment length: what the player fetches at a time. 0.1 to 60. |
 | `--peak <frames>` | `256` | Finest peak level, frames per peak: a power of two from 16 to 65536. |
-| `--concurrency <threads>` | cores − 1 | Analysis threads. The output is byte-identical for any value. |
+| `--concurrency <threads>` | cores − 1 | Analysis threads, 1 to 64. The output is byte-identical for any value. |
 | `--stem <key>=<file>` | none | A ready-made stem (repeatable). See [Stems](#stems). |
 | `--label <key>=<text>` | none | A human label for that stem (shown by the player's card). |
 | `--decoder ffmpeg \| docker:<image>` | built-in | Formats the built-in decoder does not read, through ffmpeg (local, or in a container without network). Experimental. |
+| `--demuxers <name,...> \| any` | `AUDIO_DEMUXERS` | With `--decoder`: the input formats ffmpeg may open (see [ffmpeg](#ffmpeg)). `any` lets it probe everything. |
 | `--quiet` | | No progress on stderr. |
 
 It prints a JSON summary on stdout (duration, segments, sizes, time, peak
-memory, stems) and exits non-zero on failure.
+memory, stems) and exits non-zero on failure: 2 for a bad command line (a
+number out of range or not a plain number, a Docker image name that is not one),
+before anything is read.
 
 ## API
 
@@ -87,12 +90,12 @@ The input is a path, a `ReadableStream<Uint8Array>` or an
 |---|---|---|
 | `outDir` | | Write into this folder. Either this or `storage`. |
 | `storage` | | `{ putObject(key, bytes, contentType), putFile?, getObject?, getRange? }`: see [Storage](#storage). |
-| `segmentSeconds` | `10` | What the player fetches at a time. |
+| `segmentSeconds` | `10` | What the player fetches at a time: 0.1 to 60 (the player refuses longer segments). |
 | `framesPerPeak` | `256` | A power of two from 16 to 65536. |
 | `bands`, `spectrogram` | `true` | Write bands.bin / spectrogram.bin. |
 | `resampler` | | The converter of a stem at another rate than A. |
 | `pool` | | Threads kept between calls (`createPreparePool()`): what a service should pass. |
-| `concurrency` | cores − 1, none below ~24 MB | Worker threads made for this call when there is no `pool`. A short input runs on the calling thread: a pool made for one call starts cold and costs more than it saves. |
+| `concurrency` | cores − 1, none below ~24 MB | Worker threads made for this call when there is no `pool`: an integer from 1 to 64. A short input runs on the calling thread: a pool made for one call starts cold and costs more than it saves. |
 | `decoder` | built-in | WAV, MP3, Ogg Opus and FLAC are read in process; `ffmpegDecoder()` or your own `AudioDecoder` for anything else. |
 | `sizeHint`, `name` | | Progress for streams; the name recorded in the manifest (its last path part only: no file is ever named after it). |
 | `stems` | | Named stems in the same manifest. See below. |
@@ -117,26 +120,65 @@ context's. Non-finite samples, which a float WAV or a custom decoder may hold,
 are replaced (NaN by 0, ±Infinity by ±1) and counted in `job.stats.warnings`;
 the file that holds them is then kept as a 16-bit WAV of the clean samples.
 Before the manifest is written it is checked with the player's own
-`assertManifest()`: one the player would refuse fails the job instead.
+`assertManifest()`: one the player would refuse fails the job instead. What the
+player cannot play is refused up front: A at a rate outside 8 to 384 kHz, A or
+a stem with more than 32 channels (a stem at any other rate is converted to A's).
+`checkSegmentSeconds()`, `checkConcurrency()` and `checkFramesPerPeak()` are
+exported for hosts that check their options first.
+
+A source that fails while it is read (a network stream cut, a disk error) fails
+the job with that error, whatever the decoder makes of it: the recording is never
+published shorter than it is.
 
 ### The source and its index
 
 WAV, MP3 and Ogg Opus (mono or stereo) are kept as they are. The index is
 checked before it is published: the first segment, one past the middle and the
-last are read back the player's way and compared with what was decoded. A file
-whose index does not read back right (a damaged or unusual stream) is kept as a
-16-bit WAV of what was decoded instead, with a warning in `job.stats.warnings`;
-so is FLAC (not indexed yet), and anything read through `ffmpegDecoder()` or a
-decoder of your own.
+last are read back the player's way and compared with what was decoded, and for
+an MP3 also the segment whose run reaches back furthest, against the same
+segment from a run that starts much earlier. A file whose index does not read
+back right (a damaged or unusual stream) is kept as a 16-bit WAV of what was
+decoded instead, with a warning in `job.stats.warnings`; so is FLAC (not indexed
+yet), and anything read through `ffmpegDecoder()` or a decoder of your own.
 
 | Source | A segment's run | Read back |
 |---|---|---|
 | WAV | its frames of the `data` chunk | exact |
-| MP3 | whole frames, from 6 frames before the segment (the bit reservoir) | exact |
+| MP3 | whole frames, from where the bit reservoir (511 bytes of main data, 255 for MPEG-2) is full two frames before the segment's: 6 frames from about 80 kbit/s (MPEG-1 stereo), 12 at 32 kbit/s and 48 kHz, around 50 in the silence of a VBR -V9 file | exact |
 | Opus | whole Ogg pages, from a packet at least 500 ms before the segment (the decoder converges) | within float rounding (about −140 dB) |
 
 The fetch overhead is that warm-up and the page or frame granularity: about 2 %
 for MP3 and 10–20 % for Opus with 1 s pages at 10 s segments.
+
+### ffmpeg
+
+`ffmpegDecoder()` reads what the built-in decoder does not (AAC/M4A, Ogg Vorbis,
+Opus in WebM, WMA, AIFF...) by piping the source through ffmpeg. Experimental.
+
+```ts
+import { AUDIO_DEMUXERS, ffmpegDecoder, prepareAudio } from '@saitdigital/rt-dspplr-prepare';
+
+prepareAudio(upload, { outDir, decoder: ffmpegDecoder({ demuxers: AUDIO_DEMUXERS }) });
+// ffmpeg in a container without network:
+ffmpegDecoder({ command: ['docker', 'run', '--rm', '-i', '--network', 'none', 'my-ffmpeg-image', 'ffmpeg'] });
+```
+
+| Option | Default | |
+|---|---|---|
+| `command` | `['ffmpeg']` | What runs ffmpeg; its arguments are appended. |
+| `demuxers` | any | The demuxers ffmpeg may pick for the input (its `-format_whitelist`): one that probes as anything else fails with "Format not on whitelist". |
+| `inputArgs` | | Arguments before `-i`: `['-f', 'mp3']` reads the input as that one format, without probing. |
+
+ffmpeg picks its demuxer from the bytes, among every one it has. For untrusted
+uploads pass `demuxers`, or pin one format with `inputArgs`. `AUDIO_DEMUXERS`
+lists the usual audio containers: MP4/M4A/3GP, raw AAC, Ogg, Matroska/WebM, WMA,
+AIFF, CAF, WAV/W64, FLAC, MP3, WavPack, Monkey's Audio, TTA, AC-3, E-AC-3, DTS,
+AMR, AU and Musepack. It leaves out video containers such as MPEG-TS, MPEG-PS,
+AVI and FLV. With ffmpeg 4.3, M4A (AAC and ALAC), raw AAC, Ogg Vorbis, Opus in
+WebM and Ogg, WMA, AIFF, Matroska, WavPack, AC-3, FLAC, MP3, W64, AU and an MP4
+with video decode the same with the list as without it; MPEG-TS and MPEG-PS are
+refused. The API leaves it off by default; the CLI's `--decoder` uses it unless
+`--demuxers` names others (`--demuxers any`: no list).
 
 ## Stems
 
@@ -248,7 +290,9 @@ Adapters:
   copy across devices, in a folder of its own: never A's own folder), and a
   scratch folder at `/work` where `{out}` goes. No network by default, and
   `--security-opt no-new-privileges`. A mount path with a comma, a quote or a
-  control character is refused (it would add `--mount` options). The container
+  control character is refused (it would add `--mount` options), and so is an
+  `image` that is not an image reference (`--privileged` would be a flag:
+  `checkDockerImage()`, as the CLI's `docker:<image>` is checked). The container
   is killed on cancel. It runs as the image's user, often root, and gets neither
   `--cap-drop ALL` nor `--user` by default: it writes `{out}` into a scratch
   folder that belongs to the server's user (mode 0700), and a container user
@@ -313,8 +357,10 @@ After a worker fails (`pool.failed` is set) every call through it fails: make a
 new one. Measured, 20 s stereo with two stems: 349 ms with no pool, 192 ms with
 a kept pool of 11 threads (desktop); 1.2–1.5 s and 0.9–1.3 s on a 2-vCPU VPS.
 
-- Peak memory at the default concurrency (cores − 1) is about 0.5 GB RSS for any
-  length; `concurrency: 4` keeps it under 300 MB, `concurrency: 1` near 150 MB.
+- Peak memory at the default concurrency (cores − 1) is about 0.5 GB RSS for an
+  hour or so; `concurrency: 4` keeps it under 300 MB, `concurrency: 1` near
+  150 MB. The overview files' data adds about 40 MB per hour of 48 kHz stereo
+  (half for mono): 24 h of stereo peaked at 1.2 GB with `concurrency: 4`.
 - Measured on 11 threads: 60 min mono 48 kHz in about 4 s; a 30 min stereo MP3
   in 3.7 s; a stem adds 2–6 s (decoding it twice, its analyses, reading A back
   for the pairing).
@@ -340,6 +386,8 @@ Validation and the binary formats are in `@saitdigital/rt-dspplr/format`
   read in process: it needs `ffmpegDecoder()`.
 - `ffmpegDecoder` is experimental and does not trim MP3 encoder delay. It runs
   ffmpeg with `-protocol_whitelist pipe` (the input cannot make it open a file
-  or a URL), and stops it on cancel or when the reader stops early.
+  or a URL), with `-format_whitelist` when given `demuxers` (see [ffmpeg](#ffmpeg)),
+  and stops it on cancel, when the reader stops early, or when the source fails
+  (ffmpeg would end the recording there).
 - `attachStem` reads A back from its source: `outDir`, or a storage with `getRange` or `getObject`.
 - An HTTP processor receives A as it was given (not resampled).

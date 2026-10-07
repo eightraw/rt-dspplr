@@ -125,6 +125,79 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
   opened again, so a new player) could lose stem B from its state: B, installed
   while A's load was finishing, was cleared by A's "ready". The spectrogram then
   drew stem A alone in A's colour and stopped following the mix.
+- **The high-pass was not the one drawn.** Web Audio reads a biquad's Q in dB for
+  high-pass and low-pass filters; the player passed the linear Butterworth Q, so
+  what played had +1.85 dB at the cutoff and a +3.8 dB bump just above it, where
+  the waveform, the spectrogram and the plugin's response show −3 dB and no bump.
+  The nodes now get the Q in dB (−5.33 and +2.32 dB) and match the previews.
+- A seek, play or pause while a whole file is still loading is applied once it is
+  decoded (the last call wins). Before, it cancelled the autoplay, lost the seek
+  target, and could start playback from 0 at the next speed change.
+- A prepared clip: `resume()` followed by `pause()` or `stop()` (in the same tick,
+  or while the engine was being set up) no longer starts playing, and a seek in
+  that window is where playback starts.
+- **iOS and blocked audio.** `play()`, `toggle()` and an autoplaying `load()`
+  resume the AudioContext synchronously, inside the user's gesture. When the
+  context is interrupted (a call, Siri) or suspended while playing, the player
+  pauses at the position it had and says why in the new `state.suspended`
+  (`'interrupted'`); a play that cannot get the output running reports
+  `'blocked'` instead of failing silently.
+- The native compressor (the fallback without AudioWorklet, e.g. under a CSP
+  without `blob:`) applied the spec's automatic makeup gain and was up to 12–15 dB
+  louder than the worklet at full compression. It is compensated (and its knee
+  centred as the worklet's), its parameters glide instead of stepping, and it
+  stays within about 1 dB of the worklet.
+- Whole files: new `maxClipBytes` and `maxClipSeconds` options fail a file that is
+  too big early (from Content-Length, then while reading, then after decoding)
+  with a `ClipTooLargeError` that points to prepared playback. A known length is
+  read into one buffer instead of chunks plus a joined copy. A decode that finishes
+  after its load was abandoned is kept in the cache.
+- Speed renders belong to the players waiting for them: a player that leaves a
+  clip drops its queued renders and stops a running one nobody else waits for, so
+  the next clip's render no longer queues behind it, and one player no longer
+  cancels another's prewarm of a shared clip.
+- Manifests and the files they name: only http(s) URLs are fetched (blob: only for
+  a blob: manifest); the host's `fetchOptions` headers and credentials go only to
+  the manifest's own origin and to origins listed in the new `fetchOptionsOrigins`
+  (other origins, a CDN say, are still fetched, without them). Manifest limits:
+  8000–384000 Hz, 1–32 channels, segments of at most 60 s
+  (`MIN_SAMPLE_RATE`, `MAX_SAMPLE_RATE`, `MAX_CHANNELS`, `MAX_SEGMENT_SECONDS` in
+  `./format`), and a source's rate and channels must match the timeline (Opus:
+  48 kHz); a decoded run that does not match fails its segment. bands.bin is
+  length-checked before anything is allocated.
+- A server that ignores Range requests: a source up to 64 MB is downloaded once and
+  every segment cut from it; a larger one fails at once with "The server ignores
+  HTTP Range requests" instead of downloading the whole file per segment. A 206
+  whose length or Content-Range does not match, or a file whose size changed,
+  fails with a clear error that is not retried.
+- A new load aborts the previous one's manifest and overview downloads.
+  `refreshManifest()` ignores a manifest of another recording or another grid and
+  stems made from another A. A disposed stream engine frees its audio at once, even
+  when its context never ran.
+- Effects: a plugin whose `dispose()` throws is reported and the chain still tears
+  down; a failed plugin stays out after the output is rebuilt and cannot be
+  un-bypassed; removing or moving an effect crossfades instead of clicking; a
+  module that failed to load is retried; two inline worklets with the same
+  id@version no longer share code.
+- Previews: `process()` written as an async function, a method with a quoted or
+  computed name, or an arrow with parenthesised defaults compiled to broken code
+  and was silently left out while `previewCoverage` counted it. Every plain form
+  compiles now; async and generator functions are left out with a warning and
+  counted as missing. Waveform rebuilds keep one request in flight and only the
+  latest waiting, so dragging a control no longer queues seconds of work.
+- React: `useAudioPlayer` re-arms its player in a layout effect, so a child that
+  loads in its own effect works under StrictMode (and React 19 `<Activity>`).
+- The credit menu opens inside the player (in the top layer), so it can be reached
+  inside a modal `<dialog>` or a focus trap.
+- Timeline and card: `[` and `]` set the loop at the playhead; the card keeps its
+  seek bar (zoom, focus) across the compact breakpoint; canvases follow a change
+  of pixel ratio; any CSS colour works in the spectrogram palette; 119.96 s is
+  spoken as "2 minutes 0 seconds"; `aria-controls` only while the target exists.
+- Smaller: the dynamics worklet stops when its player is disposed; Rubber Band
+  caches a WASM failure that cannot recover and retries others with a backoff;
+  status and stem B no longer stay stuck after a failed start; a caller's
+  `fetchOptions.signal` is honoured. The `webkitAudioContext` fallback is gone:
+  Safari 14.1 or later.
 
 ## @saitdigital/rt-dspplr-prepare 0.1.0
 
@@ -182,6 +255,21 @@ First release: the prepare step for long recordings. Node ≥ 20.19, ESM.
   pre-skip and end granule, FLAC is sample-exact. `builtinDecoder` is the
   default; `mp3Decoder`, `opusDecoder`, `flacDecoder` are exported, and
   `ffmpegDecoder()` stays for other formats.
+- **MP3 runs at low bitrates.** A run starts early enough that the bit reservoir
+  is full two frames before the segment (511 or 255 bytes of main data back, at
+  least 6 frames), so 32 kbit/s, 8 kbit/s and VBR files index exactly too; the
+  index check also reads the segment with the longest warm-up.
+- A source that fails while it is read (an upload cut short) fails the job with
+  its error, also through `ffmpegDecoder()` and for stems; it is never published
+  as a shorter recording.
+- Limits: `segmentSeconds` from 0.1 to 60, `concurrency` from 1 to 64 (the CLI
+  parses its numbers strictly and exits 2 on a bad one); a recording outside
+  8000–384000 Hz or 1–32 channels is refused with a clear message.
+- About 40 % less memory for the analyses of long recordings (24 h stereo: 1.9 →
+  1.2 GB), with byte-identical outputs.
+- `ffmpegDecoder({ demuxers })` restricts ffmpeg's demuxers (`-format_whitelist`);
+  `AUDIO_DEMUXERS` lists 21 audio containers, the CLI's default. `docker:<image>`
+  and `dockerProcessor` accept only an image reference.
 - Storage: `outDir`, or any `{ putObject, putFile?, getObject?, getRange? }`;
   `memoryStorage()`. A stream input is copied to the scratch folder on the way
   (it is stored as it is), and read to its end even when the decoder stops early,

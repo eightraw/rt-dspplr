@@ -10,6 +10,7 @@ import {
     DEFAULT_FRAMES_PER_BAND_BIN,
     MANIFEST_FORMAT,
     MANIFEST_FORMAT_VERSION,
+    MAX_SEGMENT_SECONDS,
     PEAKS_VERSION,
     SPECTROGRAM_VERSION,
     assertManifest,
@@ -26,16 +27,16 @@ import {
     type ManifestStem,
     type SpectrogramFile,
 } from '@saitdigital/rt-dspplr/format';
-import { checkFramesPerPeak, DEFAULT_FRAMES_PER_PEAK, levelsFromFinest, loudnessFrom, type FinestPeaks } from './analysis';
+import { binFrames, checkFramesPerPeak, DEFAULT_FRAMES_PER_PEAK, levelsFromFinest, loudnessFrom, type FinestPeaks } from './analysis';
 import { spectrogramLevels, SPECTROGRAM_RANGE_DB, SPECTROGRAM_TOP_DB } from './overviewAnalysis';
 import { jobFrames, WARMUP_FRAMES, type JobResult, type JobSpec } from './jobs';
-import { callConcurrency, defaultConcurrency, JobPool, type PreparePool } from './pool';
+import { callConcurrency, checkConcurrency, defaultConcurrency, JobPool, type PreparePool } from './pool';
 import os from 'node:os';
-import { finiteBlocks, type AudioDecoder, type SourceFormat, type SourceLayout } from './decoder';
+import { checkAudioShape, finiteBlocks, type AudioDecoder, type SourceFormat, type SourceLayout } from './decoder';
 import { builtinDecoder } from './wasm/decoders';
 import { type ResamplerOptions } from './resampler';
-import { indexSegments, mappable, mapSource, readRange, SOURCE_CONTENT_TYPES, sourceWavSink, wavMap, type SourceMap, type WavSink } from './sourceIndex';
-import { sourceReader, verifyIndex } from './sourceReader';
+import { deepestRun, indexSegments, mappable, mapSource, readRange, SOURCE_CONTENT_TYPES, sourceWavSink, wavMap, type SourceMap, type WavSink } from './sourceIndex';
+import { readSegment, sourceReader, verifyIndex } from './sourceReader';
 import { buildStem, failedStem, StemAlignmentError, type StemInput, type StemOptions } from './stem';
 import { plainExtension, runProcessor, StemProcessorError, type StemProcessor } from './processors';
 
@@ -437,9 +438,9 @@ async function run(
     if (signal.aborted) throw signal.reason ?? new Error('prepareAudio cancelled');
     const storage = options.storage ?? (options.outDir ? fsStorage(options.outDir) : null);
     if (!storage) throw new Error('prepareAudio needs `outDir` or `storage`');
-    const segmentSeconds = options.segmentSeconds ?? 10;
-    if (!(segmentSeconds > 0)) throw new Error('segmentSeconds must be > 0');
+    const segmentSeconds = checkSegmentSeconds(options.segmentSeconds ?? 10);
     const framesPerPeak = checkFramesPerPeak(options.framesPerPeak ?? DEFAULT_FRAMES_PER_PEAK);
+    if (options.concurrency !== undefined) checkConcurrency(options.concurrency);
     const stemSpecs = checkStemSpecs(options.stems);
     const warnings: string[] = [];
     const tStart = performance.now();
@@ -478,18 +479,27 @@ async function run(
     let bytesRead = 0;
     const sourceIterator = source[Symbol.asyncIterator]();
     let sourceDone = false;
+    // A read that failed (or the copy's write) is the job's error, whatever the decoder makes of it:
+    // one that swallows it or stops early must not turn a cut source into a shorter recording.
+    let sourceError: { error: unknown } | null = null;
     const take = async (): Promise<Uint8Array | null> => {
-        if (signal.aborted) throw signal.reason ?? new Error('aborted');
-        const r = await sourceIterator.next();
-        if (r.done) {
-            sourceDone = true;
-            return null;
+        if (sourceError) throw sourceError.error;
+        try {
+            if (signal.aborted) throw signal.reason ?? new Error('aborted');
+            const r = await sourceIterator.next();
+            if (r.done) {
+                sourceDone = true;
+                return null;
+            }
+            const bytes = r.value instanceof Uint8Array ? r.value : new Uint8Array(r.value as ArrayBufferLike);
+            hash.update(bytes);
+            bytesRead += bytes.length;
+            if (tee) await tee.write(bytes);
+            return bytes;
+        } catch (error) {
+            sourceError = { error };
+            throw error;
         }
-        const bytes = r.value instanceof Uint8Array ? r.value : new Uint8Array(r.value as ArrayBufferLike);
-        hash.update(bytes);
-        bytesRead += bytes.length;
-        if (tee) await tee.write(bytes);
-        return bytes;
     };
     // The decoder's view of the bytes. It may stop before their end (a WAV's chunks after its data,
     // a tag after the last MP3 frame): its return() does not stop them, drain() reads the rest
@@ -528,6 +538,7 @@ async function run(
         // The format is known once the decoder has read the header, i.e. on the first block.
         const next = await blocks.next();
         const format: SourceFormat = await decoded.format;
+        checkAudioShape(format, 'The input', true);
         const channels = format.channels;
         // The timeline is the source's own rate: nothing is resampled (the player converts).
         const rate = format.sampleRate;
@@ -769,6 +780,9 @@ async function run(
         await storage.putObject('manifest.json', bytes, 'application/json');
         outputBytes += bytes.length;
         return { manifest, outputBytes, threads: timeline.threads, timings: { aMs, processorMs, processorWaitMs, stemMs, stemsPhaseMs, stems: stemTimings }, warnings };
+    } catch (error) {
+        // The source's own error, not what the decoder made of it (a WAV cut short, "no audio").
+        throw sourceError ? sourceError.error : error;
     } finally {
         signal.removeEventListener('abort', stopProcessor);
         processorStop.abort(new Error('prepare ended'));
@@ -781,6 +795,17 @@ async function run(
         await wav?.close();
         if (tmpDir) await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
     }
+}
+
+/**
+ * segmentSeconds, checked: from 0.1 to 60 s. The player holds a segment whole (it refuses longer
+ * ones); shorter ones only multiply its requests and the manifest (one entry each).
+ */
+export function checkSegmentSeconds(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0.1 || value > MAX_SEGMENT_SECONDS) {
+        throw new Error(`segmentSeconds must be a number from 0.1 to ${MAX_SEGMENT_SECONDS}, got ${String(value)}`);
+    }
+    return value;
 }
 
 /** Frames of a segment of `seconds` at `rate` (at least one). */
@@ -856,10 +881,17 @@ export async function storeSource(a: {
     let list: ManifestSegment[] = [];
     if (!a.wav && file && mappable(a.layout)) {
         const original = file;
+        const read = (start: number, end: number) => readRange(original, start, end);
         try {
             map = await mapSource(original, a.layout, a.sampleRate, a.channels, a.sourceFrames);
             list = indexSegments(a.frames, a.framesPerSegment, map, offset);
-            await verifyIndex(map.describe, list, a.timeline.channels, (start, end) => readRange(original, start, end), a.checks);
+            // Besides the segments kept as they were decoded: the one whose run reaches furthest
+            // back (MP3), against the same samples from a run that starts much earlier.
+            const deepest = deepestRun(list, map, offset);
+            const checks = deepest && !a.checks.some((c) => c.index === deepest.index)
+                ? [...a.checks, { index: deepest.index, planes: await readSegment(map.describe, deepest.reference, a.timeline.channels, read) }]
+                : a.checks;
+            await verifyIndex(map.describe, list, a.timeline.channels, read, checks);
         } catch (error) {
             a.onWarning(`${a.what}: the ${a.layout.kind} file could not be indexed (${error instanceof Error ? error.message : String(error)}); kept as a 16-bit WAV instead`);
             map = null;
@@ -921,6 +953,86 @@ export interface TimelineInput {
 }
 
 /**
+ * The analysis jobs' arrays by kind, in timeline order (jobs come back in any order). The results
+ * themselves are not kept: each array has one owner, a list joinParts() empties as it copies.
+ */
+class JobParts {
+    readonly min: Int16Array[][];
+    readonly max: Int16Array[][];
+    readonly sumSq: Float64Array[][];
+    /** Largest |sample| per channel. */
+    readonly peak: number[];
+    readonly meanSquares: Float32Array[] = [];
+    bandBins = 0;
+    /** The spectrogram's finest columns (rows each). */
+    readonly columns: Uint8Array[] = [];
+    referenceMax = -Infinity;
+    /** What every job's bands and spectrogram share, from the first job. */
+    bands: { framesPerBin: number; cutoffs: number[] } | null = null;
+    spectrogram: { rows: number; minHz: number; maxHz: number; hop: number } | null = null;
+
+    constructor(channels: number) {
+        this.min = Array.from({ length: channels }, () => []);
+        this.max = Array.from({ length: channels }, () => []);
+        this.sumSq = Array.from({ length: channels }, () => []);
+        this.peak = new Array<number>(channels).fill(0);
+    }
+
+    add(r: JobResult): void {
+        const k = r.index;
+        r.peaks.peak.forEach((p, c) => {
+            this.min[c][k] = r.peaks.min[c];
+            this.max[c][k] = r.peaks.max[c];
+            this.sumSq[c][k] = r.peaks.sumSq[c];
+            this.peak[c] = Math.max(this.peak[c], p);
+        });
+        if (r.bands) {
+            this.meanSquares[k] = r.bands.meanSquares;
+            this.bandBins += r.bands.bins;
+            if (k === 0) this.bands = { framesPerBin: r.bands.framesPerBin, cutoffs: r.bands.cutoffs };
+        }
+        const s = r.spectrogram;
+        if (s) {
+            this.columns[k] = s.a.subarray(0, s.columns * s.rows);
+            this.referenceMax = Math.max(this.referenceMax, s.reference);
+            if (k === 0) this.spectrogram = { rows: s.rows, minHz: s.minHz, maxHz: s.maxHz, hop: s.hop };
+        }
+    }
+}
+
+/** The arrays end to end in one, each let go of once copied (the list is emptied). */
+function joinParts<A extends Int16Array | Float64Array | Float32Array | Uint8Array>(parts: A[], make: (length: number) => A): A {
+    const out = make(parts.reduce((n, p) => n + p.length, 0));
+    let o = 0;
+    for (let k = 0; k < parts.length; k += 1) {
+        out.set(parts[k], o);
+        o += parts[k].length;
+        (parts as Array<A | undefined>)[k] = undefined;
+    }
+    parts.length = 0;
+    return out;
+}
+
+/** Loudness from the finest peaks: per channel from their sums of squares, 400 ms blocks as whole finest bins. */
+function finestLoudness(finest: FinestPeaks, peakPerChannel: number[], rate: number, framesPerPeak: number, totalFrames: number): ManifestLoudness {
+    const channels = finest.sumSq.length;
+    const bins = finest.sumSq[0].length;
+    const sqPerChannel = finest.sumSq.map((s) => s.reduce((a, b) => a + b, 0));
+    const blockBins = Math.max(1, Math.round((0.4 * rate) / framesPerPeak));
+    const blocks: number[] = [];
+    for (let b = 0; b < bins; b += blockBins) {
+        let sq = 0;
+        let fr = 0;
+        for (let i = b; i < Math.min(bins, b + blockBins); i += 1) {
+            fr += binFrames(i, framesPerPeak, totalFrames);
+            for (let c = 0; c < channels; c += 1) sq += finest.sumSq[c][i];
+        }
+        if (fr >= (blockBins * framesPerPeak) / 4) blocks.push(sq / (fr * channels));
+    }
+    return loudnessFrom(peakPerChannel, sqPerChannel, blocks, totalFrames, channels);
+}
+
+/**
  * Peaks, loudness, bands and spectrogram of one timeline, from its blocks: one pass hands the
  * audio to a worker pool, which analyses fixed jobs of the timeline (see jobs.ts).
  */
@@ -935,7 +1047,7 @@ export async function writeTimeline(input: TimelineInput): Promise<TimelineOutpu
     const J = jobFrames(framesPerPeak, DEFAULT_FRAMES_PER_BAND_BIN, hop);
     const ownPool = !input.pool;
     const pool = input.pool ?? new JobPool(options.concurrency ?? defaultConcurrency(), options.workerUrl);
-    const results: JobResult[] = [];
+    const parts = new JobParts(channels);
     const inflight = new Set<Promise<void>>();
     let jobIndex = 0;
     let jobStart = 0;
@@ -963,7 +1075,7 @@ export async function writeTimeline(input: TimelineInput): Promise<TimelineOutpu
             spectrogram: wantSpectrogram,
             channels: jobBuf.map((x) => (jobFill === x.length ? x : x.subarray(0, jobFill))),
         };
-        const running = pool.run(job).then((r) => { results[r.index] = r as JobResult; });
+        const running = pool.run(job).then((r) => parts.add(r as JobResult));
         const tracked = running.finally(() => inflight.delete(tracked));
         inflight.add(tracked);
         jobIndex += 1;
@@ -1000,6 +1112,13 @@ export async function writeTimeline(input: TimelineInput): Promise<TimelineOutpu
     let segFill = 0;
     let totalFrames = 0;
     let outputBytes = 0;
+    /** Makes a file, stores it and lets go of it: its size. */
+    const put = async (name: string, make: () => Uint8Array): Promise<number> => {
+        const bytes = make();
+        await storage.putObject(`${prefix}${name}`, bytes, 'application/octet-stream');
+        outputBytes += bytes.length;
+        return bytes.length;
+    };
 
     const flushSegment = async () => {
         if (!segPlanes || segFill === 0) return;
@@ -1047,84 +1166,57 @@ export async function writeTimeline(input: TimelineInput): Promise<TimelineOutpu
     if (totalFrames === 0) throw new Error('The input holds no audio: it decoded to 0 frames');
 
     // ---- stitch the jobs, in timeline order --------------------------------------------------
-    const ordered = results.filter(Boolean);
-    const cat16 = (parts: Int16Array[]) => { const out = new Int16Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out; };
-    const cat64 = (parts: Float64Array[]) => { const out = new Float64Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out; };
-    const finest: FinestPeaks = {
-        min: Array.from({ length: channels }, (_, c) => cat16(ordered.map((r) => r.peaks.min[c]))),
-        max: Array.from({ length: channels }, (_, c) => cat16(ordered.map((r) => r.peaks.max[c]))),
-        sumSq: Array.from({ length: channels }, (_, c) => cat64(ordered.map((r) => r.peaks.sumSq[c]))),
-        frames: cat64(ordered.map((r) => r.peaks.frames)),
-    };
-    const levels = levelsFromFinest(channels, framesPerPeak, totalFrames, finest);
-    // Loudness: per channel from the finest sums; 400 ms blocks as whole finest bins.
-    const peakPerChannel = Array.from({ length: channels }, (_, c) => Math.max(0, ...ordered.map((r) => r.peaks.peak[c])));
-    const sqPerChannel = finest.sumSq.map((s) => s.reduce((a, b) => a + b, 0));
-    const blockBins = Math.max(1, Math.round((0.4 * rate) / framesPerPeak));
-    const loudnessBlocks: number[] = [];
-    for (let b = 0; b < finest.frames.length; b += blockBins) {
-        let sq = 0;
-        let fr = 0;
-        for (let i = b; i < Math.min(finest.frames.length, b + blockBins); i += 1) {
-            fr += finest.frames[i];
-            for (let c = 0; c < channels; c += 1) sq += finest.sumSq[c][i];
-        }
-        if (fr >= (blockBins * framesPerPeak) / 4) loudnessBlocks.push(sq / (fr * channels));
-    }
-    const loudness = loudnessFrom(peakPerChannel, sqPerChannel, loudnessBlocks, totalFrames, channels);
-
-    const peaksBytes = encodePeaksFile({ version: PEAKS_VERSION, sampleRate: rate, channels, frames: totalFrames, levels });
-    await storage.putObject(`${prefix}peaks.bin`, peaksBytes, 'application/octet-stream');
-    outputBytes += peaksBytes.length;
-    const layout = peaksLayout(channels, levels).levels;
+    // Each kind of the jobs' arrays is joined into one, each job's let go of as it is copied, and
+    // each file is made, stored and let go of before the next: a day of stereo has 0.4 GB of
+    // finest peaks, and holding them twice beside every file came to 1.9 GB.
+    let loudness!: ManifestLoudness;
+    let peakLevels!: Array<{ framesPerPeak: number; peaks: number; byteOffset: number; byteLength: number }>;
+    const peaksBytes = await put('peaks.bin', () => {
+        const finest: FinestPeaks = {
+            min: parts.min.map((p) => joinParts(p, (n) => new Int16Array(n))),
+            max: parts.max.map((p) => joinParts(p, (n) => new Int16Array(n))),
+            sumSq: parts.sumSq.map((p) => joinParts(p, (n) => new Float64Array(n))),
+        };
+        const levels = levelsFromFinest(channels, framesPerPeak, totalFrames, finest);
+        loudness = finestLoudness(finest, parts.peak, rate, framesPerPeak, totalFrames);
+        finest.sumSq = []; // in the levels and the loudness now: let go of before the file is made
+        peakLevels = peaksLayout(channels, levels).levels.map(({ framesPerPeak: fpp, peaks, byteOffset, byteLength }) => ({ framesPerPeak: fpp, peaks, byteOffset, byteLength }));
+        return encodePeaksFile({ version: PEAKS_VERSION, sampleRate: rate, channels, frames: totalFrames, levels });
+    });
 
     let bands: AudioManifest['bands'];
     if (wantBands) {
-        const parts = ordered.map((r) => r.bands!);
-        const meanSquares = new Float32Array(parts.reduce((n, p) => n + p.meanSquares.length, 0));
-        let o = 0;
-        for (const p of parts) { meanSquares.set(p.meanSquares, o); o += p.meanSquares.length; }
-        const file = {
-            sampleRate: rate,
-            framesPerBin: parts[0]?.framesPerBin ?? DEFAULT_FRAMES_PER_BAND_BIN,
-            bins: parts.reduce((n, p) => n + p.bins, 0),
-            cutoffs: parts[0]?.cutoffs ?? [],
-            meanSquares,
-        };
-        const bytes = encodeBandsFile(file);
-        await storage.putObject(`${prefix}bands.bin`, bytes, 'application/octet-stream');
-        outputBytes += bytes.length;
-        bands = { url: `${prefix}bands.bin`, bytes: bytes.length, format: 'rtd-bands', version: BANDS_VERSION, framesPerBin: file.framesPerBin, bins: file.bins, cutoffsHz: file.cutoffs };
+        const framesPerBin = parts.bands?.framesPerBin ?? DEFAULT_FRAMES_PER_BAND_BIN;
+        const cutoffs = parts.bands?.cutoffs ?? [];
+        const bins = parts.bandBins;
+        const bytes = await put('bands.bin', () => encodeBandsFile({ sampleRate: rate, framesPerBin, bins, cutoffs, meanSquares: joinParts(parts.meanSquares, (n) => new Float32Array(n)) }));
+        bands = { url: `${prefix}bands.bin`, bytes, format: 'rtd-bands', version: BANDS_VERSION, framesPerBin, bins, cutoffsHz: cutoffs };
     }
     let spectrogram: AudioManifest['spectrogram'];
     if (wantSpectrogram) {
-        const parts = ordered.map((r) => r.spectrogram!);
-        const first = parts[0];
-        const columns = parts.reduce((n, p) => n + p.columns, 0);
-        const a = new Uint8Array(columns * first.rows);
-        let o = 0;
-        for (const p of parts) { a.set(p.a.subarray(0, p.columns * p.rows), o); o += p.columns * p.rows; }
-        const file: SpectrogramFile = {
-            sampleRate: rate,
-            rows: first.rows,
-            frames: totalFrames,
-            minHz: first.minHz,
-            maxHz: first.maxHz,
-            topDb: SPECTROGRAM_TOP_DB,
-            rangeDb: SPECTROGRAM_RANGE_DB,
-            referenceMax: Math.max(...parts.map((p) => p.reference)),
-            levels: spectrogramLevels(a, columns, first.rows, first.hop),
-        };
-        const bytes = encodeSpectrogramFile(file);
-        await storage.putObject(`${prefix}spectrogram.bin`, bytes, 'application/octet-stream');
-        outputBytes += bytes.length;
+        const { rows, minHz, maxHz, hop } = parts.spectrogram!;
+        let levels!: NonNullable<AudioManifest['spectrogram']>['levels'];
+        const bytes = await put('spectrogram.bin', () => {
+            const a = joinParts(parts.columns, (n) => new Uint8Array(n));
+            const file: SpectrogramFile = {
+                sampleRate: rate,
+                rows,
+                frames: totalFrames,
+                minHz,
+                maxHz,
+                topDb: SPECTROGRAM_TOP_DB,
+                rangeDb: SPECTROGRAM_RANGE_DB,
+                referenceMax: parts.referenceMax,
+                levels: spectrogramLevels(a, a.length / rows, rows, hop),
+            };
+            levels = spectrogramLayout(rows, file.levels).levels.map((l) => ({ framesPerColumn: l.hop, columns: l.columns, byteOffset: l.byteOffset, byteLength: l.byteLength }));
+            return encodeSpectrogramFile(file);
+        });
         spectrogram = {
-            url: `${prefix}spectrogram.bin`, bytes: bytes.length, format: 'rtd-spectrogram', version: SPECTROGRAM_VERSION,
-            rows: file.rows, minHz: file.minHz, maxHz: file.maxHz, topDb: file.topDb, rangeDb: file.rangeDb,
-            levels: spectrogramLayout(file.rows, file.levels).levels.map((l) => ({ framesPerColumn: l.hop, columns: l.columns, byteOffset: l.byteOffset, byteLength: l.byteLength })),
+            url: `${prefix}spectrogram.bin`, bytes, format: 'rtd-spectrogram', version: SPECTROGRAM_VERSION,
+            rows, minHz, maxHz, topDb: SPECTROGRAM_TOP_DB, rangeDb: SPECTROGRAM_RANGE_DB, levels,
         };
     }
-
 
     return {
         framesPerSegment,
@@ -1132,11 +1224,11 @@ export async function writeTimeline(input: TimelineInput): Promise<TimelineOutpu
         outputBytes,
         peaks: {
             url: `${prefix}peaks.bin`,
-            bytes: peaksBytes.length,
+            bytes: peaksBytes,
             format: 'rtd-peaks',
             version: PEAKS_VERSION,
             encoding: 'int16-min-max-rms',
-            levels: layout.map(({ framesPerPeak: fpp, peaks, byteOffset, byteLength }) => ({ framesPerPeak: fpp, peaks, byteOffset, byteLength })),
+            levels: peakLevels,
         },
         loudness,
         bands,

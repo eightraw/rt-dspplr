@@ -1,3 +1,4 @@
+import { SourceError } from './fileAccess';
 import type { ManifestSource } from './manifest';
 import { base64Bytes, decodeOpusRun, decodePcmRun, decodeStreamRun, type DecodedRun } from './sourceRuns';
 import createRunWorker from './run.worker.ts?inline-worker';
@@ -76,25 +77,37 @@ function headerOf(source: ManifestSource): Uint8Array | undefined {
     return h ?? undefined;
 }
 
-/** A run of `source` (the bytes of a segment's range), decoded: planar, its warm-up included. */
+/**
+ * A run of `source` (the bytes of a segment's range), decoded: planar, its warm-up included.
+ * A run that decodes to another rate or channel count than the manifest says is refused
+ * (SourceError): played as it is, it would run at the wrong speed or on the wrong channels.
+ */
 export async function decodeRun(source: ManifestSource, bytes: ArrayBuffer): Promise<Float32Array[]> {
     if (source.codec === 'wav') return decodePcmRun(new Uint8Array(bytes), source);
-    const codec = source.codec;
+    const run = await decodeCoded(source, source.codec, bytes);
+    const channels = run.channels.length;
+    // An empty run says nothing of its format (segmentFromRun reports it short).
+    if (channels > 0 && run.channels[0].length > 0 && (run.sampleRate !== source.sampleRate || channels !== source.channels)) {
+        throw new SourceError(`the ${source.codec} source decodes to ${run.sampleRate} Hz, ${channels} channel(s); its manifest says ${source.sampleRate} Hz, ${source.channels}`);
+    }
+    return run.channels;
+}
+
+async function decodeCoded(source: ManifestSource, codec: Codec, bytes: ArrayBuffer): Promise<DecodedRun> {
     const module = await moduleOf(codec);
     const header = headerOf(source);
     const w = theWorker();
     if (w) {
         // Should the worker die with this run in it (its bytes transferred), the run fails and the
         // segment store fetches it again - on the main thread, then.
-        return new Promise<Float32Array[]>((resolve, reject) => {
+        return new Promise<DecodedRun>((resolve, reject) => {
             const id = nextId++;
-            waiting.set(id, { resolve: (run) => resolve(run.channels), reject });
+            waiting.set(id, { resolve, reject });
             const first = !sent.has(codec);
             sent.add(codec);
             w.postMessage({ id, codec, module: first ? module : undefined, header: header ? header.slice() : undefined, bytes }, [bytes]);
         });
     }
     const data = new Uint8Array(bytes);
-    const run = codec === 'opus' ? await decodeOpusRun(module, header!, data) : await decodeStreamRun(module, codec, data, header);
-    return run.channels;
+    return codec === 'opus' ? decodeOpusRun(module, header!, data) : decodeStreamRun(module, codec, data, header);
 }

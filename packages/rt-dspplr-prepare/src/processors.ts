@@ -270,6 +270,25 @@ function bindMount(src: string, dst: string, readonly: boolean): string {
     return `type=bind,src=${src},dst=${dst}${readonly ? ',readonly' : ''}`;
 }
 
+/** A registry host (with its port) before an image name. */
+const IMAGE_HOST = /[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*(?::[0-9]+)?/.source;
+/** One path component of an image name: lowercase letters and digits, joined by '.', '_', '__' or dashes. */
+const IMAGE_COMPONENT = /[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*/.source;
+/** [registry[:port]/]name[/name…][:tag][@digest], as docker parses it. */
+const IMAGE_REFERENCE = new RegExp(`^(?:${IMAGE_HOST}/)?${IMAGE_COMPONENT}(?:/${IMAGE_COMPONENT})*`
+    + '(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[0-9a-fA-F]{32,})?$');
+
+/**
+ * A Docker image reference, checked: it is put on a `docker run` line as it is, where anything
+ * else could be a flag (`--privileged`) or more than one argument's worth.
+ */
+export function checkDockerImage(image: unknown): string {
+    if (typeof image !== 'string' || image.length > 255 || !IMAGE_REFERENCE.test(image)) {
+        throw new Error(`not a Docker image reference ([registry/]name[:tag][@digest]): ${JSON.stringify(image)}`);
+    }
+    return image;
+}
+
 /** A file's extension when it is a plain one (a decoder may go by it), else '.wav'. */
 export function plainExtension(file: string): string {
     const ext = path.extname(file);
@@ -283,6 +302,7 @@ export function plainExtension(file: string): string {
  * no privilege escalation (`no-new-privileges`). @experimental
  */
 export function dockerProcessor(options: DockerProcessorOptions): StemProcessor {
+    checkDockerImage(options.image);
     const id = options.id ?? 'docker';
     const [docker, ...dockerArgs] = typeof options.docker === 'string' ? [options.docker] : options.docker?.length ? options.docker : ['docker'];
     const outName = plainFileName(options.outName ?? 'b.wav', 'outName');

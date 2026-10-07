@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
     memoryStorage,
     prepareAudio,
@@ -24,10 +25,13 @@ import {
     dockerProcessor,
     ffmpegDecoder,
     httpProcessor,
+    checkDockerImage,
+    AUDIO_DEMUXERS,
     type AudioManifest,
 } from '../src/index';
 import { storedRanges } from '../src/prepareAudio';
 import { readSegment } from '../src/sourceReader';
+import { deepestRun, indexSegments, mapSource } from '../src/sourceIndex';
 import { main } from '../src/cli';
 import { multipartHead, redactUrl } from '../src/processors';
 import { designResampler, StreamingResampler } from '../src/resampler';
@@ -353,6 +357,42 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
     const vorbis = Uint8Array.from([...ascii('OggS'), 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 30, 1, ...ascii('vorbis'), ...new Array(23).fill(0)]);
     await assert.rejects(decodeAll(builtinDecoder, chunks(vorbis)), /not WAV, MP3, Opus or FLAC.*decoder/s);
     results.push(`MP3 and Opus in process: gapless (the source's frames, best at lag 0), ${notes.join(', ')} against the source; prepare from Opus keeps 48 kHz; MP3 and Opus kept as they are, every segment of their index reads back the decoder's samples; Ogg Vorbis names the decoder hook`);
+}
+
+{
+    // Low-bitrate MP3s (test/fixtures/make-sources.mjs), where the bit reservoir reaches back more
+    // than 6 frames: 32 kbit/s at 48 kHz, 8 kbit/s at 16 kHz, VBR -V9 over 1.5 s of silence. With
+    // 6 frames of warm-up the first published segments that read back wrong, the second fell back
+    // to a WAV and a run of the third could not be decoded at all. Each run now starts once the
+    // reservoir is full.
+    const fixtures = new URL('../../../test/fixtures/', import.meta.url);
+    const notes: string[] = [];
+    for (const file of ['low-32k-48k.mp3', 'low-8k-16k.mp3', 'low-v9-22k.mp3']) {
+        const bytes = new Uint8Array(fs.readFileSync(new URL(file, fixtures)));
+        const { format, channels } = await decodeAll(builtinDecoder, chunks(bytes, 7, 4096));
+        for (const segmentSeconds of [0.1, 1]) {
+            const { manifest: m, storage, job } = await prepareMemory(bytes, { segmentSeconds });
+            assert.deepEqual(job.stats!.warnings, [], `${file}, ${segmentSeconds} s segments`);
+            assert.equal(m.segments.source.url, 'source.mp3', file);
+            const diff = maxDiff(await timelineAt(storage, m.segments, channels.length), channels);
+            assert.equal(diff, 0, `${file}, ${segmentSeconds} s segments: every segment reads back the decoder's samples (off by ${diff})`);
+        }
+        // The index is checked on the segment whose run goes back furthest too, against a run from further back still.
+        const map = await mapSource(fileURLToPath(new URL(file, fixtures)), format.layout!, format.sampleRate, format.channels, channels[0].length);
+        const list = indexSegments(channels[0].length, Math.round(0.1 * format.sampleRate), map);
+        const deepest = deepestRun(list, map)!;
+        const seg = list[deepest.index];
+        const warmups = list.map((s) => map.rangeFor(s.startFrame, s.frames).warmup!);
+        assert.equal(warmups[deepest.index], Math.max(...warmups));
+        assert.ok(warmups[deepest.index] > 6, `${file}: the deepest run starts ${warmups[deepest.index]} frames early`);
+        assert.ok(deepest.reference.range![0] < seg.range![0] && deepest.reference.range![1] === seg.range![1] && deepest.reference.tail === seg.tail, file);
+        if (file === 'low-v9-22k.mp3') {
+            const at = seg.startFrame / format.sampleRate;
+            assert.ok(at > 1.5 && at < 3.5, `the VBR file's deepest run is behind its silence (${at.toFixed(2)} s)`);
+        }
+        notes.push(`${file} up to ${Math.max(...warmups)} frames`);
+    }
+    results.push(`low-bitrate MP3: kept, every segment exact at 0.1 s and 1 s; runs start early enough for the reservoir (${notes.join(', ')}); the deepest run is checked`);
 }
 
 // ---- resampler ----------------------------------------------------------------------
@@ -1480,6 +1520,102 @@ if (argv[0] === 'run') {
 }
 
 {
+    // The other limits: segments of 0.1 to 60 s (the player refuses longer ones; shorter ones only
+    // swell the manifest), 1 to 64 threads, and the rates and channel counts the player plays.
+    for (const bad of [0.05, 0.00001, 61, 1e9, Number.NaN, Infinity, -1]) {
+        await assert.rejects(prepareAudio(chunks(A2wav, 3, 65536), { storage: memoryStorage(), segmentSeconds: bad }).done, /segmentSeconds must be a number from 0.1 to 60/, String(bad));
+    }
+    for (const bad of [Number.NaN, 0, 65, 2.5, -1]) {
+        await assert.rejects(prepareAudio(chunks(A2wav, 3, 65536), { storage: memoryStorage(), concurrency: bad }).done, /concurrency must be an integer from 1 to 64/, String(bad));
+        assert.throws(() => createPreparePool({ concurrency: bad }), /concurrency must be an integer from 1 to 64/);
+    }
+    assert.equal(new JobPool(Number.NaN).size, 1, 'a pool of NaN threads is one, inline');
+    const shortest = await prepareAudio(chunks(A2wav, 3, 65536), { storage: memoryStorage(), concurrency: 1, segmentSeconds: 0.1 }).done;
+    assert.equal(shortest.segments.framesPerSegment, RATE / 10);
+    const longest = await prepareAudio(chunks(A2wav, 3, 65536), { storage: memoryStorage(), concurrency: 1, segmentSeconds: 60 }).done;
+    assert.equal(longest.segments.list.length, 1);
+    // A's rate is the timeline's: 8 to 384 kHz. Channels: 1 to 32, for A and its stems.
+    for (const rate of [4000, 400000]) {
+        await assert.rejects(prepareAudio(chunks(asWav16([new Float64Array(rate / 2)], rate)), { storage: memoryStorage(), concurrency: 1 }).done, new RegExp(`at ${rate} Hz: the player plays 8000 to 384000 Hz`));
+    }
+    const manyChannels: AudioDecoder = () => ({
+        format: Promise.resolve({ sampleRate: RATE, channels: 33, encoding: 'synthetic', bitsPerSample: 32, frames: 4800 }),
+        blocks: (async function* () { yield Array.from({ length: 33 }, () => new Float32Array(4800)); })(),
+    });
+    await assert.rejects(prepareAudio(chunks(new Uint8Array(1)), { storage: memoryStorage(), concurrency: 1, decoder: manyChannels }).done, /has 33 channels: the player plays 1 to 32/);
+    const stem33 = Array.from({ length: 33 }, () => new Float32Array(RATE * 2));
+    await assert.rejects(prepareAudio(chunks(A2wav, 3, 65536), { storage: memoryStorage(), concurrency: 1, stems: { b: { input: { channels: stem33, sampleRate: RATE }, offsetFrames: 0 } } }).done, /stems\.b has 33 channels/);
+    // A stem at a rate the player would not play is converted to A's like any other.
+    const at4k = Float32Array.from({ length: 4000 * 2 }, (_, i) => A40[0][i * 12]);
+    const slow = await prepareAudio(chunks(A2wav, 3, 65536), { storage: memoryStorage(), concurrency: 1, stems: { b: { input: { channels: [at4k], sampleRate: 4000 }, offsetFrames: 0 } } }).done;
+    assert.equal(slow.stems!.b!.status, 'ready');
+    assert.equal(slow.stems!.b!.source!.sampleRate, 4000);
+    assert.equal(slow.stems!.b!.segments!.source.sampleRate, RATE);
+
+    // The CLI: numbers parsed strictly, every rule broken exits 2 before anything runs; the docker
+    // image is a name, never a flag.
+    const errors: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.join(' ')); };
+    try {
+        for (const args of [
+            ['--segment', '0.05'], ['--segment', 'abc'], ['--segment', '1e9'], ['--segment', '61'], ['--segment', ''],
+            ['--concurrency', 'abc'], ['--concurrency', '0'], ['--concurrency', '65'], ['--concurrency', '2.5'], ['--concurrency', '1e1'],
+            ['--decoder', 'docker:--privileged'], ['--decoder', 'docker:-v'], ['--decoder', 'docker:img --rm'], ['--decoder', 'docker:'], ['--decoder', 'docker:Upper/Case'],
+            ['--decoder', 'ffmpeg', '--demuxers', 'mov;ogg'], ['--decoder', 'ffmpeg', '--demuxers', ''], ['--demuxers', 'mov'], ['--decoder', 'sox'],
+        ]) {
+            errors.length = 0;
+            assert.equal(await main(['in.wav', 'out', ...args]), 2, args.join(' '));
+            assert.ok(/usage: rtd-prepare/.test(errors.join('\n')), args.join(' '));
+        }
+        errors.length = 0;
+        await main(['in.wav', 'out', '--concurrency', 'abc']);
+        assert.match(errors[0], /--concurrency: concurrency must be an integer from 1 to 64, got abc/);
+        errors.length = 0;
+        await main(['in.wav', 'out', '--decoder', 'docker:--privileged']);
+        assert.match(errors[0], /not a Docker image reference.*"--privileged"/);
+    } finally {
+        console.error = consoleError;
+    }
+    for (const good of ['ffmpeg', 'jrottenberg/ffmpeg:4.4-alpine', 'localhost:5000/tools/ffmpeg', 'ghcr.io/org/ff_mpeg:v1.2', `ffmpeg@sha256:${'ab'.repeat(32)}`]) {
+        assert.equal(checkDockerImage(good), good);
+    }
+    for (const bad of ['--privileged', '-v', 'ffmpeg --rm', 'ffmpeg:', 'FFmpeg', 'a//b', '', 'x'.repeat(256)]) {
+        assert.throws(() => checkDockerImage(bad), /not a Docker image reference/, bad);
+    }
+    assert.throws(() => dockerProcessor({ image: '--privileged', args: [] }), /not a Docker image reference/);
+    results.push('limits: segmentSeconds 0.1-60, concurrency integer 1-64 (API, pool, CLI exit 2), A at 8-384 kHz, 1-32 channels for A and stems, a 4 kHz stem converted; docker image names checked (CLI and dockerProcessor)');
+}
+
+{
+    // A source that fails halfway fails the job with its own error, whatever the decoder makes of
+    // it: here one that swallows the error and ends (a cut, clean WAV), one that stops reading early.
+    const half = Math.floor(A2wav.length / 2);
+    async function* failing(): AsyncGenerator<Uint8Array> {
+        yield A2wav.slice(0, 44 + 4000);
+        yield A2wav.slice(44 + 4000, half);
+        throw new Error('source read failed at byte ' + half);
+    }
+    const swallowing: AudioDecoder = (bytes, options) => wavDecoder((async function* () {
+        try {
+            for await (const b of bytes) yield b;
+        } catch {
+            // swallowed: the WAV just ends here
+        }
+    })(), options);
+    const earlyStop: AudioDecoder = (bytes) => {
+        const inner = wavDecoder(bytes);
+        return { format: inner.format, blocks: (async function* () { for await (const b of inner.blocks) { yield b; return; } })() };
+    };
+    for (const decoder of [swallowing, earlyStop, builtinDecoder]) {
+        const storage = memoryStorage();
+        await assert.rejects(prepareAudio(failing(), { storage, concurrency: 1, decoder }).done, /^Error: source read failed at byte/);
+        assert.equal(storage.objects.has('manifest.json'), false);
+    }
+    results.push('a source that fails halfway: the job fails with its error with a decoder that swallows it, one that stops early, and the built-in one; nothing published');
+}
+
+{
     // Non-finite samples (a float WAV may hold them): replaced, counted, and the manifest still validates.
     const frames = RATE * 3;
     const wav = encodeWav(speechLike(frames, RATE, 2, 51), RATE, { tag: 3, bits: 32 });
@@ -1536,7 +1672,12 @@ const argv = process.argv.slice(2);
 fs.writeFileSync(${JSON.stringify(ffArgs)}, JSON.stringify(argv));
 fs.writeFileSync(${JSON.stringify(ffPid)}, String(process.pid));
 const header = (rate) => { const b = Buffer.alloc(44); b.write('RIFF', 0); b.writeUInt32LE(0xffffffff, 4); b.write('WAVE', 8); b.write('fmt ', 12); b.writeUInt32LE(16, 16); b.writeUInt16LE(3, 20); b.writeUInt16LE(1, 22); b.writeUInt32LE(rate, 24); b.writeUInt32LE(rate * 4, 28); b.writeUInt16LE(4, 32); b.writeUInt16LE(32, 34); b.write('data', 36); b.writeUInt32LE(0xffffffff, 40); return b; };
-if (argv.includes('-fail')) {
+const formats = argv.indexOf('-format_whitelist');
+if (formats >= 0 && !argv[formats + 1].split(',').includes('wav')) {
+    process.stdin.resume();
+    process.stderr.write("[wav @ 0000] Format not on whitelist '" + argv[formats + 1] + "'\\n");
+    process.exit(1);
+} else if (argv.includes('-fail')) {
     process.stdin.resume();
     process.stderr.write('Invalid data found when processing input\\n');
     process.exit(1);
@@ -1552,7 +1693,8 @@ if (argv.includes('-fail')) {
     process.stdin.on('end', () => {
         const b = Buffer.concat(parts);
         let p = 12, data = 0, len = 0, rate = 0;
-        while (p < b.length) { const id = b.toString('ascii', p, p + 4), n = b.readUInt32LE(p + 4); if (id === 'fmt ') rate = b.readUInt32LE(p + 12); if (id === 'data') { data = p + 8; len = n; break; } p += 8 + n + (n & 1); }
+        // A cut input decodes as far as it goes, and exits 0: what ffmpeg does with a stream that ends early.
+        while (p < b.length) { const id = b.toString('ascii', p, p + 4), n = b.readUInt32LE(p + 4); if (id === 'fmt ') rate = b.readUInt32LE(p + 12); if (id === 'data') { data = p + 8; len = Math.min(n, b.length - data) & ~1; break; } p += 8 + n + (n & 1); }
         const out = Buffer.alloc(len * 2);
         for (let i = 0; i < len / 2; i += 1) out.writeFloatLE(b.readInt16LE(data + i * 2) / 32768, i * 4);
         process.stdout.write(header(rate));
@@ -1567,6 +1709,28 @@ if (argv.includes('-fail')) {
     const args: string[] = JSON.parse(fs.readFileSync(ffArgs, 'utf8'));
     const w = args.indexOf('-protocol_whitelist');
     assert.ok(w >= 0 && args[w + 1] === 'pipe' && w < args.indexOf('-i'), args.join(' '));
+    assert.equal(args.includes('-format_whitelist'), false, 'any demuxer unless demuxers says');
+    // demuxers: ffmpeg's -format_whitelist before -i; an input of another format fails, with the hint.
+    const listed = ffmpegDecoder({ command: [process.execPath, fakeFfmpeg], demuxers: ['mov', 'ogg'] });
+    await assert.rejects(prepareAudio(aFile, { storage: memoryStorage(), concurrency: 1, decoder: listed }).done, /ffmpeg failed \(exit 1\) \(the input is in a format left out of `demuxers`\): .*Format not on whitelist 'mov,ogg'/);
+    const listedArgs: string[] = JSON.parse(fs.readFileSync(ffArgs, 'utf8'));
+    const f = listedArgs.indexOf('-format_whitelist');
+    assert.ok(f >= 0 && listedArgs[f + 1] === 'mov,ogg' && f < listedArgs.indexOf('-i'), listedArgs.join(' '));
+    const common = await prepareAudio(aFile, { storage: memoryStorage(), concurrency: 1, decoder: ffmpegDecoder({ command: [process.execPath, fakeFfmpeg], demuxers: AUDIO_DEMUXERS }) }).done;
+    assert.equal(common.frames, A40[0].length);
+    for (const bad of [[], ['mov,ogg'], ['-f'], ['mov', '']]) assert.throws(() => ffmpegDecoder({ demuxers: bad }), /demuxers must be a list of ffmpeg demuxer names/, JSON.stringify(bad));
+    // A source that fails halfway: ffmpeg would end on the bytes it got (exit 0, a shorter recording).
+    // It is killed instead, and the decoder (and the job) fail with the source's own error.
+    async function* cut(): AsyncGenerator<Uint8Array> {
+        yield A40wav.slice(0, 100000);
+        throw new Error('upload interrupted');
+    }
+    await assert.rejects((async () => { for await (const block of decoder(cut()).blocks) void block; })(), /^Error: upload interrupted$/);
+    await assert.rejects(prepareAudio(cut(), { storage: memoryStorage(), concurrency: 1, decoder }).done, /^Error: upload interrupted$/);
+    // A stem from a stream decoded with it: the same error.
+    const stemOf = (input: () => AsyncIterable<Uint8Array>) => prepareAudio(aFile, { storage: memoryStorage(), concurrency: 1, stems: { b: { input, decoder, offsetFrames: 0 } } }).done;
+    assert.equal((await stemOf(() => chunks(A40wav, 3, 65536))).stems!.b!.status, 'ready');
+    await assert.rejects(stemOf(cut), /^Error: upload interrupted$/);
     // ffmpeg refuses the input: the job fails with its stderr, and nothing is left unhandled (that would end this process).
     const refusing = ffmpegDecoder({ command: [process.execPath, fakeFfmpeg], inputArgs: ['-fail'] });
     await assert.rejects(prepareAudio(aFile, { storage: memoryStorage(), concurrency: 1, decoder: refusing }).done, /ffmpeg failed \(exit 1\): Invalid data/);
@@ -1588,7 +1752,7 @@ if (argv.includes('-fail')) {
     controller.abort(new Error('stop decoding'));
     await waitFor(() => !alive(pid2), 'ffmpeg to be killed on abort');
     await assert.rejects((async () => { for (;;) if ((await cancelled.next()).done) return; })(), /stop decoding/);
-    results.push('ffmpeg decoder (fake ffmpeg): -protocol_whitelist pipe before -i; decodes through the pipe; killed when the consumer stops early and on abort');
+    results.push('ffmpeg decoder (fake ffmpeg): -protocol_whitelist pipe before -i, -format_whitelist from demuxers (another format fails, with the hint); decodes through the pipe; a source that fails halfway fails the decoder, the job and a stem with its error; killed when the consumer stops early and on abort');
 }
 
 {

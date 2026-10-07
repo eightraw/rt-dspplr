@@ -117,7 +117,12 @@ export function PlaylistExample({ clips }: { clips: { id: string; url: string; u
 ```
 
 The first `play()` must come from a user gesture (a click or key press). This
-is the browser's autoplay policy for `AudioContext`.
+is the browser's autoplay policy for `AudioContext`. `play()`, `toggle()` and
+`load(…, { autoplay: true })` resume the audio output at once, inside the
+gesture, not after the download. When the system takes the output away while
+playing (a call or Siri on iOS), the player pauses and `state.suspended` is
+`'interrupted'`; when `play()` cannot start the output, it is `'blocked'`. Either
+way the next `play()` from a gesture goes on, so a UI can show "tap to resume".
 
 ## Headless quick start
 
@@ -155,8 +160,11 @@ Construction is free. No AudioContext, node, or worker exists until the first
 | `pauseMode` | `'pause' \| 'reset'` | `'pause'` | `'reset'`: pausing returns to where playback last started, so the same passage plays again from there. |
 | `loadB` | `(clip, signal) => Promise<AudioInput \| null>` | none | On-demand source of stem B, see [Two-track mixer](#two-track-mixer). |
 | `prefetchB` | `boolean` | `false` | Fetch stem B right after load instead of waiting for mix > 0. |
-| `fetchOptions` | `RequestInit` | none | Extra `fetch()` options for URL sources (credentials, headers). |
+| `fetchOptions` | `RequestInit` | none | Extra `fetch()` options for URL sources (credentials, headers). For a prepared clip, its headers and credentials go only to the manifest's origin and to `fetchOptionsOrigins`. |
+| `fetchOptionsOrigins` | `string[]` | none | Further origins (`'https://cdn.example.com'`) that get the headers and credentials of `fetchOptions` when a manifest names files there. Files on other origins are fetched without them. |
 | `cacheBudgetBytes` | `number` | 150 MiB | Shared PCM budget for every player on the page, see [Memory](#memory). |
+| `maxClipBytes` | `number` | no limit | Whole clips (stem B too): the largest file. A URL is checked by its `Content-Length` before the download and by the bytes read while it runs. Over it, the load fails at once with an `Error` named `'ClipTooLargeError'` that points to prepared playback. |
+| `maxClipSeconds` | `number` | no limit | Whole clips: the longest clip, checked once decoded (before any speed variant). Fails the same way. |
 | `sampleRate` | `number` | the device's (44100 or 48000), else 48000 | Sample rate of the shared AudioContext (the first player to start decides). Clips at other rates are converted by the player. |
 | `latencyHint` | `'playback' \| 'interactive' \| 'balanced' \| number` | `'playback'` | Output buffering of the shared AudioContext (the first player to start decides). `'playback'` keeps the sound clean while the page is busy. |
 | `element` | `HTMLElement` | none | The element your interface lives in; same as `mount(element)`. |
@@ -175,8 +183,8 @@ source can do is reported in `state.capabilities`.
 | `mount(element)` | Puts the author menu on your interface element and returns a function that releases it. Playback needs at least one mounted element on the page: without it `play()`, `toggle()` and `load(…, { autoplay: true })` reject. |
 | `load(clip, { startAt?, autoplay? })` | Fetch and decode. Resolves `true` when ready, `false` on failure or when superseded by a newer load. |
 | `play(clip?, { startAt? })` | With no argument, resume. With a clip, play it from `startAt` (default 0). Passing the clip that is already loaded restarts it without reloading. |
-| `pause()`, `toggle()`, `stop()` | `pause()` follows `pauseMode`. |
-| `seek(seconds)` | Keeps playing if it was playing. |
+| `pause()`, `toggle()`, `stop()` | `pause()` follows `pauseMode`. While a whole clip is still loading they set what happens once it is in: it plays or not, and `stop()` puts it at 0. |
+| `seek(seconds)` | Keeps playing if it was playing. While a whole clip is still loading, it is where the clip starts. |
 | `setSpeed(speed)` | Keeps the position. Clamped to 0.25–4x. Pitch is preserved when the strategy has a worker. |
 | `setLoop({ start, end } \| null)` | In seconds. Snapped to zero crossings. Changing or dropping the loop while playing keeps the position; a loop set behind the playhead starts from its beginning. |
 | `setHighPass(hz)` | `0` bypasses. UI range 0–500 Hz. |
@@ -202,9 +210,10 @@ source can do is reported in `state.capabilities`.
 With these defaults the DSP leaves the audio as decoded: the high-pass is
 bypassed, the compressor and the two gains do nothing, and only samples
 above the -0.01 dBFS ceiling are clipped to it. Where the AudioWorklet cannot
-start (a CSP that blocks `blob:`, a browser without it), native nodes take
-over: they add a few milliseconds of look-ahead delay and limit softly near
-0 dBFS instead of clipping.
+start (a CSP that blocks `blob:`), a native `DynamicsCompressorNode` takes
+over the compressor. Its automatic makeup gain is cancelled, so it stays within
+about 1 dB of the worklet's levels, and it adds a few milliseconds of
+look-ahead delay. The ceiling is the same clip either way.
 
 ### State (`getState()`)
 
@@ -213,6 +222,7 @@ over: they add a few milliseconds of look-ahead delay and limit softly near
 | `clipId`, `src` | Current clip, and its URL if it was loaded from one. |
 | `status` | `'idle' \| 'loading' \| 'ready' \| 'error'`; `progress` 0–1 while loading; `error`. |
 | `isPlaying`, `currentTime`, `duration`, `ended` | `ended` is true after the clip plays to its end (not after `stop()`). |
+| `suspended` | `null`, or why the audio output is held: `'interrupted'` (the system took it while playing, the player paused) or `'blocked'` (`play()` could not start it). The next `play()` from a user gesture resumes. |
 | `loop` | Active loop range (snapped) or `null`. |
 | `processing` | Applied `ProcessingState`; speed stays at the audible rate during preparation. |
 | `pendingSpeed` | Requested speed being prepared, or `null`. Stop/pause/seek/new clip cancel the pending switch. |
@@ -344,7 +354,7 @@ or an ARIA slider, with a visible focus ring.
 
 | Focus | Keys |
 |---|---|
-| Waveform | Left/Right (or Down/Up) ±1 s, PageDown/PageUp ±5 s, Home/End, `+`/`-` (or `=`/`_`) zoom ×1.5, `0` resets zoom, Esc clears the loop |
+| Waveform | Left/Right (or Down/Up) ±1 s, PageDown/PageUp ±5 s, Home/End, `+`/`-` (or `=`/`_`) zoom ×1.5, `0` resets zoom, `[`/`]` set the loop's start/end at the playhead (without a loop, the other edge is the clip's end/start), Esc clears the loop |
 | Loop handle | Left/Right ±0.1 s (Shift ±1 s), PageDown/PageUp ±1 s, Home/End, Esc/Delete/Backspace clears the loop |
 | Post FX popover | Esc closes it and returns focus to the Post FX button |
 
@@ -416,8 +426,12 @@ useEffect(() => { void p.load({ manifest }); }, [manifest]);
 - Segments decode as the codec needs: WAV on the spot; MP3, Opus and FLAC with
   WebAssembly (dr_mp3, libopus, dr_flac), one chunk per codec fetched the first
   time a clip of that codec plays (30, 113 and 21 KB gzipped), in a worker. The
-  server must answer Range requests (one that ignores them sends the whole file
-  for every segment).
+  server must answer Range requests: from one that ignores them, a source of up
+  to 64 MB is read once and cut up in memory; a bigger one fails with
+  `The server ignores HTTP Range requests: <url>`.
+- A manifest's files must be `http(s)` URLs, relative to it or absolute (a CDN).
+  `fetchOptions` headers and credentials go only to the manifest's origin and to
+  those in `fetchOptionsOrigins`; files elsewhere are fetched without them.
 - Speed keeps the pitch through a realtime stretcher in the stream engine
   (AudioWorklet), which runs at the clip's rate and converts to the context's.
   Without it pitch follows speed and `capabilities.canPreservePitch` says so (the
@@ -490,14 +504,21 @@ A plugin (`DspPlugin`) is plain data plus functions:
     of the waveform approximates from it.
   - `process(channels, sampleRate, params, state)` is a self-contained function, run in
     the preview workers on the clip's audio, for the waveform (exact in the decoded
-    window).
+    window). A function, an arrow or a method; it must process the channels before it
+    returns, so an async function or a generator is left out of the previews.
   - An effect without a preview still plays. `previewCoverage.missing` names it, and
     the card says "Not in the preview: …".
 - `latencyFrames`: reported in `state.effectsLatencyFrames`.
 
 **Crash isolation**: a plugin that throws in `create()`, or whose worklet processor
 throws, is bypassed. The `effecterror` event and `effects[i].error` report it, and
-playback goes on. A preview function that throws is left out of the preview.
+playback goes on. It stays out, also when the output is rebuilt:
+`effects.bypass(id, false)` is ignored with a warning; remove it and add it again to
+retry. A plugin whose `dispose()` throws is reported the same way and
+still taken out of the graph. A preview function that throws, or does not compile,
+is left out of the preview. The isolation stops at exceptions: worklet plugins run
+in the one `AudioWorkletGlobalScope` the player's own processors use, so a processor
+that hangs, or that patches globals, affects all audio of the page.
 
 ## Timeline
 
@@ -708,6 +729,15 @@ native nodes, speed to `playbackRate` (prepared clips: resampling, the pitch
 follows), and the waveform and the spectrogram stay empty. A warning is logged, also when a
 worker fails after it started.
 
+The Rubber Band entry compiles `rubberband.wasm` in its own module worker, loaded
+from a URL: a worker like that takes its policy from the CSP of the worker
+script's own response, not from the page's, and that response needs
+`'wasm-unsafe-eval'` in `script-src`. Refused, each job falls back to the built-in
+vocoder, and the worker does not try again. `connect-src` must allow what the
+player loads with `fetch()`: the clip URLs, manifests, the source files of prepared
+clips (Range requests), their peaks, bands and spectrogram files, and
+`rubberband.wasm`.
+
 ## Styling and themes
 
 `@saitdigital/rt-dspplr/styles.css` styles the component. The root element is
@@ -746,7 +776,7 @@ the default look; `theme="dark"` and `theme="auto"` switch the token set.
 | `--rtd-radius`, `--rtd-control-radius` | `14px`, `8px` | |
 | `--rtd-wave-height`, `--rtd-play-size`, `--rtd-padding` | `56px`, `48px`, `16px` | Compact: `36px`, `40px`, `10px`. |
 | `--rtd-spectrogram-colormap` | `magma_r` (dark: `magma`) | The colormap of the level (`none` or empty: the three-colour ramp). |
-| `--rtd-spectrogram-bg`, `-a`, `-b`, `-mix`, `-peak` | `#f3f4f6`, orange, blue, purple, `#1b1f24` | The three-colour ramp: `colorMode: 'dual'`, or without a colormap. Hex colours. |
+| `--rtd-spectrogram-bg`, `-a`, `-b`, `-mix`, `-peak` | `#f3f4f6`, orange, blue, purple, `#1b1f24` | The three-colour ramp: `colorMode: 'dual'`, or without a colormap. Any CSS colour (`var()` too); the alpha is ignored. |
 | `--rtd-overlay-wave`, `-wave-rms`, `-played`, `-played-rms` | translucent ink / accent | The waveform outline drawn over the spectrogram (`display: 'both'`). |
 
 The dark set (`theme="dark"`, or `"auto"` with a dark OS setting) uses a
@@ -779,7 +809,10 @@ beyond the variant itself: the built-in vocoder goes through clips longer than
 15 s frame by frame (see [Time-stretch strategies](#time-stretch-strategies)).
 For large files or constrained devices, set `prewarmSpeeds: false`, avoid
 unnecessary stem B prefetch, and dispose unused players. Whole clips are
-decoded in full. For long recordings, the prepared (manifest)
+decoded in full: an hour of 48 kHz stereo is about 1.4 GB of PCM, and each speed
+variant adds to it. Where users can pass any file, set `maxClipBytes` and
+`maxClipSeconds` so a file too large fails early with a clear error instead of
+taking the tab down. For long recordings, the prepared (manifest)
 source keeps only about a minute of decoded audio around the playhead; see
 [Long recordings](#long-recordings-prepared-files).
 
@@ -799,8 +832,10 @@ matrix; its client bundles use webpack 5, which is tested.)
 
 ## Browser support
 
-Current Chrome, Edge, Firefox and Safari. Requirements: Web Audio with
-AudioWorklet (Chrome 66, Firefox 76, Safari 14.1; native fallback otherwise),
+Current Chrome, Edge, Firefox and Safari (14.1 or later: older Safari has only
+the prefixed `webkitAudioContext`, which the player does not use). Requirements:
+Web Audio with AudioWorklet (Chrome 66, Firefox 76, Safari 14.1; native nodes
+take over where a CSP blocks it),
 Web Workers, CSS container queries (2023+ browsers; older ones just skip the
 narrow-width tweaks). The Rubber Band entry needs module workers (Firefox
 114+). Formats: whatever the browser's `decodeAudioData` supports (WAV, MP3,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
     AudioPlayerCore,
     type AudioPlayerOptions,
@@ -13,9 +13,13 @@ import {
 // - The player is created once per component instance. Creating it is free:
 //   no AudioContext, node, or worker exists until the first load/play.
 // - Unmount disposes it (stops playback, releases nodes). Under React
-//   StrictMode, development builds run mount -> unmount -> mount; the mount
-//   effect therefore re-arms the instance with reactivate(), otherwise the
-//   second mount would hold a player that refuses to play.
+//   StrictMode, development builds run mount -> unmount -> mount (React 19's
+//   <Activity> does the same when it hides and shows a tree); the mount
+//   re-arms the instance with reactivate(), otherwise the second mount would
+//   hold a player that refuses to play. It re-arms in a layout effect: React
+//   runs every layout effect of a commit before any passive one, so a child
+//   that loads a clip from its own useEffect (children's effects run first)
+//   finds the player re-armed.
 // - `options` are read once, on first render. Remount (e.g. change `key`) to
 //   switch the stretch strategy.
 // - A custom interface puts `ref` on its root element; <AudioPlayer> mounts
@@ -52,6 +56,9 @@ export interface UseAudioPlayerResult extends Pick<
     ref: (element: HTMLElement | null) => void;
 }
 
+// Plain effects during SSR, where React 18 warns about layout ones (nothing plays there).
+const useIsomorphicLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
+
 export function useAudioPlayer(options?: AudioPlayerOptions): UseAudioPlayerResult {
     const [player] = useState(() => new AudioPlayerCore(options));
 
@@ -63,12 +70,13 @@ export function useAudioPlayer(options?: AudioPlayerOptions): UseAudioPlayerResu
         release.current = element ? player.mount(element) : null;
     }, [player]);
 
-    useEffect(() => {
-        // Re-arm on every mount: StrictMode's simulated unmount disposed it.
+    // Re-arm on every mount (StrictMode's simulated unmount disposed it), before
+    // any child's effect can load into it. Dispose with the passive effects.
+    useIsomorphicLayoutEffect(() => {
         player.reactivate();
-        return () => {
-            player.dispose();
-        };
+    }, [player]);
+    useEffect(() => () => {
+        player.dispose();
     }, [player]);
 
     return useMemo(() => ({

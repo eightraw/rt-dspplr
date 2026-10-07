@@ -3,7 +3,7 @@ import { mixGains } from '../controls';
 import { Mixer, Track, type LoopRange, type TrackState } from '../engine';
 import type { PlaybackTarget } from '../engine/Track';
 import type AudioEngine from '../engine/AudioEngine';
-import { BufferLoader } from '../loader/BufferLoader';
+import { BufferLoader, checkClipLimits, type ClipLimits } from '../loader/BufferLoader';
 import type { StretchService } from '../stretch/StretchService';
 import type { PlaybackSource, SourceCapabilities, SourceHost } from './types';
 
@@ -47,6 +47,7 @@ export class BufferSource implements PlaybackSource {
     private readonly _host: SourceHost;
     private readonly _stretch: StretchService | null;
     private readonly _prewarmSpeeds: readonly number[];
+    private readonly _limits: ClipLimits;
     private readonly _loaderB: BufferLoader;
 
     private _generation = 0;
@@ -54,6 +55,13 @@ export class BufferSource implements PlaybackSource {
     private _speedRequestId = 0;
     private _playIntent = false;
     private _pendingPlaybackOffset: number | null = null;
+    /**
+     * A clip is loading (from load() until its buffer is in place). Meanwhile
+     * the transport records what the listener wants, and load() applies it:
+     * `_playIntent` (play/pause) and `_pendingStart` (seek/stop).
+     */
+    private _loading = false;
+    private _pendingStart: number | null = null;
     private _disposed = false;
     private _initPromise: Promise<boolean> | null = null;
 
@@ -76,7 +84,8 @@ export class BufferSource implements PlaybackSource {
         this._host = host;
         this._stretch = settings.stretch;
         this._prewarmSpeeds = settings.prewarmSpeeds;
-        this._loaderB = new BufferLoader({ fetchOptions: host.options.fetchOptions });
+        this._limits = { maxBytes: host.options.maxClipBytes, maxSeconds: host.options.maxClipSeconds };
+        this._loaderB = new BufferLoader({ fetchOptions: host.options.fetchOptions, ...this._limits });
     }
 
     get capabilities(): SourceCapabilities {
@@ -114,6 +123,8 @@ export class BufferSource implements PlaybackSource {
     pause = async (): Promise<void> => {
         this._playIntent = false;
         this._pendingPlaybackOffset = null;
+        // Still loading: the clip will not start once decoded (a resume asks again).
+        if (this._loading) return;
         this._playRequestId += 1;
         this._speedRequestId += 1;
         this._update({ pendingSpeed: null });
@@ -143,6 +154,12 @@ export class BufferSource implements PlaybackSource {
     stop = (): void => {
         this._playIntent = false;
         this._pendingPlaybackOffset = null;
+        if (this._loading) {
+            // Once decoded, the clip waits at 0.
+            this._pendingStart = 0;
+            this._update({ isPlaying: false, currentTime: 0, playbackStartPoint: 0, startedAt: null, ended: false });
+            return;
+        }
         this._playRequestId += 1;
         this._speedRequestId += 1;
         this._trackA?.setPlaybackRate(this._state.processing.speed);
@@ -153,20 +170,32 @@ export class BufferSource implements PlaybackSource {
     };
 
     seek = async (time: number): Promise<void> => {
+        if (this._loading) {
+            // Still loading: the clip starts here once decoded, and a pending
+            // autoplay stands (taking a new request id would cancel it).
+            const start = clampTime(time, 0);
+            this._pendingStart = start;
+            this._update({ currentTime: start, playbackStartPoint: start, ended: false });
+            return;
+        }
         const requestId = ++this._playRequestId;
         this._speedRequestId += 1;
         this._update({ pendingSpeed: null });
         const trackA = this._trackA;
         const trackB = this._trackB;
         if (!trackA?.buffer) return;
-        this._playIntent = trackA.state.playState === 'playing';
+        const playing = trackA.state.playState === 'playing';
+        // A start still in flight (a speed variant rendering, the output resuming)
+        // is not dropped by the seek: it starts again from the new point.
+        const starting = !playing && this._playIntent;
+        this._playIntent = playing || starting;
         this._pendingPlaybackOffset = null;
         trackA.setPlaybackRate(this._state.processing.speed);
         trackB?.setPlaybackRate(this._state.processing.speed);
 
         const clamped = clampTime(time, trackA.duration);
 
-        if (trackA.state.playState === 'playing' && trackB?.buffer) {
+        if (starting || (playing && trackB?.buffer)) {
             await this._startSynchronized(clamped);
         } else {
             await trackA.seek(clamped);
@@ -306,6 +335,8 @@ export class BufferSource implements PlaybackSource {
     unload(): void {
         this._playIntent = false;
         this._pendingPlaybackOffset = null;
+        this._loading = false;
+        this._pendingStart = null;
         this._loadRequestId += 1;
         this._playRequestId += 1;
         this._speedRequestId += 1;
@@ -321,6 +352,8 @@ export class BufferSource implements PlaybackSource {
     dispose(): void {
         this._playIntent = false;
         this._pendingPlaybackOffset = null;
+        this._loading = false;
+        this._pendingStart = null;
         this._generation += 1;
         this._loadRequestId += 1;
         this._speedRequestId += 1;
@@ -369,7 +402,7 @@ export class BufferSource implements PlaybackSource {
         const output = await this._host.ensureOutput();
         if (!output || generation !== this._generation || this._disposed) return false;
         const processing = this._state.processing;
-        const trackOptions = { stretch: this._stretch, loader: { fetchOptions: this._host.options.fetchOptions } };
+        const trackOptions = { stretch: this._stretch, loader: { fetchOptions: this._host.options.fetchOptions, ...this._limits } };
         const mixer = new Mixer(output.engine);
         const trackA = mixer.createTrack('A', trackOptions);
         const trackB = mixer.createTrack('B', trackOptions);
@@ -395,7 +428,8 @@ export class BufferSource implements PlaybackSource {
     }
 
     private _onTrackA(track: Track, trackState: TrackState): void {
-        if (track !== this._trackA || !this._clip) return;
+        // While a clip loads the track is empty: the state shows the load (a seek's target, say).
+        if (track !== this._trackA || !this._clip || this._loading) return;
 
         if (trackState.ended) {
             this._playIntent = false;
@@ -424,18 +458,31 @@ export class BufferSource implements PlaybackSource {
     async load(clip: ClipInfo, startAt: number | undefined, autoplay: boolean): Promise<boolean> {
         this._playIntent = autoplay;
         this._pendingPlaybackOffset = null;
+        this._loading = true;
+        this._pendingStart = null;
         const generation = this._generation;
         const loadId = ++this._loadRequestId;
         const requestId = ++this._playRequestId;
         this._speedRequestId += 1;
         const isCurrent = () => loadId === this._loadRequestId && generation === this._generation && !this._disposed;
-        const ready = await this._ensureInitialized();
+        let initError: unknown = null;
+        const ready = await this._ensureInitialized().catch((error: unknown) => {
+            initError = error;
+            return false;
+        });
         const trackA = this._trackA;
         const trackB = this._trackB;
         const ctx = this._engine?.context;
-        if (!ready || !trackA || !trackB || !ctx || !isCurrent()) return false;
+        if (!ready || !trackA || !trackB || !ctx || !isCurrent()) {
+            // Still current, the audio engine could not start: an error like a clip's.
+            if (isCurrent()) {
+                this._fail(clip, initError ? toError(initError) : new Error('The audio engine could not start (no Web Audio, or it failed)'));
+            }
+            return false;
+        }
         trackA.unload();
-        const requestedStart = Math.max(0, startAt ?? 0);
+        // A seek made while the engine was starting is where the clip starts.
+        const requestedStart = this._pendingStart ?? Math.max(0, startAt ?? 0);
 
         this._abortB();
         this._requestIdB += 1;
@@ -498,14 +545,15 @@ export class BufferSource implements PlaybackSource {
 
         if (!loaded) {
             readyA.settle(false);
-            if (failure) {
-                this._update({ status: 'error', error: failure });
-                this._host.emit('error', failure);
-            }
+            this._fail(clip, failure ?? new Error('The clip could not be loaded'));
             return false;
         }
 
-        const startPoint = clampTime(requestedStart, trackA.duration);
+        // What the transport asked for while the clip loaded: a seek moved the
+        // start, a pause, stop or resume set the intent (see seek, pause, resume).
+        const startPoint = clampTime(this._pendingStart ?? requestedStart, trackA.duration);
+        this._pendingStart = null;
+        this._loading = false;
         const transportCurrent = requestId === this._playRequestId;
         // bufferB is left as it is: cleared when this load began, it may already hold this clip's
         // stem B, installed while A's load was finishing (both decoded in the cache, say).
@@ -523,7 +571,7 @@ export class BufferSource implements PlaybackSource {
         void this._maybeLoadB();
 
         if (requestId !== this._playRequestId) return true;
-        if (!autoplay) {
+        if (!this._playIntent) {
             if (startPoint > 0) await trackA.seek(startPoint);
             return true;
         }
@@ -540,6 +588,21 @@ export class BufferSource implements PlaybackSource {
             ended: false,
         });
         return true;
+    }
+
+    /** The current load failed: the error goes into the state and out as an event, and nothing plays. */
+    private _fail(clip: ClipInfo, error: Error): void {
+        this._loading = false;
+        this._pendingStart = null;
+        this._playIntent = false;
+        this._update({
+            clipId: clip.id,
+            src: typeof clip.src === 'string' ? clip.src : null,
+            status: 'error',
+            error,
+            isPlaying: false,
+        });
+        this._host.emit('error', error);
     }
 
     async restart(startAt: number): Promise<boolean> {
@@ -569,6 +632,11 @@ export class BufferSource implements PlaybackSource {
     }
 
     async resume(): Promise<void> {
+        if (this._loading) {
+            // Still loading: it plays once decoded. A new request id would cancel that.
+            this._playIntent = true;
+            return;
+        }
         const requestId = ++this._playRequestId;
         const trackA = this._trackA;
         if (!trackA?.buffer || this._disposed) return;
@@ -610,7 +678,13 @@ export class BufferSource implements PlaybackSource {
             && source === trackA?.buffer;
         if (!engine || !trackA || !source || !ctx) return false;
         if (trackA.state.playState !== 'playing') this._pendingPlaybackOffset = offset;
-        if (!await engine.resume() || !isCurrent()) return false;
+        if (!await engine.resume()) {
+            // The output would not start (no user activation, an interruption): the
+            // request is over, or a later seek or speed change would start it unasked.
+            if (isCurrent() && trackA.state.playState !== 'playing') this._playIntent = false;
+            return false;
+        }
+        if (!isCurrent()) return false;
 
         // Retain prepared buffers until start, even when the cache budget is zero.
         const targets = prepared ?? await Promise.all([
@@ -744,7 +818,11 @@ export class BufferSource implements PlaybackSource {
 
             const buffer = await this._decodeB(input, controller.signal);
             if (!buffer) return;
-            if (!this._trackA?.buffer && !(await this._readyAFor(clip.id))) return;
+            if (!this._trackA?.buffer && !(await this._readyAFor(clip.id))) {
+                // Stem A failed: B is not loading any more (loading the clip again fetches it).
+                if (requestId === this._requestIdB && this._clip?.id === clip.id) this._update({ statusB: 'idle' });
+                return;
+            }
             await this._installB(clip.id, requestId, buffer);
         } catch (error) {
             if (isAbort(error) || controller.signal.aborted) return;
@@ -834,10 +912,14 @@ export class BufferSource implements PlaybackSource {
 
     private async _decode(input: Exclude<AudioInput, string>, ctx: BaseAudioContext): Promise<AudioBuffer> {
         if (typeof AudioBuffer !== 'undefined' && input instanceof AudioBuffer) {
+            checkClipLimits(this._limits, { seconds: input.duration });
             return input;
         }
+        checkClipLimits(this._limits, { bytes: input instanceof ArrayBuffer ? input.byteLength : (input as Blob).size });
         const bytes = input instanceof ArrayBuffer ? input : await (input as Blob).arrayBuffer();
         // decodeAudioData detaches its argument; keep the caller's bytes intact.
-        return ctx.decodeAudioData(bytes.slice(0));
+        const decoded = await ctx.decodeAudioData(bytes.slice(0));
+        checkClipLimits(this._limits, { seconds: decoded.duration });
+        return decoded;
     }
 }

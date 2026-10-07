@@ -164,13 +164,23 @@ function createBinding(root: HTMLElement, options: AttributionOptions): Attribut
         menu.className = 'rtd-attribution-menu';
         menu.setAttribute('role', 'menu');
         menu.setAttribute('aria-label', 'About this player');
-        // Copy the player's theme because the menu lives outside its clipped layout.
-        const theme = win!.getComputedStyle(root);
-        for (const token of ['bg', 'border', 'text', 'text-muted', 'surface-hover', 'font', 'popover-shadow']) {
-            const value = theme.getPropertyValue(`--rtd-${token}`);
-            if (value) menu.style.setProperty(`--rtd-${token}`, value);
+        // The menu lives in the player's own element, so a modal <dialog> or a focus trap
+        // around the player holds it too (outside them it would be inert, or lose its focus
+        // at once); as a popover it is drawn in the top layer, so nothing clips it. Without
+        // popovers it goes to the body, or to the player's dialog (the rest of the page is
+        // inert under a modal one).
+        const popover = typeof menu.showPopover === 'function';
+        const host = popover ? root : root.closest('dialog') ?? doc.body;
+        if (host !== root) {
+            // Outside the player it does not inherit the player's theme: copy it.
+            const theme = win!.getComputedStyle(root);
+            for (const token of ['bg', 'border', 'text', 'text-muted', 'surface-hover', 'font', 'popover-shadow']) {
+                const value = theme.getPropertyValue(`--rtd-${token}`);
+                if (value) menu.style.setProperty(`--rtd-${token}`, value);
+            }
         }
-        menu.style.cssText += ';position:fixed;inset:auto;margin:0;box-sizing:border-box;width:max-content;min-width:240px;max-width:calc(100vw - 16px);padding:6px;border:1px solid var(--rtd-border,#d1d5db);border-radius:12px;background:var(--rtd-bg,#fff);color:var(--rtd-text,#1b1f24);box-shadow:var(--rtd-popover-shadow,0 12px 32px rgba(0,0,0,.28));font:500 13px/1.35 var(--rtd-font,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif);letter-spacing:normal;text-align:left;z-index:2147483647;';
+        // Inside the player it would inherit the player's text styles: reset the ones that show.
+        menu.style.cssText += ';position:fixed;inset:auto;margin:0;box-sizing:border-box;width:max-content;min-width:240px;max-width:calc(100vw - 16px);padding:6px;border:1px solid var(--rtd-border,#d1d5db);border-radius:12px;background:var(--rtd-bg,#fff);color:var(--rtd-text,#1b1f24);box-shadow:var(--rtd-popover-shadow,0 12px 32px rgba(0,0,0,.28));font:500 13px/1.35 var(--rtd-font,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif);letter-spacing:normal;word-spacing:normal;text-align:left;text-indent:0;text-transform:none;text-shadow:none;white-space:normal;cursor:auto;pointer-events:auto;z-index:2147483647;';
         // One entry, as a context menu draws its items: an icon, the credit, and under it
         // the version and where the project lives.
         const link = doc.createElement('a');
@@ -203,8 +213,8 @@ function createBinding(root: HTMLElement, options: AttributionOptions): Attribut
             previousFocus?.focus({ preventScroll: true });
         });
         menu.append(link);
-        doc.body.append(menu);
-        if (typeof menu.showPopover === 'function') {
+        host.append(menu);
+        if (popover) {
             menu.setAttribute('popover', 'manual');
             menu.showPopover();
         }

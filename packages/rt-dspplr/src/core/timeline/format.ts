@@ -16,8 +16,10 @@ export function formatClock(seconds: number, tenths = false): string {
 /** Spoken form for aria-valuetext: "1 minute 5 seconds". */
 export function spokenTime(seconds: number): string {
     const safe = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
-    const m = Math.floor(safe / 60);
-    const s = Math.round((safe - m * 60) * 10) / 10;
+    // Rounded to the tenth it is read in before it is split: 119.96 s is 2 minutes, not 1 minute 60 seconds.
+    const tenths = Math.round(safe * 10);
+    const m = Math.floor(tenths / 600);
+    const s = (tenths - m * 600) / 10;
     const sec = `${s} second${s === 1 ? '' : 's'}`;
     return m > 0 ? `${m} minute${m === 1 ? '' : 's'} ${sec}` : sec;
 }

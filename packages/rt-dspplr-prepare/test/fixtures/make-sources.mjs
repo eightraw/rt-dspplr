@@ -6,6 +6,16 @@
 //   ffmpeg -i mp3-src.wav -c:a libmp3lame -b:a 128k -map_metadata -1 sine-speech.mp3
 //
 // (ffmpeg 6.1.1 of Alpine 3.20.)
+//
+// The low-bitrate MP3s, where the bit reservoir reaches back more than 6 frames: 4 s + 333 frames
+// with digital silence from 1.5 s to 3 s (a VBR encoder's smallest frames there).
+//
+//   node make-sources.mjs   → also low-src-48k.wav (stereo), low-src-16k.wav (mono), low-src-22k.wav (stereo) (not kept)
+//   ffmpeg -i low-src-48k.wav -c:a libmp3lame -b:a 32k -map_metadata -1 low-32k-48k.mp3    MPEG-1, 32 kbit/s
+//   ffmpeg -i low-src-16k.wav -c:a libmp3lame -b:a 8k -map_metadata -1 low-8k-16k.mp3      MPEG-2, 8 kbit/s
+//   ffmpeg -i low-src-22k.wav -c:a libmp3lame -q:a 9 -map_metadata -1 low-v9-22k.mp3       MPEG-2, VBR -V9
+//
+// (ffmpeg n4.3.2 with LAME 3.100, Windows.)
 import fs from 'node:fs';
 
 function speechLike(frames, rate, channels, seed = 3) {
@@ -37,6 +47,14 @@ function wav16(channels, rate) {
     return b;
 }
 
+/** speechLike() with digital silence from 1.5 s to 3 s. */
+function gapped(frames, rate, channels) {
+    return speechLike(frames, rate, channels, 31).map((x) => x.fill(0, Math.round(1.5 * rate), 3 * rate));
+}
+
 fs.writeFileSync(new URL('./opus-src.wav', import.meta.url), wav16(speechLike(2 * 48000 + 333, 48000, 2, 31), 48000));
 fs.writeFileSync(new URL('./mp3-src.wav', import.meta.url), wav16(speechLike(2 * 44100 + 333, 44100, 2, 31), 44100));
+fs.writeFileSync(new URL('./low-src-48k.wav', import.meta.url), wav16(gapped(4 * 48000 + 333, 48000, 2), 48000));
+fs.writeFileSync(new URL('./low-src-16k.wav', import.meta.url), wav16(gapped(4 * 16000 + 333, 16000, 1), 16000));
+fs.writeFileSync(new URL('./low-src-22k.wav', import.meta.url), wav16(gapped(4 * 22050 + 333, 22050, 2), 22050));
 console.log('written');

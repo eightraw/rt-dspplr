@@ -214,7 +214,8 @@ export class StreamEngine {
 
     /**
      * Fade out (if sounding), then the processor lets go of its audio and stops
-     * running; the node is disconnected once the fade has played.
+     * running; the node is disconnected once the fade has played. A silent
+     * processor lets go as the message arrives, rendering or not (a suspended context).
      */
     dispose(): void {
         this.post({ type: 'dispose' });

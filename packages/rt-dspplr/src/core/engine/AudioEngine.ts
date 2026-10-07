@@ -127,11 +127,8 @@ class AudioEngine {
      */
     destroy(): void {
         if (this._context) {
-            try {
-                this._context.close();
-            } catch {
-                // Already closed.
-            }
+            // Rejects when it is already closed.
+            void this._context.close().catch(() => undefined);
             this._context = null;
         }
         this._status = 'uninitialized';
@@ -144,6 +141,7 @@ class AudioEngine {
     // Notifications (lightweight pub/sub for status changes)
     // -----------------------------------------------------------------------
 
+    /** Called on every status change and every change of the context's `state`. */
     subscribe(listener: () => void): () => void {
         this._listeners.add(listener);
         return () => {
@@ -162,11 +160,10 @@ class AudioEngine {
     // -----------------------------------------------------------------------
 
     private async _doInit(options?: AudioEngineOptions): Promise<boolean> {
-        const AudioContextCtor = typeof window === 'undefined'
-            ? undefined
-            : window.AudioContext || (window as typeof window & {
-                webkitAudioContext?: typeof AudioContext;
-            }).webkitAudioContext;
+        // No webkitAudioContext fallback: the WebKit that lacks AudioContext
+        // (before Safari 14.1) has no promise-based decodeAudioData and no
+        // AudioWorklet either, so the player could not work there anyway.
+        const AudioContextCtor = typeof window === 'undefined' ? undefined : window.AudioContext;
 
         if (!AudioContextCtor) {
             console.error('[AudioEngine] AudioContext not supported');
@@ -185,6 +182,11 @@ class AudioEngine {
             context = new AudioContextCtor({ sampleRate: DEFAULT_SAMPLE_RATE, latencyHint });
         }
         this._context = context;
+        // Subscribers hear when the output stops under them: 'interrupted' (a call or
+        // Siri on iOS) or 'suspended' by the system, and 'running' again.
+        context.addEventListener('statechange', () => {
+            if (this._context === context) this._notify();
+        });
 
         // Register dynamics worklet
         this._workletAvailable = await this._loadWorklet();

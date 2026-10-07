@@ -15,8 +15,19 @@ function cores(): number {
     return typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
 }
 
+/** Most threads a pool starts: each is a worker of a few MB, all started at once. */
+export const MAX_CONCURRENCY = 64;
+
+/** `concurrency`, checked: an integer from 1 to MAX_CONCURRENCY. */
+export function checkConcurrency(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > MAX_CONCURRENCY) {
+        throw new Error(`concurrency must be an integer from 1 to ${MAX_CONCURRENCY}, got ${String(value)}`);
+    }
+    return value;
+}
+
 export function defaultConcurrency(): number {
-    return Math.max(1, cores() - 1);
+    return Math.min(MAX_CONCURRENCY, Math.max(1, cores() - 1));
 }
 
 /**
@@ -28,7 +39,7 @@ export const SHORT_INPUT_BYTES = 24 * 1024 * 1024;
 
 /** Threads for one call without a shared pool: `concurrency` if given, else none for a short input, else cores − 1. */
 export function callConcurrency(concurrency: number | undefined, inputBytes: number | null): number {
-    if (concurrency !== undefined) return concurrency;
+    if (concurrency !== undefined) return checkConcurrency(concurrency);
     if (inputBytes !== null && inputBytes < SHORT_INPUT_BYTES) return 1;
     return defaultConcurrency();
 }
@@ -54,7 +65,7 @@ export interface PreparePool {
  * on a machine with two or more (one worker is slower than none).
  */
 export function createPreparePool(options: { concurrency?: number; workerUrl?: URL } = {}): PreparePool {
-    const size = options.concurrency ?? (cores() >= 2 ? Math.max(2, defaultConcurrency()) : 1);
+    const size = options.concurrency !== undefined ? checkConcurrency(options.concurrency) : cores() >= 2 ? Math.max(2, defaultConcurrency()) : 1;
     return new JobPool(size, options.workerUrl, true);
 }
 
@@ -76,7 +87,8 @@ export class JobPool {
 
     constructor(concurrency: number, workerUrl?: URL, shared = false) {
         this.shared = shared;
-        const size = Math.max(1, Math.floor(concurrency));
+        // The callers check theirs; whatever comes here makes 1 to MAX_CONCURRENCY workers.
+        const size = Number.isFinite(concurrency) ? Math.min(MAX_CONCURRENCY, Math.max(1, Math.floor(concurrency))) : 1;
         let url: URL | null = null;
         try {
             url = workerUrl ?? new URL('./prepare-worker.mjs', import.meta.url);

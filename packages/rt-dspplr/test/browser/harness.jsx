@@ -63,6 +63,17 @@ function StrictPlayer({ clip }) {
     useEffect(() => { window.strictPlayer = player.player; void player.play(clip); }, [player.player, clip]);
     return <AudioPlayer player={player} />;
 }
+// A child that loads into its parent's player from its own effect: React runs the
+// child's effects first, so on StrictMode's remount the load comes before the parent's.
+function ChildLoader({ player, clip }) {
+    useEffect(() => { window.strictChildLoads = [...(window.strictChildLoads ?? []), player.load(clip)]; }, [player, clip]);
+    return null;
+}
+function StrictChildPage({ clip }) {
+    const player = useAudioPlayer({ stretcher: 'native', prewarmSpeeds: false });
+    window.strictChildPlayer = player.player;
+    return <div ref={player.ref}><ChildLoader player={player.player} clip={clip} /><button onClick={() => void player.play()}>Child play</button></div>;
+}
 function CustomPlayer() {
     const player = useAudioPlayer({ stretcher: 'native', prewarmSpeeds: false });
     window.customPlayer = player.player;
@@ -85,4 +96,5 @@ window.h = { ...api, advanced, format, internals: { StreamEngine, loadStreamEngi
     mountTimeline(props) { const root = createRoot(document.getElementById('root')); root.render(<TimelinePage {...props} />); return root; },
     mountCard(clip, options) { const root = createRoot(document.getElementById('root')); root.render(<CardPage clip={clip} options={options} />); return root; },
     mountStrict() { const root = createRoot(document.getElementById('root')); root.render(<StrictMode><StrictPlayer clip={buffer()} /></StrictMode>); return root; },
+    mountStrictChild() { const root = createRoot(document.getElementById('root')); root.render(<StrictMode><StrictChildPage clip={buffer()} /></StrictMode>); return root; },
 };

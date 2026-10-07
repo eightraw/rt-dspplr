@@ -11,16 +11,24 @@ import { wasmInt16 } from './wasm/kernels';
 // written once as a 16-bit WAV (sourceWavSink) and indexed like any WAV.
 //
 //   wav   bytes = dataOffset + frame × blockAlign
-//   mp3   whole frames; a run starts MP3_WARMUP frames early (the bit reservoir,
-//         the overlap) and is counted back from its end, because the decoder
-//         gives nothing for a first frame whose reservoir lies outside the run
+//   mp3   whole frames; a run starts early enough that the bit reservoir is
+//         full before the two frames ahead of the first sample's (they give it
+//         its overlap and filterbank state), and at least MP3_WARMUP frames
+//         early; it is counted back from its end, because the decoder gives
+//         nothing for a frame whose reservoir lies outside the run
 //   opus  whole Ogg pages; a run starts OPUS_PREROLL samples early, at the first
 //         packet that begins on its first page: a fresh decoder converges on
 //         the continuous decode's samples
 // ---------------------------------------------------------------------------
 
-/** Frames of an MP3 a run starts before its first sample's frame. */
+/**
+ * Fewest frames of an MP3 a run starts before its first sample's frame. Low bitrates need more:
+ * the bit reservoir reaches back up to 511 bytes of main data (MPEG-1; 255 for MPEG-2 and 2.5),
+ * the main data of 9 frames at 32 kbit/s and 48 kHz, of over 50 in the silence of a VBR -V9 file.
+ */
 const MP3_WARMUP = 6;
+/** Frames further back than the rule's start that the check of the deepest MP3 run reads its reference from (plus the rule's own warm-up again). */
+const MP3_CHECK_MARGIN = 64;
 /**
  * Samples (48 kHz) an Opus run is decoded before its first sample: 500 ms. RFC 7845's 80 ms
  * left errors up to -35 dBFS (music, 40 ms pages); 240 ms, -81 dB; 400 ms, the same samples.
@@ -32,8 +40,13 @@ export interface SourceMap {
     describe: Omit<ManifestSource, 'url' | 'bytes'>;
     /** Decoded frames of the source. */
     frames: number;
-    /** The bytes of a run holding samples [start, start + count) and how many of the run's samples, from `start` to its end, there are. */
-    rangeFor(start: number, count: number): { range: [number, number]; tail: number };
+    /**
+     * The bytes of a run holding samples [start, start + count) and how many of the run's samples, from `start` to its end,
+     * there are. `warmup`: codec frames the run starts before the frame of `start` (MP3).
+     */
+    rangeFor(start: number, count: number): { range: [number, number]; tail: number; warmup?: number };
+    /** A run of the same samples that starts much earlier: what a check of rangeFor()'s warm-up compares with (MP3). */
+    referenceFor?(start: number, count: number): { range: [number, number]; tail: number };
 }
 
 /** Whether the player decodes this layout itself (else the source is written as a WAV). */
@@ -76,16 +89,36 @@ export async function mapSource(file: string, layout: SourceLayout, sampleRate: 
             }
             return lo;
         };
+        /**
+         * The first frame of a run for the frame f holding its first sample: f − 2 decoded gives f − 1
+         * its overlap, f − 1 gives f its overlap and filterbank state, so the reservoir must be full
+         * before f − 2. Walking back from f − 3, the frame reached once the main data of the frames
+         * passed holds the reservoir; never later than MP3_WARMUP frames before f.
+         */
+        const runStart = (f: number) => {
+            let k = f - 3;
+            for (let have = 0; k >= 0 && have < table.reservoir; k -= 1) have += table.mainBytes[k];
+            return Math.max(0, Math.min(f - MP3_WARMUP, k));
+        };
+        const run = (start: number, count: number, from: (f: number) => number) => {
+            const r = start + delay;
+            const f = frameOf(r);
+            const f0 = from(f);
+            const fl = frameOf(r + count - 1);
+            const end = fl + 1 < table.count ? table.offset[fl + 1] : table.end;
+            const runEnd = fl + 1 < table.count ? table.firstSample[fl + 1] : table.totalSamples;
+            return { range: [table.offset[f0], end] as [number, number], tail: runEnd - r, warmup: f - f0 };
+        };
         return {
             describe: { codec: 'mp3', sampleRate, channels },
             frames,
-            rangeFor: (start, count) => {
-                const r = start + delay;
-                const f0 = Math.max(0, frameOf(r) - MP3_WARMUP);
-                const fl = frameOf(r + count - 1);
-                const end = fl + 1 < table.count ? table.offset[fl + 1] : table.end;
-                const runEnd = fl + 1 < table.count ? table.firstSample[fl + 1] : table.totalSamples;
-                return { range: [table.offset[f0], end], tail: runEnd - r };
+            rangeFor: (start, count) => run(start, count, runStart),
+            referenceFor: (start, count) => {
+                const { range, tail } = run(start, count, (f) => {
+                    const f0 = runStart(f);
+                    return Math.max(0, f0 - (f - f0) - MP3_CHECK_MARGIN);
+                });
+                return { range, tail };
             },
         };
     }
@@ -155,12 +188,40 @@ export function indexSegments(frames: number, framesPerSegment: number, map: Sou
     return list;
 }
 
+/**
+ * The segment (of indexSegments()'s list) whose run starts furthest back, where a warm-up that
+ * falls short shows first, with the same segment on a run that starts much earlier still: a
+ * reference for it. A run from the file's first frame has nothing earlier to be checked against
+ * (and is the continuous decode's start). Null when no run has a warm-up of that kind (WAV, Opus).
+ */
+export function deepestRun(list: ManifestSegment[], map: SourceMap, offset = 0): { index: number; reference: ManifestSegment } | null {
+    if (!map.referenceFor) return null;
+    let deepest: { index: number; reference: ManifestSegment } | null = null;
+    let most = -1;
+    for (const seg of list) {
+        if (!seg.range) continue;
+        const s0 = Math.max(0, seg.startFrame + offset);
+        const count = seg.frames - (seg.lead ?? 0) - (seg.trail ?? 0);
+        const warmup = map.rangeFor(s0, count).warmup ?? 0;
+        if (warmup <= most) continue;
+        const { range, tail } = map.referenceFor(s0, count);
+        if (range[0] >= seg.range[0]) continue;
+        most = warmup;
+        deepest = { index: seg.index, reference: { ...seg, range, tail } };
+    }
+    return deepest;
+}
+
 // ---- MP3 frames ------------------------------------------------------------------------------
 
 interface Mp3Table {
     count: number;
     offset: Float64Array;
     firstSample: Float64Array;
+    /** Bytes of main data each frame brings to the bit reservoir (the frame less its header, CRC and side info). */
+    mainBytes: Float64Array;
+    /** How far back the reservoir reaches: 511 bytes (MPEG-1), 255 (MPEG-2 and 2.5). */
+    reservoir: number;
     totalSamples: number;
     /** Where the last frame ends. */
     end: number;
@@ -196,10 +257,11 @@ function columns(n: number) {
  * frame (the decoder skips it too), resynchronising over junk. Layer III, as dr_mp3 decodes it.
  */
 export async function mp3Frames(file: string): Promise<Mp3Table> {
-    const table = columns(2);
+    const table = columns(3); // offset, firstSample, mainBytes
     let samples = 0;
     let end = 0;
     let first = true;
+    let reservoir = 255;
     let carry = new Uint8Array(0);
     let base = 0; // file offset of carry[0]
     let pos = 0; // next byte to look at, file offset
@@ -223,14 +285,18 @@ export async function mp3Frames(file: string): Promise<Mp3Table> {
             const n = mpeg1 ? 1152 : 576;
             const size = Math.floor(((n / 8) * (mpeg1 ? BITRATE_V1 : BITRATE_V2)[bitrateIndex] * 1000) / RATES[version][rateIndex]) + ((bytes[i + 2] >> 1) & 1);
             if (i + size > bytes.length) break; // the rest comes with the next chunk
+            const mono = (bytes[i + 3] >> 6) === 3;
+            const side = mpeg1 ? (mono ? 17 : 32) : (mono ? 9 : 17);
             if (first) {
                 first = false;
-                const mono = (bytes[i + 3] >> 6) === 3;
-                const at = i + 4 + (mpeg1 ? (mono ? 17 : 32) : (mono ? 9 : 17));
+                const at = i + 4 + side;
                 const tag = String.fromCharCode(bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]);
                 if (tag === 'Xing' || tag === 'Info') { i += size; continue; }
             }
-            table.push(base + i, samples);
+            if (mpeg1) reservoir = 511;
+            // The protection bit clear: a 16-bit CRC after the header.
+            const crc = bytes[i + 1] & 1 ? 0 : 2;
+            table.push(base + i, samples, Math.max(0, size - 4 - crc - side));
             samples += n;
             end = base + i + size;
             i += size;
@@ -239,7 +305,7 @@ export async function mp3Frames(file: string): Promise<Mp3Table> {
         carry = bytes.slice(i);
         base = pos;
     }
-    return { count: table.count, offset: table.column(0), firstSample: table.column(1), totalSamples: samples, end };
+    return { count: table.count, offset: table.column(0), firstSample: table.column(1), mainBytes: table.column(2), reservoir, totalSamples: samples, end };
 }
 
 // ---- Ogg Opus pages --------------------------------------------------------------------------

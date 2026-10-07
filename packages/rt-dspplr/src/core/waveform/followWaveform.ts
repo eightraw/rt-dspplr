@@ -5,7 +5,10 @@ import { rowFrequencies } from '../spectrogram/dspPaint';
 import type { AudioPlayerCore } from '../AudioPlayer';
 
 /** What the preview needs from a player. */
-export type PreviewPlayer = Pick<AudioPlayerCore, 'getState' | 'subscribe'> & Partial<Pick<AudioPlayerCore, 'on' | 'getWindowAudio'>>;
+export type PreviewPlayer = Pick<AudioPlayerCore, 'getState' | 'subscribe'> & Partial<Pick<AudioPlayerCore, 'on' | 'getWindowAudio'>> & {
+    /** A plugin's preview did not compile in a worker: count it in the state's previewCoverage. */
+    refreshPreviewCoverage?: () => void;
+};
 import { ApproxPreview } from './overviewPreviewClient';
 import type { WaveformPeakLevel, WaveformPeakPyramid } from './pyramid';
 import type { WaveformProcessing } from './types';
@@ -126,7 +129,7 @@ function followBuffer(player: PreviewPlayer, onPyramid: Publish): () => void {
     const analyzer = new WaveformAnalyzer((pyramids) => {
         latest = pyramids;
         onPyramid({ pyramid: latest.processed ?? latest.source, gain: latest.gain ?? null, windowGain: null });
-    });
+    }, () => player.refreshPreviewCoverage?.());
     let buffers: { a: AudioBuffer | null; b: AudioBuffer | null; clip: string | null } = { a: null, b: null, clip: null };
     let applied: WaveformProcessing | null = null;
     const sync = () => {
@@ -190,7 +193,7 @@ function followSegmented(player: PreviewPlayer, onPyramid: Publish): () => void 
             .filter((level) => level.maxPeaks.length >= 4)
             .map((level) => ({ ...level, startBin: windowStart / level.binSize }));
         publish();
-    });
+    }, () => player.refreshPreviewCoverage?.());
 
     // The approximate preview over the whole clip runs in its own worker (≈ 0.1–0.25 s per change for an hour).
     const preview = new ApproxPreview((pyramid, gain) => {
@@ -242,7 +245,7 @@ function followSegmented(player: PreviewPlayer, onPyramid: Publish): () => void 
         windowKey = audio.key;
         windowStart = audio.startFrame;
         exact = [];
-                windowGain = null;
+        windowGain = null;
         applied = processingOf(player.getState());
         analyzer.setBuffers(audio.buffer, audio.bufferB ?? null, applied);
     };
@@ -279,7 +282,7 @@ function followSegmented(player: PreviewPlayer, onPyramid: Publish): () => void 
         if (changedInputs || changedB || !sameProcessing(applied, processing)) {
             const processingChanged = !sameProcessing(applied, processing);
             applied = processing;
-            // Debounced to a frame, like the worker's processed rebuild.
+            // The approximation is debounced to a frame; the analyzer keeps only the latest exact rebuild.
             if (!timer) timer = setTimeout(recomputeApprox, DEBOUNCE_MS);
             if (processingChanged && windowKey) analyzer.setProcessing(processing);
         }

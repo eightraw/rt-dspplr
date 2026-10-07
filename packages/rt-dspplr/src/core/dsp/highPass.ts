@@ -1,4 +1,5 @@
 export const HIGH_PASS_SLOPE_DB_PER_OCT = 24;
+/** Linear Q of the two Butterworth sections (a BiquadFilterNode takes them in dB). */
 export const HIGH_PASS_SECTION_Q = [
     0.541196100146197,
     1.306562964876377,
@@ -45,8 +46,11 @@ export function createFourthOrderHighPassStages(context: BaseAudioContext): [Biq
 
     first.type = 'highpass';
     second.type = 'highpass';
-    first.Q.value = HIGH_PASS_SECTION_Q[0];
-    second.Q.value = HIGH_PASS_SECTION_Q[1];
+    // A highpass BiquadFilterNode reads Q in dB (alpha = sin w0 / (2 * 10^(Q/20))),
+    // unlike the linear q of computeHighPassCoefficients. The linear values here
+    // gave a +3.8 dB bump above the cutoff instead of Butterworth's -3 dB at it.
+    first.Q.value = 20 * Math.log10(HIGH_PASS_SECTION_Q[0]);
+    second.Q.value = 20 * Math.log10(HIGH_PASS_SECTION_Q[1]);
 
     return [first, second];
 }

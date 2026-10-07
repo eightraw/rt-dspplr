@@ -60,7 +60,7 @@ type Message =
     | { type: 'stretch'; enabled: boolean }
     /** Stem B is another stem now (or gone): play A until its segments arrive, without holding. */
     | { type: 'resetB' }
-    /** Fade out if sounding, then stop processing for good. */
+    /** Fade out if sounding, then stop processing for good (at once, on arrival, when silent). */
     | { type: 'dispose' };
 
 type Jump = Extract<Message, { type: 'play' | 'pause' | 'seek' }>;
@@ -309,9 +309,33 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         this.stretched = Array.from({ length: this.channels }, () => new Float32Array(BLOCK));
         this.port.onmessage = (event: MessageEvent<Message>) => {
             const message = event.data;
+            if (!this.playing) {
+                // Nothing sounds, so nothing needs a fade: let go of the audio now, not at the next
+                // render, which a suspended context (no user gesture yet) may never reach.
+                if (this.disposing) return;
+                if (message.type === 'dispose' || message.type === 'clear') {
+                    this.release(message.type === 'dispose');
+                    return;
+                }
+            }
             const frame = (message as { frame?: number }).frame;
             this.queue.push({ frame: typeof frame === 'number' ? frame : -1, message });
         };
+    }
+
+    /**
+     * Drop every segment, and the queued ones (as applying the queue in order would);
+     * on dispose, the queue and the stretcher too: process() then returns false.
+     */
+    private release(dispose: boolean): void {
+        this.queue = dispose ? [] : this.queue.filter((q) => q.message.type !== 'seg');
+        this.stems.a.clear();
+        this.stems.b.clear();
+        this.invalidate('a');
+        this.invalidate('b');
+        if (!dispose) return;
+        this.disposing = true;
+        this.stretch = null;
     }
 
     // ---- segments ------------------------------------------------------------------------
@@ -431,6 +455,11 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         if (!factory) return; // the module is still being added; try again next block
         this.stretchLoading = true;
         factory().then((mod) => {
+            // Disposed while it loaded: its heap is not kept.
+            if (this.disposing) {
+                this.stretchLoading = false;
+                return;
+            }
             mod._main();
             mod._presetDefault(this.channels, this.clipRate);
             const inLat = mod._inputLatency();

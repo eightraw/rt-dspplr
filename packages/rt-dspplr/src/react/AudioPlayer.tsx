@@ -490,49 +490,16 @@ function AudioPlayerCard({
         'aria-label': titleText ? `Audio player: ${titleText}` : 'Audio player',
     };
 
-    if (compact) {
-        const drawerId = `${ids}-drawer`;
-        return (
-            <section {...rootProps}>
-                <div className="rtd-row">
-                    {playButton}
-                    {scrubber}
-                    {time}
-                    <button
-                        type="button"
-                        className="rtd-btn rtd-icon-btn"
-                        aria-label="Player settings"
-                        aria-expanded={drawerOpen}
-                        aria-controls={drawerId}
-                        title="Speed, loop, mixer and sound"
-                        onClick={() => setDrawerOpen((open) => !open)}
-                    >
-                        <IconSliders />
-                    </button>
-                    {creditSlot}
-                </div>
-                {drawerOpen && (
-                    <div className="rtd-drawer" id={drawerId}>
-                        {heading}
-                        <div className="rtd-tools">
-                            {navButtons && <div className="rtd-transport">{navStart}{navBack}{navForward}</div>}
-                            {speed}
-                            {loopButton}
-                        </div>
-                        <MixSlider core={core} state={state} />
-                        <SoundPanel core={core} state={state} />
-                    </div>
-                )}
-            </section>
-        );
-    }
-
+    // One tree for both layouts: the seek bar keeps its parent and its place in it when
+    // the card folds or unfolds, so it is not mounted again and keeps its zoom, its pan
+    // and the focus. The stylesheet lays the row out for each.
+    const drawerId = `${ids}-drawer`;
     const popoverId = `${ids}-sound`;
     return (
         <section {...rootProps}>
-            {heading}
+            {!compact && heading}
             <div className="rtd-row">
-                {navButtons ? (
+                {navButtons && !compact ? (
                     <div className="rtd-transport">
                         {navStart}
                         {navBack}
@@ -542,37 +509,64 @@ function AudioPlayerCard({
                 ) : playButton}
                 {scrubber}
                 {time}
-            </div>
-            <div className="rtd-tools">
-                {speed}
-                {loopButton}
-                <MixSlider core={core} state={state} />
-                <div className="rtd-sound-anchor">
+                {compact && (
                     <button
-                        ref={soundButtonRef}
                         type="button"
-                        className="rtd-btn rtd-chip"
-                        aria-expanded={soundOpen}
-                        aria-controls={popoverId}
-                        aria-haspopup="dialog"
-                        onClick={() => setSoundOpen((open) => !open)}
+                        className="rtd-btn rtd-icon-btn"
+                        aria-label="Player settings"
+                        aria-expanded={drawerOpen}
+                        aria-controls={drawerOpen ? drawerId : undefined}
+                        title="Speed, loop, mixer and sound"
+                        onClick={() => setDrawerOpen((open) => !open)}
                     >
                         <IconSliders />
-                        <span>Post FX</span>
                     </button>
-                    {soundOpen && (
-                        <div
-                            ref={soundPopoverRef}
-                            id={popoverId}
-                            className="rtd-popover"
-                            role="dialog"
-                            aria-label="Post FX"
-                        >
-                            <SoundPanel core={core} state={state} />
-                        </div>
-                    )}
-                </div>
+                )}
+                {compact && creditSlot}
             </div>
+            {compact ? drawerOpen && (
+                <div key="drawer" className="rtd-drawer" id={drawerId}>
+                    {heading}
+                    <div className="rtd-tools">
+                        {navButtons && <div className="rtd-transport">{navStart}{navBack}{navForward}</div>}
+                        {speed}
+                        {loopButton}
+                    </div>
+                    <MixSlider core={core} state={state} />
+                    <SoundPanel core={core} state={state} />
+                </div>
+            ) : (
+                <div key="tools" className="rtd-tools">
+                    {speed}
+                    {loopButton}
+                    <MixSlider core={core} state={state} />
+                    <div className="rtd-sound-anchor">
+                        <button
+                            ref={soundButtonRef}
+                            type="button"
+                            className="rtd-btn rtd-chip"
+                            aria-expanded={soundOpen}
+                            aria-controls={soundOpen ? popoverId : undefined}
+                            aria-haspopup="dialog"
+                            onClick={() => setSoundOpen((open) => !open)}
+                        >
+                            <IconSliders />
+                            <span>Post FX</span>
+                        </button>
+                        {soundOpen && (
+                            <div
+                                ref={soundPopoverRef}
+                                id={popoverId}
+                                className="rtd-popover"
+                                role="dialog"
+                                aria-label="Post FX"
+                            >
+                                <SoundPanel core={core} state={state} />
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
         </section>
     );
 }

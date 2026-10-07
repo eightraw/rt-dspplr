@@ -2,7 +2,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { ANALYZER_VERSION, MANIFEST_FORMAT_VERSION, assertManifest, assertStemKey, type AudioManifest, type ManifestStem } from '@saitdigital/rt-dspplr/format';
-import { defaultConcurrency, JobPool, type PreparePool } from './pool';
+import { checkConcurrency, defaultConcurrency, JobPool, type PreparePool } from './pool';
 import { fsStorage, manifestBytes, storedRanges, type PrepareOptions, type PrepareStorage } from './prepareAudio';
 import { sourceReader } from './sourceReader';
 import { buildStem, failedStem, StemAlignmentError, type StemInput, type StemOptions } from './stem';
@@ -129,7 +129,7 @@ export async function attachStem(target: StemTarget, stem: string, input: StemIn
     const { storage, read } = storageOf(target);
     const manifest = await readManifest(read);
     const prepare: PrepareOptions = { ...options.prepare, concurrency: options.concurrency ?? options.prepare?.concurrency, workerUrl: options.workerUrl ?? options.prepare?.workerUrl, pool: options.pool ?? options.prepare?.pool };
-    const pool = (prepare.pool as JobPool | undefined) ?? new JobPool(prepare.concurrency ?? defaultConcurrency(), prepare.workerUrl);
+    const pool = (prepare.pool as JobPool | undefined) ?? new JobPool(prepare.concurrency !== undefined ? checkConcurrency(prepare.concurrency) : defaultConcurrency(), prepare.workerUrl);
     let tmpDir: string | null = null;
     try {
         const entry = labelled(await buildStem({

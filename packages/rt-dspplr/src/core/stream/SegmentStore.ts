@@ -1,3 +1,4 @@
+import { SourceError, type FileAccess } from './fileAccess';
 import type { AudioManifest } from './manifest';
 import { decodeRun } from './RunDecoder';
 import { segmentFromRun } from './sourceRuns';
@@ -10,13 +11,23 @@ import { segmentFromRun } from './sourceRuns';
 // then the least important wanted ones, but never the first `essential`.
 // A segment that fails (HTTP error, bad data) is retried with a growing pause
 // (250 ms doubling to 8 s), never on every pump; onError() reports each failure.
+// A SourceError (the server ignores Range requests on a big file, the file
+// changed, it decodes to another format) is not retried: it is reported once
+// and the store fetches nothing more (`broken`).
 // ---------------------------------------------------------------------------
 
 const RETRY_FIRST_MS = 250;
 const RETRY_MAX_MS = 8000;
+/**
+ * A source whose server ignores Range requests is read whole, once, and every
+ * segment is cut from that copy, up to this size: a short clip on a plain
+ * server plays (the copy is not counted in the decoded-audio budget). A
+ * longer recording, what prepared clips are for, fails with a clear error
+ * instead of a download of the whole file per segment.
+ */
+export const WHOLE_SOURCE_MAX_BYTES = 64 * 1024 * 1024;
 
 export interface SegmentStoreOptions {
-    fetchOptions?: RequestInit;
     /** Decoded-audio budget in bytes. */
     maxBytes: number;
     /** Parallel fetches. Default 3. */
@@ -54,7 +65,14 @@ interface Job {
 export class SegmentStore {
     private readonly _sourceUrl: string;
     private readonly _manifest: AudioManifest;
-    private readonly _options: Required<Omit<SegmentStoreOptions, 'fetchOptions'>> & { fetchOptions?: RequestInit };
+    private readonly _files: FileAccess;
+    private readonly _options: Required<SegmentStoreOptions>;
+    /** Aborted by dispose() and by the load's signal: ends the whole-file download too. */
+    private readonly _life = new AbortController();
+    private readonly _onAbort = () => this._cancelAll();
+    /** The whole source, when its server answered a Range request with all of it (see WHOLE_SOURCE_MAX_BYTES). */
+    private _whole: Promise<ArrayBuffer> | null = null;
+    private _broken: SourceError | null = null;
     private readonly _cache = new Map<number, Entry>();
     private readonly _jobs = new Map<number, Job>();
     private _queue: Job[] = [];
@@ -68,10 +86,19 @@ export class SegmentStore {
     private readonly _failures = new Map<number, { count: number; retryAt: number }>();
     private readonly _stats = { peak: 0, fetches: 0, fetchedBytes: 0, fetchMs: 0, decodeMs: 0, evictions: 0 };
 
-    constructor(manifestUrl: string, manifest: AudioManifest, options: SegmentStoreOptions) {
+    /** `files`: how the manifest's files are fetched (their URLs, the host's options, the load's signal). */
+    constructor(files: FileAccess, manifest: AudioManifest, options: SegmentStoreOptions) {
         this._manifest = manifest;
-        this._sourceUrl = new URL(manifest.segments.source.url, manifestUrl).href;
+        this._files = files;
+        this._sourceUrl = files.resolve(manifest.segments.source.url, 'segments.source.url');
         this._options = { concurrency: 3, ...options };
+        if (files.signal?.aborted) this._life.abort();
+        else files.signal?.addEventListener('abort', this._onAbort);
+    }
+
+    /** Why the source cannot be played (see SourceError), or null. */
+    get broken(): SourceError | null {
+        return this._broken;
     }
 
     /** A decoded segment, or null. Marks it as used. */
@@ -109,12 +136,13 @@ export class SegmentStore {
 
     /**
      * Fetch + decode (deduplicated). `urgent` jumps the queue. Resolves null if
-     * cancelled, or at once while a failed segment waits for its next retry.
+     * cancelled, at once while a failed segment waits for its next retry, and
+     * at once for good once the source is `broken`.
      */
     load(index: number, urgent = false): Promise<AudioBuffer | null> {
         const cached = this.get(index);
         if (cached) return Promise.resolve(cached);
-        if (index < 0 || index >= this._manifest.segments.list.length || this._disposed) return Promise.resolve(null);
+        if (index < 0 || index >= this._manifest.segments.list.length || this._disposed || this._broken || this._life.signal.aborted) return Promise.resolve(null);
         const failed = this._failures.get(index);
         if (failed && performance.now() < failed.retryAt && !this._jobs.has(index)) return Promise.resolve(null);
         const existing = this._jobs.get(index);
@@ -205,15 +233,23 @@ export class SegmentStore {
 
     dispose(): void {
         this._disposed = true;
-        for (const job of [...this._jobs.values()]) {
-            job.controller.abort();
-            this._finish(job, null);
-        }
+        this._files.signal?.removeEventListener('abort', this._onAbort);
+        this._cancelAll();
+        this._whole = null;
         this._cache.clear();
         this._bytes = 0;
         this._listeners.clear();
         this._errorListeners.clear();
         this._failures.clear();
+    }
+
+    /** Abort every fetch, the whole-file download included; nothing is fetched after. */
+    private _cancelAll(): void {
+        this._life.abort();
+        for (const job of [...this._jobs.values()]) {
+            job.controller.abort();
+            this._finish(job, null);
+        }
     }
 
     private _drop(index: number): void {
@@ -245,19 +281,19 @@ export class SegmentStore {
     private async _run(job: Job): Promise<void> {
         const t0 = performance.now();
         try {
+            if (this._broken) {
+                this._finish(job, null);
+                return;
+            }
             const seg = this._manifest.segments.list[job.index];
             let bytes: ArrayBuffer | null = null;
             let fetched = 0;
             if (seg.range) {
-                const [start, end] = seg.range;
-                const headers = new Headers(this._options.fetchOptions?.headers);
-                headers.set('range', `bytes=${start}-${end - 1}`);
-                const response = await fetch(this._sourceUrl, { ...this._options.fetchOptions, headers, signal: job.controller.signal });
-                if (!response.ok) throw new Error(`Segment ${job.index}: HTTP ${response.status}`);
-                bytes = await response.arrayBuffer();
-                fetched = bytes.byteLength;
-                // A server that ignores ranges sends the whole file: the run is cut out of it.
-                if (response.status === 200 && bytes.byteLength > end - start) bytes = bytes.slice(start, end);
+                ({ bytes, fetched } = await this._fetchRun(seg.range[0], seg.range[1], job.controller.signal));
+                if (job.controller.signal.aborted || this._disposed) {
+                    this._finish(job, null);
+                    return;
+                }
             }
             const t1 = performance.now();
             const run = bytes ? await decodeRun(this._manifest.segments.source, bytes) : null;
@@ -280,8 +316,22 @@ export class SegmentStore {
             this._finish(job, buffer);
             for (const listener of [...this._listeners]) listener(job.index);
         } catch (error) {
-            if (job.controller.signal.aborted || this._disposed) {
+            if (job.controller.signal.aborted || this._disposed || this._life.signal.aborted) {
                 this._finish(job, null);
+                return;
+            }
+            if (error instanceof SourceError) {
+                // Reported once; the other segments would fail the same way: nothing more is fetched.
+                const first = !this._broken;
+                this._broken ??= error;
+                this._finish(job, null);
+                if (!first) return;
+                console.warn('[AudioPlayer]', error.message);
+                for (const other of [...this._jobs.values()]) {
+                    other.controller.abort();
+                    this._finish(other, null);
+                }
+                for (const listener of [...this._errorListeners]) listener(job.index, error, 1);
                 return;
             }
             const count = (this._failures.get(job.index)?.count ?? 0) + 1;
@@ -291,6 +341,104 @@ export class SegmentStore {
             const err = error instanceof Error ? error : new Error(String(error));
             for (const listener of [...this._errorListeners]) listener(job.index, err, count);
         }
+    }
+
+    /**
+     * The bytes [start, end) of the source: a Range request, checked; or, when
+     * the server answers with the whole file, a slice of that (kept, see
+     * WHOLE_SOURCE_MAX_BYTES). `fetched`: the bytes this call downloaded.
+     */
+    private async _fetchRun(start: number, end: number, signal: AbortSignal): Promise<{ bytes: ArrayBuffer; fetched: number }> {
+        const kept = this._whole;
+        if (kept) return { bytes: (await kept).slice(start, end), fetched: 0 };
+        const url = this._sourceUrl;
+        // A controller of its own: should this response be the whole file, it serves every
+        // segment, and only the store's end stops it (not this segment's cancellation).
+        const request = new AbortController();
+        const cancel = () => request.abort();
+        signal.addEventListener('abort', cancel);
+        try {
+            const response = await fetch(url, this._files.init(url, { range: `bytes=${start}-${end - 1}`, signal: request.signal }));
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const whole = start === 0 && end === this._manifest.segments.source.bytes;
+            if (response.status === 206 || whole) {
+                if (response.status === 206) this._checkContentRange(response.headers.get('content-range'), start, end);
+                const bytes = await response.arrayBuffer();
+                if (bytes.byteLength !== end - start) throw new Error(`${bytes.byteLength} bytes for a range of ${end - start}`);
+                return { bytes, fetched: bytes.byteLength };
+            }
+            // 200: the server ignored the Range header and sends all of the file. Another
+            // segment's answer may be bringing it already.
+            if (this._whole) {
+                void response.body?.cancel().catch(() => {});
+                return { bytes: (await this._whole).slice(start, end), fetched: 0 };
+            }
+            signal.removeEventListener('abort', cancel);
+            this._life.signal.addEventListener('abort', cancel);
+            const reading = this._readWhole(response);
+            this._whole = reading;
+            // A failed download is tried again by the next segment (a SourceError breaks the store instead).
+            reading.catch(() => {
+                if (this._whole === reading) this._whole = null;
+            });
+            const all = await reading;
+            return { bytes: all.slice(start, end), fetched: all.byteLength };
+        } finally {
+            signal.removeEventListener('abort', cancel);
+            this._life.signal.removeEventListener('abort', cancel);
+        }
+    }
+
+    /**
+     * A 206's Content-Range must start at the byte asked for, and give the size the
+     * manifest has (another size: the file was replaced). Unreadable cross-origin
+     * without Access-Control-Expose-Headers (null): not checked then.
+     */
+    private _checkContentRange(header: string | null, start: number, end: number): void {
+        const m = header === null ? null : /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(header.trim());
+        if (!m) return;
+        const bytes = this._manifest.segments.source.bytes;
+        if (Number(m[1]) !== start) throw new SourceError(`${this._sourceUrl} answered bytes ${m[1]}-${m[2]} to a request for ${start}-${end - 1}`);
+        if (m[3] !== '*' && Number(m[3]) !== bytes) throw new SourceError(`${this._sourceUrl} is ${m[3]} bytes, its manifest says ${bytes}: the file changed`);
+    }
+
+    /** The whole source from a 200 to a Range request, up to WHOLE_SOURCE_MAX_BYTES; a bigger one is refused, its download cancelled. */
+    private async _readWhole(response: Response): Promise<ArrayBuffer> {
+        const refuse = () => new SourceError(`The server ignores HTTP Range requests: ${this._sourceUrl} (a prepared clip over ${WHOLE_SOURCE_MAX_BYTES / 2 ** 20} MB needs them)`);
+        const header = response.headers.get('content-length');
+        const declared = header === null ? NaN : Number(header);
+        if (declared > WHOLE_SOURCE_MAX_BYTES) {
+            void response.body?.cancel().catch(() => {});
+            throw refuse();
+        }
+        const reader = response.body?.getReader();
+        let all: ArrayBuffer;
+        if (!reader) {
+            all = await response.arrayBuffer();
+        } else {
+            // Into one buffer of the declared size when there is one (a compressed response may grow it).
+            let out = new Uint8Array(declared > 0 ? declared : 1 << 20);
+            let total = 0;
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (total + value.byteLength > WHOLE_SOURCE_MAX_BYTES) {
+                    void reader.cancel().catch(() => {});
+                    throw refuse();
+                }
+                if (total + value.byteLength > out.length) {
+                    const grown = new Uint8Array(Math.min(WHOLE_SOURCE_MAX_BYTES, Math.max(2 * out.length, total + value.byteLength)));
+                    grown.set(out.subarray(0, total));
+                    out = grown;
+                }
+                out.set(value, total);
+                total += value.byteLength;
+            }
+            all = total === out.length ? out.buffer : out.slice(0, total).buffer;
+        }
+        const bytes = this._manifest.segments.source.bytes;
+        if (all.byteLength !== bytes) throw new SourceError(`${this._sourceUrl} is ${all.byteLength} bytes, its manifest says ${bytes}: the file changed`);
+        return all;
     }
 
     /** The segment's frames at the timeline's rate (the engine converts to the context's). */

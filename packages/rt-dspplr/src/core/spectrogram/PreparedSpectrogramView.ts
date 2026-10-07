@@ -5,6 +5,7 @@ import type { SpectralPyramid } from './protocol';
 import { sampleSpectralPyramid } from './sample';
 import { paintSpectrogram, spectrogramBackground, type SpectrogramPalette } from './paint';
 import { resolvePalette, themePalette } from './themePalette';
+import { watchPixelRatio } from '../timeline/pixelRatio';
 import { chooseFft, type SpectrogramOptions, type SpectrogramView } from './SpectrogramView';
 import { applyDspToSpectrogram } from './dspPaint';
 import { previewSettings } from '../effects/preview';
@@ -211,6 +212,7 @@ export function createPreparedSpectrogram(
     }) ?? null;
     const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => resize()) : null;
     observer?.observe(canvas);
+    const unwatchRatio = watchPixelRatio(canvas, resize);
     resize();
     onState();
     schedulePaint();
@@ -238,6 +240,7 @@ export function createPreparedSpectrogram(
             unsubscribe();
             off?.();
             observer?.disconnect();
+            unwatchRatio();
             if (frame) canvas.ownerDocument.defaultView?.cancelAnimationFrame(frame);
             offPreview();
             analyzer.dispose();

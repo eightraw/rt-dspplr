@@ -57,8 +57,6 @@ export class PeakAnalyzer {
     private _binMax: Float64Array;
     private _binSq: Float64Array;
     private _frames = 0;
-    /** Frames in the last finest peak when it is partial (0 = full). */
-    private _partialLast = 0;
 
     // loudness
     private _peak: Float64Array;
@@ -146,20 +144,13 @@ export class PeakAnalyzer {
 
     /** Close the last partial peak and build every level. */
     finish(): { levels: PeakLevelData[]; loudness: ManifestLoudness } {
-        if (this._framesInBin > 0) {
-            // A partial last peak: RMS over the frames it has.
-            const frames = this._framesInBin;
-            this._closeBin();
-            this._partialLast = frames;
-        }
+        // A partial last peak: RMS over the frames it has (levelsFromFinest() counts them).
+        if (this._framesInBin > 0) this._closeBin();
         if (this._blockN > 0 && this._blockN >= this._blockFrames / 4) this._closeBlock();
-        const frames = new Float64Array(this._count).fill(this._fpp);
-        if (this._partialLast) frames[this._count - 1] = this._partialLast;
         const levels = levelsFromFinest(this._channels, this._fpp, this._frames, {
             min: this._min.map((x) => x.subarray(0, this._count)),
             max: this._max.map((x) => x.subarray(0, this._count)),
             sumSq: this._sumSq.map((x) => x.subarray(0, this._count)),
-            frames,
         });
         return { levels, loudness: this._loudness() };
     }
@@ -169,13 +160,19 @@ export class PeakAnalyzer {
     }
 }
 
-/** Finest-level data of one or more consecutive ranges, concatenated (per channel). */
+/**
+ * Finest-level data of one or more consecutive ranges, concatenated (per channel). A peak holds
+ * fpp frames, the last one what is left of the total: binFrames() says, nothing is stored for it.
+ */
 export interface FinestPeaks {
     min: Int16Array[];
     max: Int16Array[];
     sumSq: Float64Array[];
-    /** Frames in each finest peak (fpp, or fewer for the last one). */
-    frames: Float64Array;
+}
+
+/** Frames in peak i of a level of `framesPerPeak` over `totalFrames` (the last one holds what is left). */
+export function binFrames(i: number, framesPerPeak: number, totalFrames: number): number {
+    return Math.min(framesPerPeak, totalFrames - i * framesPerPeak);
 }
 
 /** Every level of the ladder from the finest one (coarser levels pool the finer ones exactly). */
@@ -191,19 +188,17 @@ export function levelsFromFinest(channelCount: number, fpp: number, totalFrames:
                 min: finest.min.map((a) => a.subarray(0, peaks)),
                 max: finest.max.map((a) => a.subarray(0, peaks)),
                 sumSq: finest.sumSq.map((a) => a.subarray(0, peaks)),
-                frames: finest.frames.subarray(0, peaks),
             };
         } else {
             const ratio = framesPerPeak / levels[levels.length - 1].framesPerPeak;
             const p: FinestPeaks = prev;
-            const frames = new Float64Array(peaks);
+            const count = p.sumSq[0].length;
             const min = p.min.map(() => new Int16Array(peaks));
             const max = p.max.map(() => new Int16Array(peaks));
             const sumSq = p.sumSq.map(() => new Float64Array(peaks));
             for (let i = 0; i < peaks; i += 1) {
                 const from = i * ratio;
-                const to = Math.min(p.frames.length, from + ratio);
-                for (let j = from; j < to; j += 1) frames[i] += p.frames[j];
+                const to = Math.min(count, from + ratio);
                 for (let c = 0; c < channelCount; c += 1) {
                     let lo = 32767;
                     let hi = -32768;
@@ -218,11 +213,11 @@ export function levelsFromFinest(channelCount: number, fpp: number, totalFrames:
                     sumSq[c][i] = sq;
                 }
             }
-            cur = { min, max, sumSq, frames };
+            cur = { min, max, sumSq };
         }
         for (let c = 0; c < channelCount; c += 1) {
             const rms = new Int16Array(peaks);
-            for (let i = 0; i < peaks; i += 1) rms[i] = quantize(Math.sqrt(cur.sumSq[c][i] / Math.max(1, cur.frames[i])));
+            for (let i = 0; i < peaks; i += 1) rms[i] = quantize(Math.sqrt(cur.sumSq[c][i] / Math.max(1, binFrames(i, framesPerPeak, totalFrames))));
             channels.push({ min: cur.min[c], max: cur.max[c], rms });
         }
         levels.push({ framesPerPeak, peaks, channels });

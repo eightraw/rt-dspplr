@@ -12,7 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Ajv2020 from 'ajv/dist/2020';
 import schema from '../schema/manifest.schema.json';
-import { assertManifest, isStemKey, MANIFEST_FORMAT_VERSION } from '../src/core/stream/manifest';
+import { assertManifest, isStemKey, manifestProblem, MANIFEST_FORMAT_VERSION, MAX_SEGMENT_SECONDS } from '../src/core/stream/manifest';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // The bundle runs from node_modules/.cache/rtd-test; find the package root from there or from test/.
@@ -136,6 +136,16 @@ const broken: Array<[string, (m: any) => void]> = [
     ['alignment offsetFrames 1.5', (m) => { m.stems.b.alignment = { ...m.stems.b.alignment, offsetFrames: 1.5 }; }],
     ['loudness perChannel item a number', (m) => { m.loudness.perChannel = [3]; }],
     ['stem error a number', (m) => { m.stems.b.error = 503; }],
+    // The limits the player allocates under (MIN_SAMPLE_RATE, MAX_SAMPLE_RATE, MAX_CHANNELS).
+    ['sampleRate 7999', (m) => { m.sampleRate = 7999; }],
+    ['sampleRate 384001', (m) => { m.sampleRate = 384001; }],
+    ['sourceSampleRate 400000', (m) => { m.sourceSampleRate = 400000; }],
+    ['channels 0', (m) => { m.channels = 0; }],
+    ['channels 33', (m) => { m.channels = 33; }],
+    ['source sampleRate 7999', (m) => { m.segments.source.sampleRate = 7999; }],
+    ['source channels 33', (m) => { m.segments.source.channels = 33; }],
+    ['stem source sampleRate 1000000', (m) => { m.stems.b.segments.source.sampleRate = 1000000; }],
+    ['an opus source at 44100 Hz', (m) => { Object.assign(m.segments.source, { codec: 'opus', header: 'T3B1c0hlYWQ=', sampleRate: 44100 }); }],
 ];
 for (const [name, mutate] of broken) {
     const m = clone();
@@ -184,6 +194,43 @@ results.push(`${broken.length} broken manifests: refused by the schema and by as
         assert.equal(assertOk(m), false, `assertManifest accepted: ${name}`);
     }
     results.push(`${tiling.length} manifests off the grid (gaps, overlaps, empty or short lists, stems off A's grid, ranges past the source or empty, lead + trail too long): refused by assertManifest (documented: not expressible in the schema)`);
+}
+
+// Rules across fields: segments of at most MAX_SEGMENT_SECONDS at the timeline's rate, and sources
+// that decode to the timeline (A) or to A's rate with A's channels or one (a stem). assertManifest
+// only (JSON Schema cannot compare fields): the schema accepts these.
+{
+    const rate = base.sampleRate;
+    const over = MAX_SEGMENT_SECONDS * rate + 1;
+    const oneSegment = (frames: number) => (m: any) => {
+        delete m.stems;
+        m.frames = frames;
+        m.duration = frames / rate;
+        m.segments.list = [{ ...m.segments.list[0], frames, tail: frames }];
+    };
+    const crossField: Array<[string, (m: any) => void, RegExp]> = [
+        ['one segment of 2^27 frames (a 1 GB allocation)', oneSegment(2 ** 27), /over 60 s/],
+        [`one segment of ${MAX_SEGMENT_SECONDS} s + 1 frame`, oneSegment(over), /over 60 s/],
+        [`framesPerSegment of ${MAX_SEGMENT_SECONDS} s + 1 frame`, (m) => { m.segments.framesPerSegment = over; }, /framesPerSegment is over 60 s/],
+        ['a stem segment over 60 s', (m) => { m.stems.b.status = 'failed'; m.stems.b.segments.list[0].frames = over; }, /stems\.b\.segments\.list\[0\] is over 60 s/],
+        ['A source at another rate', (m) => { m.segments.source.sampleRate = 44100; }, /the timeline is 48000/],
+        ['A source with other channels', (m) => { m.segments.source.channels = 2; }, /the timeline is/],
+        ['a stem source at another rate', (m) => { m.stems.b.segments.source.sampleRate = 44100; }, /A's rate/],
+        ['a stereo stem under a mono A', (m) => { m.stems.b.segments.source.channels = 2; }, /A's channels/],
+    ];
+    for (const [name, mutate, reason] of crossField) {
+        const m = clone();
+        mutate(m);
+        assert.ok(schemaOk(m), `the schema should accept (not expressible): ${name} (${JSON.stringify(validate.errors)})`);
+        assert.match(manifestProblem(m) ?? 'accepted', reason, `assertManifest: ${name}`);
+    }
+    results.push(`${crossField.length} manifests with segments over ${MAX_SEGMENT_SECONDS} s or sources off the timeline's rate and channels: refused by assertManifest (documented: not expressible in the schema)`);
+    // A mono stem under a stereo A plays on both channels.
+    const m = clone();
+    m.channels = 2;
+    Object.assign(m.segments.source, { channels: 2, pcm: { ...m.segments.source.pcm, blockAlign: 4 } });
+    assert.ok(schemaOk(m) && assertOk(m), `a mono stem under a stereo A must be accepted: ${manifestProblem(m)}`);
+    results.push('a mono stem under a stereo A: accepted by both');
 }
 
 // Forward compatibility: unknown optional fields are ignored by both.

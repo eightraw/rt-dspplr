@@ -28,9 +28,9 @@
     "id": { "type": "string", "description": "sha256:<hex> of the source file's bytes" },
     "createdAt": { "type": "string" },
     "duration": { "type": "number", "minimum": 0, "description": "seconds: frames / sampleRate" },
-    "sampleRate": { "$ref": "#/$defs/positiveInteger", "description": "Hz, of segments, peaks and analyses" },
-    "sourceSampleRate": { "$ref": "#/$defs/positiveInteger" },
-    "channels": { "$ref": "#/$defs/positiveInteger" },
+    "sampleRate": { "$ref": "#/$defs/sampleRate", "description": "Hz, of segments, peaks and analyses" },
+    "sourceSampleRate": { "$ref": "#/$defs/sampleRate" },
+    "channels": { "$ref": "#/$defs/channels" },
     "frames": { "$ref": "#/$defs/count" },
     "source": {
       "type": "object",
@@ -58,6 +58,8 @@
   "$defs": {
     "count": { "type": "integer", "minimum": 0 },
     "positiveInteger": { "type": "integer", "minimum": 1 },
+    "sampleRate": { "type": "integer", "minimum": 8000, "maximum": 384000, "description": "Hz (MIN_SAMPLE_RATE to MAX_SAMPLE_RATE)" },
+    "channels": { "type": "integer", "minimum": 1, "maximum": 32, "description": "1 to MAX_CHANNELS" },
     "stemKey": {
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
@@ -72,8 +74,8 @@
         "url": { "type": "string", "description": "relative to the manifest's URL (or absolute); fetched with HTTP Range requests" },
         "bytes": { "$ref": "#/$defs/count" },
         "codec": { "enum": ["wav", "mp3", "flac", "opus"] },
-        "sampleRate": { "$ref": "#/$defs/positiveInteger" },
-        "channels": { "$ref": "#/$defs/positiveInteger" },
+        "sampleRate": { "$ref": "#/$defs/sampleRate", "description": "for A the timeline's; for a stem A's (checked by assertManifest)" },
+        "channels": { "$ref": "#/$defs/channels", "description": "for A the timeline's; for a stem A's or 1 (checked by assertManifest)" },
         "pcm": {
           "type": "object",
           "description": "wav: the layout of its samples",
@@ -88,7 +90,8 @@
       },
       "allOf": [
         { "if": { "properties": { "codec": { "const": "wav" } } }, "then": { "required": ["pcm"] } },
-        { "if": { "properties": { "codec": { "enum": ["flac", "opus"] } } }, "then": { "required": ["header"] } }
+        { "if": { "properties": { "codec": { "enum": ["flac", "opus"] } } }, "then": { "required": ["header"] } },
+        { "if": { "properties": { "codec": { "const": "opus" } } }, "then": { "properties": { "sampleRate": { "const": 48000 } } } }
       ]
     },
     "segment": {
@@ -98,7 +101,7 @@
       "properties": {
         "index": { "$ref": "#/$defs/count" },
         "startFrame": { "$ref": "#/$defs/count" },
-        "frames": { "$ref": "#/$defs/count" },
+        "frames": { "$ref": "#/$defs/count", "description": "at most MAX_SEGMENT_SECONDS (60) × sampleRate (checked by assertManifest)" },
         "range": {
           "oneOf": [
             { "type": "null" },
@@ -115,7 +118,7 @@
       "type": "object",
       "required": ["framesPerSegment", "source", "list"],
       "properties": {
-        "framesPerSegment": { "$ref": "#/$defs/positiveInteger" },
+        "framesPerSegment": { "$ref": "#/$defs/positiveInteger", "description": "at most MAX_SEGMENT_SECONDS (60) × sampleRate (checked by assertManifest)" },
         "source": { "$ref": "#/$defs/source" },
         "list": { "type": "array", "items": { "$ref": "#/$defs/segment" } }
       }

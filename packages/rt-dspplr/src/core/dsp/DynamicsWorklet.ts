@@ -18,6 +18,7 @@ function scheduleParam(
     param.linearRampToValueAtTime(value, now + PARAM_RAMP_SECONDS);
 }
 
+/** The dynamics processor. `disconnect()` also ends its processor: it is the teardown. */
 export interface DynamicsWorkletNode extends DSPNodeDescriptor {
     readonly name: 'dynamics';
     readonly node: AudioWorkletNode;
@@ -76,6 +77,9 @@ export function createDynamicsWorklet(
 
         disconnect(): void {
             try { node.disconnect(); } catch { /* noop */ }
+            // A processor runs (and is pulled) for as long as it says so; this one
+            // stops at 'dispose'. The node cannot be used again.
+            try { node.port.postMessage('dispose'); } catch { /* closed context */ }
         },
     };
 }
