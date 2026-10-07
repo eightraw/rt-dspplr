@@ -13,14 +13,14 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
   `<Timeline>` and `createTimeline()`. Switching between a whole clip and a
   prepared one on one player stops and unloads the other source.
 - The audio of a prepared recording is the original file itself, kept by prepare
-  byte for byte (WAV, MP3, Ogg Opus; other formats as a 16-bit WAV). The manifest
+  byte for byte (WAV, MP3, Ogg Opus, FLAC; other formats as a 16-bit WAV). The manifest
   holds an index of it: for each segment, the byte range that holds it. The
   player fetches a segment with an HTTP Range request and decodes it: WAV on the
   spot, MP3, Opus and FLAC with WebAssembly builds of dr_mp3, libopus and dr_flac,
   one lazy chunk per codec (30, 113 and 21 KB gzipped) fetched the first time a
   clip of that codec plays, decoding in a worker (on the main thread when a
   Content-Security-Policy forbids blob: workers). Segments read back the samples
-  prepare analysed: WAV and MP3 exactly, Opus within float rounding. An hour of
+  prepare analysed: WAV, MP3 and FLAC exactly, Opus within float rounding. An hour of
   MP3 is stored as the MP3 (our hour-long test file: 102 MB instead of 651 MB of WAV
   segments), and on a 4G connection the first sound comes in 1.1–2.2 s and a seek
   in 0.3–0.9 s (WAV segments: 2–6 s).
@@ -231,7 +231,9 @@ First release: the prepare step for long recordings. Node ≥ 20.19, ESM.
   middle and the last are read back the player's way (the same decoders) and
   compared with what was analysed. MP3 runs start 6 frames early (exact), Opus
   runs 500 ms early on a page boundary (within float rounding; RFC 7845's 80 ms
-  left errors up to −35 dBFS). A source that is not indexed (FLAC, formats read
+  left errors up to −35 dBFS), FLAC runs at the frame of their first sample
+  (exact; fixed and variable block sizes, 16 and 24 bits, ID3 tags around the
+  stream). A source that is not indexed (formats read
   through `ffmpegDecoder()` or another decoder, Opus with more than two channels,
   a file whose index does not read back, a file with non-finite samples) is kept
   as a 16-bit WAV of what was decoded, with a warning when the index failed.
@@ -248,7 +250,7 @@ First release: the prepare step for long recordings. Node ≥ 20.19, ESM.
   part such as a vocal's breaths correlates weakly however well it is aligned,
   while unrelated or re-timed audio peaks at a different lag in every window. A
   stem silent for part of the file is measured where it sounds. A stem the player
-  reads as it is (WAV, MP3 or Opus at A's rate, with A's channels or one) is kept
+  reads as it is (WAV, MP3, Opus or FLAC at A's rate, with A's channels or one) is kept
   byte for byte under `<key>/r<revision>/` with its index shifted by the offset
   (`lead`, `trail` silence where it does not reach); any other is downmixed,
   resampled on the pool (bit-identical to the streaming resampler) and written as

@@ -123,7 +123,7 @@ each segment says which bytes of it hold its frames.
 | `codec` | `"wav"` \| `"mp3"` \| `"opus"` \| `"flac"` | yes | How a run of it decodes, see [Sources](#sources). |
 | `sampleRate`, `channels` | integers, 8000–384000 Hz and 1–32 | yes | What it decodes to. For A: the timeline's. For a stem: A's rate, and A's channels or 1 (played on all of them). An `opus` source is 48000 Hz. The player refuses a run that decodes to anything else. |
 | `pcm` | object | wav | `{ encoding: "int" \| "float", bitsPerSample, blockAlign }` of its samples. |
-| `header` | string, base64 | flac, opus | Put before a run to decode it: FLAC's `fLaC` and STREAMINFO, Opus's OpusHead packet. |
+| `header` | string, base64 | flac, opus | Put before a run to decode it: FLAC's `fLaC` and STREAMINFO (marked as the last metadata block, its total samples and MD5 0, unknown: a run is not the whole stream), Opus's OpusHead packet. |
 
 A segment:
 
@@ -272,4 +272,4 @@ same code, so what it indexes is what plays.
 | `wav` | RIFF/WAVE, PCM integer 8–32 bits or float 32/64 (`pcm`), any chunks around `data` | Whole frames of `data`: `(end − start) / blockAlign` frames, `tail` = the segment's frames. | none |
 | `mp3` | MPEG-1/2 Layer III; an ID3v2 tag and a Xing/Info frame may come first | Whole frames from the middle of the stream, decoded raw: no tag, no gapless trimming (the decoder's delay is in `tail`). | from where the bit reservoir (511 bytes of main data, 255 for MPEG-2/2.5) is full two frames before the segment's first (their overlap and filterbank state), and at least 6 frames before it: the samples are the continuous decode's, exactly |
 | `opus` | Ogg Opus, one logical stream, channel mapping family 0 (mono or stereo) | Whole Ogg pages. A packet continued from before the run is dropped, as is one that runs past it; each packet is decoded in order by a fresh decoder (48 kHz, the header's output gain applied). | from the first packet that begins on a page at least 500 ms before the segment: within float rounding of the continuous decode (80 ms left errors up to −35 dBFS) |
-| `flac` | native FLAC | `header` (`fLaC`, STREAMINFO) then whole frames. | none (frames are independent); prepare 0.1 keeps FLAC as a WAV |
+| `flac` | native FLAC (an ID3v2 tag may come first, an ID3v1 tag last) | `header` (`fLaC`, STREAMINFO) then whole frames. | none: a run starts at the frame of its first sample (frames are independent); the samples are the continuous decode's, exactly |

@@ -18,6 +18,14 @@ export async function loadPrepare() {
     return import(pathToFileURL(PREPARE).href);
 }
 
+/** The test signal's 16-bit sample `i` of channel `c`: always audible (no long silences), so "audio is playing" is unambiguous. */
+function sample16(i, c, rate) {
+    const t = i / rate;
+    const env = 0.35 + 0.25 * Math.sin(2 * Math.PI * 0.7 * t);
+    const v = env * Math.sin(2 * Math.PI * (180 + 60 * Math.sin(0.5 * t) + c * 7) * t) + 0.002 * Math.sin(i * 12.9898 + c);
+    return Math.max(-32768, Math.min(32767, Math.round(v * 32768)));
+}
+
 function wav16(file, seconds, rate, channels) {
     const frames = Math.round(seconds * rate);
     const buf = Buffer.alloc(44 + frames * channels * 2);
@@ -27,16 +35,56 @@ function wav16(file, seconds, rate, channels) {
     buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(frames * channels * 2, 40);
     let p = 44;
     for (let i = 0; i < frames; i += 1) {
-        const t = i / rate;
-        // Always audible (no long silences), so "audio is playing" is unambiguous.
-        const env = 0.35 + 0.25 * Math.sin(2 * Math.PI * 0.7 * t);
         for (let c = 0; c < channels; c += 1) {
-            const v = env * Math.sin(2 * Math.PI * (180 + 60 * Math.sin(0.5 * t) + c * 7) * t) + 0.002 * Math.sin(i * 12.9898 + c);
-            buf.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(v * 32768))), p);
+            buf.writeInt16LE(sample16(i, c, rate), p);
             p += 2;
         }
     }
     fs.writeFileSync(file, buf);
+}
+
+/**
+ * The same signal as a FLAC, from a tiny encoder of our own (no ffmpeg needed): verbatim
+ * subframes, and block sizes that vary frame to frame, so frames carry sample numbers.
+ */
+function flac16(file, seconds, rate, channels, sizes = [4096, 1152, 576, 4608, 192]) {
+    const frames = Math.round(seconds * rate);
+    const out = [];
+    const put = (...bytes) => { for (const x of bytes) out.push(x & 255); };
+    const crc8 = (b) => { let c = 0; for (const x of b) { c ^= x; for (let k = 0; k < 8; k += 1) c = c & 0x80 ? ((c << 1) ^ 0x07) & 255 : (c << 1) & 255; } return c; };
+    const crc16 = (b) => { let c = 0; for (const x of b) { c ^= x << 8; for (let k = 0; k < 8; k += 1) c = c & 0x8000 ? ((c << 1) ^ 0x8005) & 0xffff : (c << 1) & 0xffff; } return c; };
+    // A frame's coded number, UTF-8 style.
+    const utf8 = (v) => {
+        if (v < 0x80) return [v];
+        let n = 1;
+        while (v >= 2 ** (5 * n + 6)) n += 1;
+        const bytes = [];
+        for (let k = 0; k < n; k += 1) { bytes.unshift(0x80 | (v % 64)); v = Math.floor(v / 64); }
+        return [((0xff << (7 - n)) & 0xff) | v, ...bytes];
+    };
+    const min = Math.min(...sizes);
+    const max = Math.max(...sizes);
+    put(0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34);
+    put(min >> 8, min, max >> 8, max, 0, 0, 0, 0, 0, 0);
+    put(rate >> 12, rate >> 4, ((rate & 15) << 4) | ((channels - 1) << 1), (15 << 4) | Math.floor(frames / 2 ** 32), frames >>> 24, frames >>> 16, frames >>> 8, frames);
+    for (let i = 0; i < 16; i += 1) put(0);
+    for (let f = 0, start = 0; start < frames; f += 1) {
+        const n = Math.min(sizes[f % sizes.length], frames - start);
+        const frame = [0xff, 0xf9, 0x70, (channels - 1) << 4, ...utf8(start), (n - 1) >> 8, (n - 1) & 255];
+        frame.push(crc8(frame));
+        for (let c = 0; c < channels; c += 1) {
+            frame.push(0x02); // verbatim
+            for (let i = 0; i < n; i += 1) {
+                const v = sample16(start + i, c, rate);
+                frame.push((v >> 8) & 255, v & 255);
+            }
+        }
+        const crc = crc16(frame);
+        frame.push(crc >> 8, crc & 255);
+        put(...frame);
+        start += n;
+    }
+    fs.writeFileSync(file, Uint8Array.from(out));
 }
 
 /** Steady band-limited noise (stable RMS, unambiguous cross-correlation), mono 16-bit. */
@@ -126,14 +174,16 @@ export default async function setup() {
 }
 
 /**
- * MP3 and Opus clips (prepare's 2 s fixtures), kept as they are with 0.5 s segments, and the
- * decoder's samples beside them (`<name>.f32`: planar float32, channel after channel).
+ * MP3 and Opus clips (prepare's 2 s fixtures) and a 2 s FLAC (flac16()), kept as they are with
+ * 0.5 s segments, and the decoder's samples beside them (`<name>.f32`: planar float32, channel
+ * after channel).
  */
 async function lossy() {
     const { prepareAudio, builtinDecoder } = await loadPrepare();
     const fixtures = path.resolve(root, '..', 'rt-dspplr-prepare', 'test', 'fixtures');
-    for (const codec of ['mp3', 'opus']) {
-        const src = path.join(fixtures, `sine-speech.${codec}`);
+    for (const codec of ['mp3', 'opus', 'flac']) {
+        const src = codec === 'flac' ? path.join(FIXTURES, 'flacclip-src.flac') : path.join(fixtures, `sine-speech.${codec}`);
+        if (codec === 'flac') flac16(src, 2, 44100, 2);
         const out = path.join(FIXTURES, `${codec}clip`);
         fs.rmSync(out, { recursive: true, force: true });
         await prepareAudio(src, { outDir: out, segmentSeconds: 0.5 }).done;
