@@ -8,7 +8,7 @@
 
 import assert from 'node:assert/strict';
 import splitCode from '../src/vendor/rtdSplit';
-import { SPLIT_HOP, SPLIT_MARGIN, SplitSource, type SplitExports } from '../src/core/engine/splitSource';
+import { SPLIT_HOP, SPLIT_MARGIN, SplitSource, type SplitExports, type SplitMode } from '../src/core/engine/splitSource';
 
 const results: string[] = [];
 const SR = 44100;
@@ -70,7 +70,7 @@ const energy = (x: Float32Array[], from: number, to: number) => x.reduce((s, c) 
     const n = seconds * SR;
     const { tone, clicks, sum } = stem(seconds);
     const read = (frame: number, c: number) => (frame >= 0 && frame < n ? sum[c][frame] : 0);
-    const split = new SplitSource(await exports(), 2, read, () => true);
+    const split = new SplitSource(await exports(), 0, 2, read, () => true);
     const blocks = Array.from({ length: Math.ceil(n / 4096) }, (_, k) => k * 4096);
     const { tonal, atonal } = parts(split, n, blocks);
 
@@ -90,7 +90,7 @@ const energy = (x: Float32Array[], from: number, to: number) => x.reduce((s, c) 
     assert.ok(atonalErr < -3, `the atonal part is mostly the clicks (residual ${atonalErr.toFixed(1)} dB)`);
 
     // 4. After a jump (blocks out of order) the parts are the same.
-    const jumpy = new SplitSource(await exports(), 2, read, () => true);
+    const jumpy = new SplitSource(await exports(), 0, 2, read, () => true);
     const order = [...blocks].reverse();
     const again = parts(jumpy, n, order);
     let jumpWorst = 0;
@@ -105,7 +105,7 @@ const energy = (x: Float32Array[], from: number, to: number) => x.reduce((s, c) 
     const { sum } = stem(4);
     const read = (frame: number, c: number) => (frame >= 0 && frame < n ? sum[c][frame] : 0);
     let present = true;
-    const split = new SplitSource(await exports(), 2, read, () => present);
+    const split = new SplitSource(await exports(), 0, 2, read, () => present);
     const at = 2 * SR;
     let rounds = 0;
     for (;;) {
@@ -122,10 +122,72 @@ const energy = (x: Float32Array[], from: number, to: number) => x.reduce((s, c) 
     assert.equal(split.prepare(SPLIT_HOP * 4, (i) => SR / 2 + i, { left: 100 }), 'ready');
     // The last frame of a span counts too, however short of a quarter chunk it ends past a chunk start.
     const edge = 88 * SPLIT_HOP;
-    const fresh = new SplitSource(await exports(), 2, read, () => true);
+    const fresh = new SplitSource(await exports(), 0, 2, read, () => true);
     assert.equal(fresh.prepare(1000, (i) => edge - 900 + i, { left: 100 }), 'ready');
     assert.notEqual(fresh.tonal(edge + 100, 0), 0, 'the chunk holding the span\'s last frame is made');
-    results.push(`split budget: a cold region is made over ${rounds} blocks of 3; audio not in memory reports 'missing' and is split once it is there`);
+    // A span that jumps back (a loop wrap) between two chunk starts: the chunk its frames enter
+    // just before the jump and the one they leave just after it are made too.
+    const before = 50 * SPLIT_HOP + 100;
+    const after = 20 * SPLIT_HOP + 1000;
+    const wrap = (i: number) => (i < 1000 ? before + i : after + (i - 1000));
+    const wrapped = new SplitSource(await exports(), 0, 2, read, () => true);
+    assert.equal(wrapped.prepare(2000, wrap, { left: 1000 }), 'ready');
+    const unmade = Array.from({ length: 2001 }, (_, i) => wrap(i)).filter((f) => wrapped.tonal(f, 0) === 0);
+    assert.deepEqual(unmade, [], 'every frame of a span through a loop wrap is split');
+    results.push(`split budget: a cold region is made over ${rounds} blocks of 3; audio not in memory reports 'missing' and is split once it is there; a span's last frame and both sides of a loop wrap are made`);
+}
+
+{
+    // 5. In a loop the parts are those of the audio as it plays: split through the loop, they are
+    // exactly the parts of that audio written out and split as a clip. On a hop grid, so both
+    // are cut into the same chunks.
+    const n = 4 * SR;
+    const { sum } = stem(4);
+    const read = (frame: number, c: number) => (frame >= 0 && frame < n ? sum[c][frame] : 0);
+    const loop = { start: 30 * SPLIT_HOP, end: 90 * SPLIT_HOP };
+    const len = loop.end - loop.start;
+    const all = { left: Infinity };
+    // Played audio written out, split as a clip, against the clip split through the loop in `mode`,
+    // over frames [from, to) of the clip (at `offset` in the played audio).
+    const compare = async (played: Float32Array[], offset: number, from: number, to: number, mode: SplitMode) => {
+        const reference = new SplitSource(await exports(), 0, 2, (f, c) => (f >= 0 && f < played[0].length ? played[c][f] : 0), () => true);
+        assert.equal(reference.prepare(to - from - 1, (i) => offset + i, all), 'ready');
+        const looped = new SplitSource(await exports(), 0, 2, read, () => true);
+        looped.setLoop(loop);
+        assert.equal(looped.prepare(to - from - 1, (i) => from + i, all, () => mode), 'ready');
+        let worst = 0;
+        for (let f = from; f < to; f += 1) {
+            for (let c = 0; c < 2; c += 1) {
+                worst = Math.max(worst, Math.abs(looped.tonal(f, c, mode) - reference.tonal(offset + f - from, c)), Math.abs(looped.atonal(f, c, mode) - reference.atonal(offset + f - from, c)));
+            }
+        }
+        return worst;
+    };
+    // After a wrap: the loop over and over; its parts all round, against its middle copy.
+    const around = sum.map((x) => Float32Array.from({ length: 3 * len }, (_, j) => x[loop.start + (j % len)]));
+    assert.equal(await compare(around, len, loop.start, loop.end, 2), 0, 'after a wrap: the loop\'s parts are those of the loop over and over');
+    // Before the first wrap: what lies before the loop, then the loop over and over.
+    const firstPass = sum.map((x) => Float32Array.from({ length: loop.end + 2 * len }, (_, j) => (j < loop.end ? x[j] : x[loop.start + ((j - loop.end) % len)])));
+    assert.equal(await compare(firstPass, 0, 0, loop.end, 1), 0, 'on the way in: the parts of the audio up to the loop and round it');
+    // The loop's own cache holds only the chunks near its edges: inside it, the clip's parts.
+    // (Two splits on one instance, in contexts of their own, as the engine keeps its two stems.)
+    const shared = await exports();
+    const plain = new SplitSource(shared, 0, 2, read, () => true);
+    const looped = new SplitSource(shared, 3, 2, read, () => true);
+    looped.setLoop(loop);
+    const middle = loop.start + len / 2;
+    plain.prepare(SPLIT_HOP, (i) => middle + i, all);
+    looped.prepare(SPLIT_HOP, (i) => middle + i, all, () => 2);
+    let same = true;
+    for (let f = middle; f < middle + SPLIT_HOP; f += 1) same &&= looped.tonal(f, 0, 2) === plain.tonal(f, 0) && looped.atonal(f, 1, 2) === plain.atonal(f, 1);
+    assert.ok(same, 'inside the loop, away from its edges, the clip\'s own parts');
+    // Near the end the loop's parts differ from the clip's (its start follows, not what lies there).
+    plain.prepare(SPLIT_HOP, (i) => loop.end - SPLIT_HOP + i, all);
+    looped.prepare(SPLIT_HOP, (i) => loop.end - SPLIT_HOP + i, all, () => 2);
+    let differ = 0;
+    for (let f = loop.end - SPLIT_HOP; f < loop.end; f += 1) differ = Math.max(differ, Math.abs(looped.tonal(f, 0, 2) - plain.tonal(f, 0)));
+    assert.ok(differ > 1e-3, `near the loop's end the parts are the loop's (off the clip's by ${differ.toExponential(1)})`);
+    results.push(`split through a loop: exactly the parts of the audio as it plays (the loop all round after a wrap; up to the loop and round it on the way in); away from its edges the clip's own parts, near its end not (by up to ${differ.toFixed(3)})`);
 }
 
 console.log(results.map((line) => `  ok  ${line}`).join('\n'));

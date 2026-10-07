@@ -224,6 +224,27 @@ test('whole clips stretch in realtime by default: the speed changes at once, the
     expect(requests.some(url => /rubberband/i.test(url))).toBe(false);
 });
 
+test('clip after clip keeps the realtime stretch: each engine takes the instances of the one before', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const p = h.make({ stretcher: undefined, processing: { speed: 1.5 } });
+        const ready = [];
+        for (let k = 0; k < 25; k += 1) {
+            const t = performance.now();
+            await p.play(h.buffer(1, 300 + k * 10));
+            while (!p.getState().capabilities.canPreservePitch && performance.now() - t < 5000) await h.sleep(5);
+            ready.push(p.getState().capabilities.canPreservePitch ? performance.now() - t : null);
+        }
+        await h.sleep(300);
+        const out = { ready, rms: h.rms(p), playing: p.getState().isPlaying };
+        p.dispose();
+        return out;
+    });
+    console.log(`25 clips at 1.5x: stretch ready after ${r.ready.map((ms) => (ms === null ? 'never' : Math.round(ms))).join(', ')} ms`);
+    expect(r.ready.every((ms) => ms !== null)).toBe(true);
+    expect(r.playing).toBe(true);
+    expect(r.rms).toBeGreaterThan(0.02);
+});
+
 test('strategy options the worker cannot receive fail the job, not the player', async ({ page }) => {
     const result = await page.evaluate(async () => {
         const strategy = { ...h.delayedStrategy(50), options: { notCloneable: () => 1 } };

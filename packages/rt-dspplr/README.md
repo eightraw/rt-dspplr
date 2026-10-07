@@ -623,11 +623,16 @@ smoothly, a short overlap-add the atonal one, so an attack is played once and
 stays sharp instead of being smeared or doubled. In blind listening on guitar at
 0.75x it could not be told from Rubber Band's offline render. The split looks a
 few hundred milliseconds ahead in the clip's audio, which costs no latency;
-after a jump it is ready within a few milliseconds. In Chrome on a desktop
+after a jump it is ready within a few milliseconds. In a loop it looks at the
+audio as it plays: past the loop's end comes its start, and once playback has
+wrapped, its end comes before its start, so nothing from outside the loop (the
+next bar's downbeat, say) reaches the seam. In Chrome on a desktop
 (i5-12400F) the whole engine takes 4–6 % of one core while it stretches one
 stem and 6–8 % with stem B mixed in, under 1 % at 1x, where the stretch is
-off. A whole clip is handed to the engine in
-5-second pieces around the playhead, so the engine holds about 20 s of it.
+off. The split's WebAssembly takes about 4 MB of memory per player (11 MB
+with a loop), and the instances of a player's engine go to the next one when
+it loads another clip. A whole clip is handed to the engine in 5-second pieces
+around the playhead, so the engine holds about 20 s of it.
 
 | `stretcher` | Import | What it does |
 |---|---|---|
@@ -711,7 +716,7 @@ dynamics AudioWorklet (~2 KB), the waveform peaks worker (~8 KB), the
 spectrogram worker (~7 KB), the overview preview worker of prepared clips
 (~6 KB) and the stream engine AudioWorklet (~10 KB). The realtime stretcher
 (Signalsmith Stretch, MIT, ~100 KB of WASM; its notice is in the chunk and in
-THIRD_PARTY_NOTICES.md) and its tonal/atonal split (our own, ~18 KB of WASM) are
+THIRD_PARTY_NOTICES.md) and its tonal/atonal split (our own, ~20 KB of WASM) are
 separate chunks, loaded by a dynamic `import()` when the first clip loads. Each is started from
 a `blob:` URL the first time it is needed. No extra files, loaders, or `new URL()` patterns are involved. The
 same build is verified in Vite (dev and build) and webpack 5. Nothing in it is

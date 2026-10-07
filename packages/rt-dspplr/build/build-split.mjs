@@ -15,6 +15,8 @@ const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'rtd-split-')), 'spl
 execFileSync(zig, [
     'cc', '-target', 'wasm32-wasi', '-mexec-model=reactor',
     '-O3', '-msimd128', '-ffp-contract=off', '-s',
+    // zig gives a module a 16 MiB stack; the split's locals need a few KB (its buffers are static).
+    '-Wl,-z,stack-size=65536',
     path.join(root, 'wasm/split.c'),
     '-o', out,
 ], { stdio: 'inherit' });
