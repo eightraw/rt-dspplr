@@ -159,10 +159,10 @@ player side.
 
 - [API, React examples, themes, browser support and memory](packages/rt-dspplr/README.md)
 - [Preparing long recordings](packages/rt-dspplr-prepare/README.md) and [the manifest format](docs/manifest.md)
-- [Time-stretch strategies](packages/rt-dspplr/README.md#time-stretch-strategies)
+- [Speed and time stretch](packages/rt-dspplr/README.md#speed-and-time-stretch)
 - [Workers, bundlers and CSP](packages/rt-dspplr/README.md#bundlers-workers-csp)
 
-Rubber Band is optional and not bundled. The built-in vocoder works without it.
+Rubber Band is optional and not bundled. The built-in realtime stretch works without it.
 Rubber Band is GPL, which does not combine with this player's license: shipping the
 Rubber Band entry in an application other people get, a web page included, needs a
 commercial Rubber Band licence. See [Rubber Band's terms](https://breakfastquay.com/rubberband/license.html).

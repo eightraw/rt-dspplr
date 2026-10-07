@@ -190,33 +190,38 @@ test('React StrictMode remount loads and unmount releases nodes', async ({ page 
     expect(await page.evaluate(() => ({ disposed: strictPlayer.disposed, status: strictPlayer.getState().status }))).toEqual({ disposed: true, status: 'idle' });
 });
 
-test('built-in vocoder works without the Rubber Band entry', async ({ page }) => {
+test('whole clips stretch in realtime by default: the speed changes at once, the pitch stays, Rubber Band is never fetched', async ({ page }) => {
     const requests = []; page.on('request', req => requests.push(req.url()));
     const result = await page.evaluate(async () => {
-        const p = h.make({ stretcher: h.vocoderStretcher }); await p.play(h.buffer(2)); await p.setSpeed(1.5); await h.sleep(120);
-        const result = { playing: p.getState().isPlaying, speed: p.getState().processing.speed, rms: h.rms(p) }; p.dispose(); return result;
-    });
-    expect(result.playing).toBe(true); expect(result.speed).toBe(1.5); expect(result.rms).toBeGreaterThan(0.01);
-    expect(requests.some(url => /rubberband/i.test(url))).toBe(false);
-});
-
-test('vocoderStretcher({ memory }) renders speeds in the worker, lean and fast', async ({ page }) => {
-    const result = await page.evaluate(async () => {
-        const out = {};
-        for (const memory of ['lean', 'fast']) {
-            const strategy = h.vocoderStretcher({ memory });
-            const p = h.make({ stretcher: strategy }); await p.play(h.buffer(2)); await p.setSpeed(1.5); await h.sleep(120);
-            out[memory] = { id: strategy.id, speed: p.getState().processing.speed, pending: p.getState().pendingSpeed, rms: h.rms(p) > 0.01 };
-            p.dispose();
+        const p = h.make({ stretcher: undefined }); await p.play(h.buffer(6));
+        const t = performance.now();
+        while (!p.getState().capabilities.canPreservePitch && performance.now() - t < 10000) await h.sleep(10);
+        await p.setSpeed(1.5);
+        const pending = p.getState().pendingSpeed;
+        await h.sleep(100);
+        const c0 = performance.now(); const t0 = p.getCurrentTime();
+        await h.sleep(800);
+        const pace = (p.getCurrentTime() - t0) / ((performance.now() - c0) / 1000);
+        // The pitch: upward zero crossings of what is heard (440 Hz; 660 Hz if the pitch followed the speed).
+        const data = new Float32Array(p.analyser.fftSize); p.analyser.getFloatTimeDomainData(data);
+        let first = -1, last = -1, periods = 0;
+        for (let i = 1; i < data.length; i++) {
+            if (!(data[i - 1] < 0 && data[i] >= 0)) continue;
+            const x = i - 1 + data[i - 1] / (data[i - 1] - data[i]);
+            if (first < 0) first = x; else periods += 1;
+            last = x;
         }
-        return { ...out, defaultId: h.vocoderStretcher.id, callable: typeof h.vocoderStretcher };
+        const hz = periods / ((last - first) / p.analyser.context.sampleRate);
+        const s = p.getState();
+        const out = { kind: s.sourceKind, preserve: s.capabilities.canPreservePitch, stretchAvailable: p.stretchAvailable, playing: s.isPlaying, speed: s.processing.speed, pending, pace, hz, rms: h.rms(p) };
+        p.dispose(); return out;
     });
-    expect(result).toEqual({
-        lean: { id: 'vocoder:lean', speed: 1.5, pending: null, rms: true },
-        fast: { id: 'vocoder:fast', speed: 1.5, pending: null, rms: true },
-        defaultId: 'vocoder',
-        callable: 'function',
-    });
+    expect(result).toMatchObject({ kind: 'buffer', preserve: true, stretchAvailable: true, playing: true, speed: 1.5, pending: null });
+    expect(Math.abs(result.hz - 440)).toBeLessThan(8);
+    expect(result.pace).toBeGreaterThan(1.4);
+    expect(result.pace).toBeLessThan(1.6);
+    expect(result.rms).toBeGreaterThan(0.03);
+    expect(requests.some(url => /rubberband/i.test(url))).toBe(false);
 });
 
 test('strategy options the worker cannot receive fail the job, not the player', async ({ page }) => {

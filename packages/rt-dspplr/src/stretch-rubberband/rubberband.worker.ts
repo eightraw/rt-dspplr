@@ -5,15 +5,14 @@
 // resolved from the application's own node_modules and is never part of this
 // package's build output.
 //
-// If Rubber Band cannot run (WASM blocked, file missing, out of memory), every
-// job falls back to the built-in phase vocoder instead of failing. A failure
-// that cannot pass (WASM refused or broken, no file) is kept for the worker's
+// If Rubber Band cannot run (WASM blocked, file missing, out of memory), the
+// job fails and the player plays that speed by playbackRate (the pitch follows
+// the speed). A failure that cannot pass (WASM refused or broken, no file) is kept for the worker's
 // life; any other is tried again with a growing pause.
 
 import { RubberBandInterface } from 'rubberband-wasm';
 import { processWithRubberBand } from './rubberbandCore';
 import { serveStretchWorker, type StretchWorkerScope } from '../core/stretch/protocol';
-import { stretchMultichannel } from '../core/stretch/OfflineStretchCore';
 
 interface ConfigureMessage {
     type: 'configure';
@@ -91,23 +90,9 @@ function loadRubberBandApi(): Promise<RubberBandInterface> {
     return attempt;
 }
 
-let warnedFallback = false;
-
-serveStretchWorker(workerScope, async (channels, sampleRate, speed, transientSensitivity) => {
-    try {
-        const api = await loadRubberBandApi();
-        return processWithRubberBand(api, channels, sampleRate, speed);
-    } catch (error) {
-        if (!warnedFallback) {
-            warnedFallback = true;
-            console.warn('[rubberband worker] Rubber Band failed, falling back to the built-in phase vocoder', error);
-        }
-        return stretchMultichannel(channels, {
-            sampleRate,
-            rate: 1 / speed,
-            transientSensitivity,
-        });
-    }
+serveStretchWorker(workerScope, async (channels, sampleRate, speed) => {
+    const api = await loadRubberBandApi();
+    return processWithRubberBand(api, channels, sampleRate, speed);
 });
 
 // serveStretchWorker owns onmessage; wrap it to also accept 'configure'.

@@ -329,7 +329,7 @@ async function runOne(server, name, runMode) {
 }
 
 if (args.includes('--stretch-quality')) {
-    // Realtime stretch (engine) vs the offline vocoder and Rubber Band: level, timing, spectral
+    // Realtime stretch (engine) vs Rubber Band offline: level, timing, spectral
     // distance to the time-scaled input, CPU; WAVs to --listen <dir>.
     const { build } = await import('esbuild');
     const helper = path.join(root, 'node_modules', '.cache', 'stretch-offline.mjs');
@@ -443,8 +443,7 @@ if (args.includes('--stretch-quality')) {
             const rt = new Float32Array(Buffer.from(r.output, 'base64').buffer.slice(0));
             const outs = { realtime: { out: rt, ms: r.wallMs } };
             if (rate !== 1) {
-                outs.vocoder = await offlineStretch('vocoder', input, sr, rate);
-                outs.rubberband = await offlineStretch('rubberband', input, sr, rate);
+                outs.rubberband = await offlineStretch(input, sr, rate);
             }
             for (const [method, { out, ms }] of Object.entries(outs)) {
                 const lvl = rmsDb(out, Math.round(sr / rate), out.length - Math.round(sr / rate)) - inDb;

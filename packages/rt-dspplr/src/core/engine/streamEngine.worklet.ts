@@ -299,6 +299,8 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
 
     private stretchWanted = true;
     private stretch: { mod: WasmStretch; inPtr: number[]; outPtr: number[]; len: number; inLat: number; outLat: number } | null = null;
+    /** What the stretcher's input window was last filled with (renderPlaying shifts it on). */
+    private window: { end: number; split: boolean; ga: number; gb: number; loop: { start: number; end: number } | null; wrapped: boolean; inLoop: boolean } | null = null;
     private stretchLoading = false;
     private stretchError = '';
     private readonly mixScratch: Float32Array[];
@@ -459,6 +461,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     private invalidate(stem: Stem): void {
         this.cache[stem].start = 0;
         this.cache[stem].end = 0;
+        this.window = null;
     }
 
     /** The timeline frame `offset` frames from `from`, read through the loop. */
@@ -692,6 +695,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                 this.bFresh = true;
                 // Another stem B: its parts are another stem's.
                 this.split?.b.clear();
+                this.window = null;
                 break;
             case 'dispose':
                 this.disposing = true;
@@ -867,9 +871,20 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                 // that many frames (at this rate) ahead, so the output lands on the playhead.
                 const end = Math.round(start + s.outLat * rate + s.inLat);
                 const split = splitHere ? this.split! : null;
+                // The window moves on by about a block per block: what it held is shifted, and
+                // only the new frames are read, while the same frames would read the same
+                // (same stems in memory, gains, split, and reading through the loop).
+                const loop = this.loop;
+                const inLoop = !!loop && start >= loop.start && start < loop.end;
+                const prev = this.window;
+                const shift = prev ? end - prev.end : -1;
+                const kept = prev && shift >= 0 && shift < s.len && prev.split === !!split && prev.ga === gaStart && prev.gb === gbStart
+                    && prev.loop === loop && prev.wrapped === this.wrapped && prev.inLoop === inLoop ? s.len - shift : 0;
+                this.window = { end, split: !!split, ga: gaStart, gb: gbStart, loop, wrapped: this.wrapped, inLoop };
                 for (let c = 0; c < this.channels; c += 1) {
                     const buf = new Float32Array(memory, s.inPtr[c], s.len);
-                    for (let k = 0; k < s.len; k += 1) {
+                    if (kept > 0) buf.copyWithin(0, shift);
+                    for (let k = kept; k < s.len; k += 1) {
                         const f = this.mapFrame(start, end - s.len + k);
                         buf[k] = split
                             ? split.a.tonal(f, c) * gaStart + (gbStart !== 0 ? split.b.tonal(f, c) * gbStart : 0)

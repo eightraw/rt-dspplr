@@ -120,6 +120,11 @@ const energy = (x: Float32Array[], from: number, to: number) => x.reduce((s, c) 
     assert.equal(split.prepare(SPLIT_HOP * 4, (i) => SR / 2 + i, { left: 100 }), 'missing', 'audio not in memory is never split');
     present = true;
     assert.equal(split.prepare(SPLIT_HOP * 4, (i) => SR / 2 + i, { left: 100 }), 'ready');
+    // The last frame of a span counts too, however short of a quarter chunk it ends past a chunk start.
+    const edge = 88 * SPLIT_HOP;
+    const fresh = new SplitSource(await exports(), 2, read, () => true);
+    assert.equal(fresh.prepare(1000, (i) => edge - 900 + i, { left: 100 }), 'ready');
+    assert.notEqual(fresh.tonal(edge + 100, 0), 0, 'the chunk holding the span\'s last frame is made');
     results.push(`split budget: a cold region is made over ${rounds} blocks of 3; audio not in memory reports 'missing' and is split once it is there`);
 }
 

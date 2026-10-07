@@ -147,7 +147,7 @@ test('a 44.1 kHz clip at a 48 kHz context keeps realtime speed: 1.5x keeps the p
 test('a prepared 44.1 kHz clip plays with realtime speed in the player, at the right pace', async ({ page }) => {
     const r = await page.evaluate(async () => {
         const ui = document.body.appendChild(document.createElement('div'));
-        const player = h.createAudioPlayer({ element: ui, prewarmSpeeds: false, stretcher: 'native', processing: { highPassHz: 0, compression: 0 } });
+        const player = h.createAudioPlayer({ element: ui, prewarmSpeeds: false, processing: { highPassHz: 0, compression: 0 } });
         await player.play({ manifest: `${longBase}/stereo441/manifest.json` });
         const t = performance.now();
         while (!(h.rms(player) > 0.02) && performance.now() - t < 8000) await h.sleep(10);

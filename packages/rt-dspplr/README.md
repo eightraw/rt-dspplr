@@ -13,9 +13,9 @@ with their length. Long recordings can instead be prepared once on the server
 and played segment by segment with `play({ manifest })`, see
 [Long recordings](#long-recordings-prepared-files).
 
-- **Pitch-preserving speed** (1.25x, 1.5x, 2x...). Variants are rendered
-  off the main thread. Playback continues at the applied speed while a new
-  variant is prepared, then switches at the live position.
+- **Pitch-preserving speed** (0.75x, 1.25x, 2x...), changed at once by a
+  realtime stretch in an AudioWorklet that keeps attacks single and sharp, for
+  whole and prepared clips alike.
 - **Loop** any range, with boundaries snapped to zero crossings (no clicks).
 - **Real-time DSP chain** on the output: input gain, a 24 dB/oct high-pass,
   a peak compressor, your own effects, output gain, and a -0.01 dBFS ceiling
@@ -58,7 +58,7 @@ ESM only. TypeScript types included.
 - [DSP plugins (effects)](#dsp-plugins-effects)
 - [Timeline](#timeline)
 - [Spectrogram](#spectrogram)
-- [Time-stretch strategies](#time-stretch-strategies)
+- [Speed and time stretch](#speed-and-time-stretch)
 - [Bundlers, workers, CSP](#bundlers-workers-csp)
 - [Styling and themes](#styling-and-themes)
 - [Memory](#memory)
@@ -152,9 +152,9 @@ Construction is free. No AudioContext, node, or worker exists until the first
 
 | Option | Type | Default | |
 |---|---|---|---|
-| `stretcher` | `StretchStrategy \| 'native'` | `vocoderStretcher` | Time-stretch backend, see [strategies](#time-stretch-strategies). |
+| `stretcher` | `'realtime' \| 'native' \| StretchStrategy` | `'realtime'` | How speed keeps the pitch, see [Speed](#speed-and-time-stretch). |
 | `speeds` | `number[]` | `[1, 1.25, 1.5, 2]` | Speeds offered by UIs and the default prewarm set, within 0.25–4x (`SPEED_MIN`, `SPEED_MAX`); others are dropped with a warning. |
-| `prewarmSpeeds` | `boolean \| number[]` | `true` | Render speed variants in the background after load. The selected speed always goes first. |
+| `prewarmSpeeds` | `boolean \| number[]` | `true` | With an offline `stretcher` only: render speed variants in the background after load. The selected speed always goes first. |
 | `processing` | `Partial<ProcessingState>` | see below | Initial DSP values. |
 | `mixLaw` | `'crossfade' \| 'separation'` | `'crossfade'` | How `mix` sets the stems' gains, see [Two-track mixer](#two-track-mixer). |
 | `pauseMode` | `'pause' \| 'reset'` | `'pause'` | `'reset'`: pausing returns to where playback last started, so the same passage plays again from there. |
@@ -164,7 +164,7 @@ Construction is free. No AudioContext, node, or worker exists until the first
 | `fetchOptionsOrigins` | `string[]` | none | Further origins (`'https://cdn.example.com'`) that get the headers and credentials of `fetchOptions` when a manifest names files there. Files on other origins are fetched without them. |
 | `cacheBudgetBytes` | `number` | 150 MiB | Shared PCM budget for every player on the page, see [Memory](#memory). |
 | `maxClipBytes` | `number` | no limit | Whole clips (stem B too): the largest file. A URL is checked by its `Content-Length` before the download and by the bytes read while it runs. Over it, the load fails at once with an `Error` named `'ClipTooLargeError'` that points to prepared playback. |
-| `maxClipSeconds` | `number` | no limit | Whole clips: the longest clip, checked once decoded (before any speed variant). Fails the same way. |
+| `maxClipSeconds` | `number` | no limit | Whole clips: the longest clip, checked once decoded. Fails the same way. |
 | `sampleRate` | `number` | the device's (44100 or 48000), else 48000 | Sample rate of the shared AudioContext (the first player to start decides). Clips at other rates are converted by the player. |
 | `latencyHint` | `'playback' \| 'interactive' \| 'balanced' \| number` | `'playback'` | Output buffering of the shared AudioContext (the first player to start decides). `'playback'` keeps the sound clean while the page is busy. |
 | `element` | `HTMLElement` | none | The element your interface lives in; same as `mount(element)`. |
@@ -185,7 +185,7 @@ source can do is reported in `state.capabilities`.
 | `play(clip?, { startAt? })` | With no argument, resume. With a clip, play it from `startAt` (default 0). Passing the clip that is already loaded restarts it without reloading. |
 | `pause()`, `toggle()`, `stop()` | `pause()` follows `pauseMode`. While a whole clip is still loading they set what happens once it is in: it plays or not, and `stop()` puts it at 0. |
 | `seek(seconds)` | Keeps playing if it was playing. While a whole clip is still loading, it is where the clip starts. |
-| `setSpeed(speed)` | Keeps the position. Clamped to 0.25–4x. Pitch is preserved when the strategy has a worker. |
+| `setSpeed(speed)` | Keeps the position, changes at once. Clamped to 0.25–4x. Pitch is preserved while `capabilities.canPreservePitch` is true. |
 | `setLoop({ start, end } \| null)` | In seconds. Snapped to zero crossings. Changing or dropping the loop while playing keeps the position; a loop set behind the playhead starts from its beginning. |
 | `setHighPass(hz)` | `0` bypasses. UI range 0–500 Hz. |
 | `setCompression(amount)` | 0–1. |
@@ -224,8 +224,8 @@ look-ahead delay. The ceiling is the same clip either way.
 | `isPlaying`, `currentTime`, `duration`, `ended` | `ended` is true after the clip plays to its end (not after `stop()`). |
 | `suspended` | `null`, or why the audio output is held: `'interrupted'` (the system took it while playing, the player paused) or `'blocked'` (`play()` could not start it). The next `play()` from a user gesture resumes. |
 | `loop` | Active loop range (snapped) or `null`. |
-| `processing` | Applied `ProcessingState`; speed stays at the audible rate during preparation. |
-| `pendingSpeed` | Requested speed being prepared, or `null`. Stop/pause/seek/new clip cancel the pending switch. |
+| `processing` | Applied `ProcessingState`; with an offline `stretcher`, speed stays at the audible rate while a variant is prepared. |
+| `pendingSpeed` | With an offline `stretcher`: the requested speed being prepared, or `null` (always `null` otherwise). Stop/pause/seek/new clip cancel the pending switch. |
 | `statusB` | `'unavailable' \| 'idle' \| 'loading' \| 'ready' \| 'error'` (and `'processing'` for prepared clips with polling). |
 | `sourceKind`, `capabilities` | `'buffer'` (whole clip) or `'segmented'` (prepared); what the source can do: `canPreservePitch`, `canMixStemB`, `stems` (a prepared clip's ready stems: `{ key, label }[]`), `exactWaveformPreview`, `spectrogram`, `loopSnapping`. |
 | `manifest`, `stem`, `prepared`, `buffering` | Prepared clips: the manifest, the active blend stem's key, the overview data as it arrives, waiting for a segment. |
@@ -432,18 +432,11 @@ useEffect(() => { void p.load({ manifest }); }, [manifest]);
 - A manifest's files must be `http(s)` URLs, relative to it or absolute (a CDN).
   `fetchOptions` headers and credentials go only to the manifest's origin and to
   those in `fetchOptionsOrigins`; files elsewhere are fetched without them.
-- Speed keeps the pitch through a realtime stretch in the stream engine
-  (AudioWorklet), which runs at the clip's rate and converts to the context's.
-  Each stem is split into a tonal part (held notes) and an atonal one (attacks,
-  noise) by median filtering of its spectrum: Signalsmith Stretch stretches the
-  tonal part smoothly, a short overlap-add the atonal one, so an attack is played
-  once and stays sharp instead of being smeared or doubled. The split looks a few
-  hundred milliseconds ahead in the clip's audio, which costs no latency; after a
-  jump it is ready within a few milliseconds. About 1 % of a core per stem on a
-  desktop, Signalsmith about 3 %. Without the stretcher pitch follows speed and
-  `capabilities.canPreservePitch` says so (the card shows it).
+- Speed keeps the pitch through the realtime stretch of the stream engine, as
+  for whole clips (see [Speed](#speed-and-time-stretch)); the engine runs at the
+  clip's rate and converts to the context's.
 - Options under `segmented`: `cacheSeconds`, `prefetchSegments`, `engine`,
-  `realtimeStretch`, `pollStemsMs`. `player.getStreamStats()` reports cache,
+  `pollStemsMs`. `player.getStreamStats()` reports cache,
   fetches and latencies.
 
 **Named stems.** A manifest can carry several stems, each a time-aligned derivative
@@ -620,50 +613,47 @@ view.dispose();
 Levels are relative to the clip's loudest bin, so a quiet stem looks quiet.
 With `mixLaw: 'separation'` the reference is both stems together.
 
-## Time-stretch strategies
+## Speed and time stretch
 
-| Strategy | Import | Quality / cost |
+Whole clips and prepared ones play through the same stream engine, an
+AudioWorklet, and change speed at once, keeping the pitch. Each stem is split
+into a tonal part (held notes) and an atonal one (attacks, noise) by median
+filtering of its spectrum: Signalsmith Stretch (MIT) stretches the tonal part
+smoothly, a short overlap-add the atonal one, so an attack is played once and
+stays sharp instead of being smeared or doubled. In blind listening on guitar at
+0.75x it could not be told from Rubber Band's offline render. The split looks a
+few hundred milliseconds ahead in the clip's audio, which costs no latency;
+after a jump it is ready within a few milliseconds. In Chrome on a desktop
+(i5-12400F) the whole engine takes 4–6 % of one core while it stretches one
+stem and 6–8 % with stem B mixed in, under 1 % at 1x, where the stretch is
+off. A whole clip is handed to the engine in
+5-second pieces around the playhead, so the engine holds about 20 s of it.
+
+| `stretcher` | Import | What it does |
 |---|---|---|
-| `vocoderStretcher` (default) | `@saitdigital/rt-dspplr` | Built-in phase vocoder with transient-aware phase reset. Pure TS, ~5 KB worker, no dependencies. Call it to choose its memory use: `vocoderStretcher({ memory })`, see below. |
-| `'native'` / `nativeStretcher` | `@saitdigital/rt-dspplr` | `playbackRate` only: no stretch rendering, pitch follows speed. |
-| `rubberbandStretcher(options?)` | `@saitdigital/rt-dspplr/stretch-rubberband` | Rubber Band R3 ("finer") in a module worker. Best quality, ~265 KB WASM loaded on first use, GPL (see below). |
-| custom | `serveStretchWorker` | Any algorithm. Write a worker with `serveStretchWorker(self, (channels, sampleRate, speed, sensitivity, options) => …)` and return `{ id, createWorker, options? }`. `options` are plain, cloneable data handed to the worker with every request. |
+| `'realtime'` (default) | | The realtime stretch above. Where it cannot run (no AudioWorklet, WASM refused by a CSP) the pitch follows the speed, and `capabilities.canPreservePitch` says so (the card shows it). |
+| `'native'` | | No stretch: the pitch follows the speed. |
+| `rubberbandStretcher(options?)` | `@saitdigital/rt-dspplr/stretch-rubberband` | Rubber Band R3 ("finer") renders each speed of a whole clip offline in a module worker, ~265 KB WASM loaded on first use, GPL (see below). Prepared clips keep the realtime stretch. |
+| custom | `serveStretchWorker` | Any offline algorithm for whole clips. Write a worker with `serveStretchWorker(self, (channels, sampleRate, speed, sensitivity, options) => …)` and return `{ id, createWorker, options? }`. `options` are plain, cloneable data handed to the worker with every request. |
 
-The built-in vocoder can hold the whole clip's analysis in memory or go
-through it frame by frame. Both give the same samples, bit for bit:
+### Offline strategies
 
-| `memory` | Memory while rendering | Time |
-|---|---|---|
-| `'auto'` (default) | `'lean'` above 15 s of audio, `'fast'` below | that of the mode it picks |
-| `'lean'` | the output plus a few FFT-sized buffers: +78 MB for 10 min mono | about 5–10% more than `'fast'` |
-| `'fast'` | about 20x the clip's PCM: +2.3 GB for 10 min mono | the baseline: 19 s for 10 min mono |
-
-```ts
-createAudioPlayer({ stretcher: vocoderStretcher({ memory: 'lean' }) });
-```
-
-Measured in Node 20, mono 48 kHz at 1.5x. Each mode is its own strategy with
-its own cache.
-
-Variants are rendered once per (clip, speed, strategy) and cached. The
+With an offline strategy a whole clip plays on two AudioBufferSourceNodes
+instead of the engine, and each speed is a rendered variant of the whole
+clip. Variants are rendered once per (clip, speed, strategy) and cached. The
 selected speed is rendered before the others, and a playback request jumps
 ahead of queued prewarm jobs. Prewarm jobs of a clip are cancelled when the
 player moves to another clip. The variant of the current clip at the current
 speed is also held by the player itself, so seeking and restarting at that
 speed never render again, even when the variant is too large for the cache.
-If no worker can start (strategy `native`, CSP, four crashes in a row), speed
-changes fall back to `playbackRate`; a job that a worker never answers is
-abandoned after a watchdog (at least 10 s) and its worker replaced.
+If no worker can start (CSP, four crashes in a row), speed changes fall back
+to `playbackRate`; a job that a worker never answers is abandoned after a
+watchdog (at least 10 s) and its worker replaced.
 
-Speed preparation is offline, over the whole clip, not a streaming realtime
-stretcher. On `setSpeed`, the old rate keeps playing until the requested
-variant is ready; `state.pendingSpeed` exposes this wait. The latest request
-wins. This avoids an intentional pause but does not promise click-free
-phase continuity between independently stretched buffers. The built-in
-vocoder keeps the level of tonal material within half a decibel at every
-speed, and its output lands within a few milliseconds of the source
-time scaled by the speed; noise-like material comes out a few decibels quieter,
-as from any phase vocoder.
+On `setSpeed`, the old rate keeps playing until the requested variant is
+ready; `state.pendingSpeed` exposes this wait. The latest request wins. This
+avoids an intentional pause but does not promise click-free phase continuity
+between independently stretched buffers.
 
 ### Rubber Band entry
 
@@ -675,7 +665,7 @@ const player = createAudioPlayer({ stretcher: rubberbandStretcher() });
 ```
 
 `rubberband-wasm` is an optional peer dependency. A normal `npm install
-@saitdigital/rt-dspplr` does not install it. The built-in vocoder needs no Rubber Band.
+@saitdigital/rt-dspplr` does not install it. The built-in realtime stretch needs no Rubber Band.
 To opt in, install it yourself:
 
 ```bash
@@ -711,35 +701,36 @@ export default defineConfig({
 
 Without that line, `vite dev` prints one warning that explains it and uses
 `playbackRate` for speed changes. Production builds are unaffected. If the
-WASM fails to load at runtime, each job falls back to the built-in vocoder.
+WASM fails to load at runtime, that speed plays by `playbackRate` (the pitch
+follows).
 
 ## Bundlers, workers, CSP
 
-The core and React entries contain six small scripts as strings: the
-dynamics AudioWorklet (~2 KB), the vocoder worker (~5 KB), the waveform
-peaks worker (~8 KB), the spectrogram worker (~7 KB), the overview
-preview worker of prepared clips (~6 KB) and the stream engine AudioWorklet
-of prepared clips (~10 KB). The realtime stretcher of prepared clips
+The core and React entries contain five small scripts as strings: the
+dynamics AudioWorklet (~2 KB), the waveform peaks worker (~8 KB), the
+spectrogram worker (~7 KB), the overview preview worker of prepared clips
+(~6 KB) and the stream engine AudioWorklet (~10 KB). The realtime stretcher
 (Signalsmith Stretch, MIT, ~100 KB of WASM; its notice is in the chunk and in
 THIRD_PARTY_NOTICES.md) and its tonal/atonal split (our own, ~18 KB of WASM) are
-separate chunks, loaded by a dynamic `import()` only when a prepared clip plays. Each is started from
+separate chunks, loaded by a dynamic `import()` when the first clip loads. Each is started from
 a `blob:` URL the first time it is needed. No extra files, loaders, or `new URL()` patterns are involved. The
 same build is verified in Vite (dev and build) and webpack 5. Nothing in it is
 bundler-specific, so other ESM bundlers should behave the same.
 
 With a Content-Security-Policy, allow `blob:` in `worker-src` (workers) and
 `script-src` (the AudioWorklet modules), and `'wasm-unsafe-eval'` in `script-src`
-for the realtime stretcher of prepared clips (it compiles its WASM, and the
-split's, in the AudioWorklet). If they are blocked, the player still works: DSP falls back to
-native nodes, speed to `playbackRate` (prepared clips: resampling, the pitch
-follows), and the waveform and the spectrogram stay empty. A warning is logged, also when a
+for the realtime stretcher (it compiles its WASM, and the split's, in the
+AudioWorklet). If they are blocked, the player still works: DSP falls back to
+native nodes, speed to resampling (the pitch follows), whole clips to
+AudioBufferSourceNodes when the AudioWorklet itself is refused, and the waveform
+and the spectrogram stay empty. A warning is logged, also when a
 worker fails after it started.
 
 The Rubber Band entry compiles `rubberband.wasm` in its own module worker, loaded
 from a URL: a worker like that takes its policy from the CSP of the worker
 script's own response, not from the page's, and that response needs
-`'wasm-unsafe-eval'` in `script-src`. Refused, each job falls back to the built-in
-vocoder, and the worker does not try again. `connect-src` must allow what the
+`'wasm-unsafe-eval'` in `script-src`. Refused, each speed plays by `playbackRate`
+(the pitch follows), and the worker does not try again. `connect-src` must allow what the
 player loads with `fetch()`: the clip URLs, manifests, the source files of prepared
 clips (Range requests), their peaks, bands and spectrogram files, and
 `rubberband.wasm`.
@@ -799,24 +790,23 @@ to the width it is given rather than to the viewport.
 
 Decoded audio is raw Float32 PCM in the browser's native memory, about
 22 MiB per minute of 48 kHz stereo. One byte-bounded LRU (default 150 MiB,
-shared by all players) holds both decoded clips and rendered speed variants.
-The default three variants can add about 2x the clip's size. Speculative
-prewarming only schedules variants whose estimated size fits beside what the
-cache already holds. Explicitly requested variants may exceed the budget; they
-are played without caching, and the player keeps the one it is playing until
-the clip or the speed changes.
+shared by all players) holds decoded clips and, with an offline `stretcher`,
+rendered speed variants. The realtime stretch keeps no variants: the engine
+holds about 20 s of the clip around the playhead, per stem. With an offline
+strategy the default three variants can add about 2x the clip's size.
+Speculative prewarming only schedules variants whose estimated size fits beside
+what the cache already holds. Explicitly requested variants may exceed the
+budget; they are played without caching, and the player keeps the one it is
+playing until the clip or the speed changes.
 
 **This is a cache limit, not a cap on total tab memory.** `usedBytes` reports
 cache references only. Active tracks can retain evicted buffers; decode,
 download, waveform workers, stretch workers and their scratch/output buffers
 consume additional memory. Stems A and B each require PCM.
-Eviction never interrupts playback. Rendering a speed variant needs little
-beyond the variant itself: the built-in vocoder goes through clips longer than
-15 s frame by frame (see [Time-stretch strategies](#time-stretch-strategies)).
-For large files or constrained devices, set `prewarmSpeeds: false`, avoid
-unnecessary stem B prefetch, and dispose unused players. Whole clips are
-decoded in full: an hour of 48 kHz stereo is about 1.4 GB of PCM, and each speed
-variant adds to it. Where users can pass any file, set `maxClipBytes` and
+Eviction never interrupts playback. For large files or constrained devices,
+avoid unnecessary stem B prefetch and dispose unused players (with an offline
+strategy, set `prewarmSpeeds: false` too). Whole clips are decoded in full: an
+hour of 48 kHz stereo is about 1.4 GB of PCM. Where users can pass any file, set `maxClipBytes` and
 `maxClipSeconds` so a file too large fails early with a clear error instead of
 taking the tab down. For long recordings, the prepared (manifest)
 source keeps only about a minute of decoded audio around the playhead; see
@@ -848,9 +838,10 @@ narrow-width tweaks). The Rubber Band entry needs module workers (Firefox
 AAC/M4A, FLAC everywhere; Ogg/Opus and WebM depend on the browser). The shared
 AudioContext runs at the device's rate when it is 44.1 or 48 kHz (else at
 48 kHz) unless the first player asks for another `sampleRate`. Whole clips at
-another rate are resampled by the browser's decoder; prepared clips by the
-stream engine, which plays them at their own rate (mix, realtime stretch) and
-converts its output with a windowed-sinc resampler (residual below −90 dB,
+another rate are resampled by the browser's decoder (an AudioBuffer handed in
+keeps its rate); prepared clips and such buffers by the stream engine, which
+plays them at their own rate (mix, realtime stretch) and converts its output
+with a windowed-sinc resampler (residual below −90 dB,
 about 1 % of a core for stereo), so realtime speed works at any rate.
 
 ## Sizes
@@ -876,7 +867,7 @@ npm run test:package      # build + npm artifact installed in an isolated consum
 Install Chromium once with `npx playwright install chromium`. The automated
 browser suite covers transport cancellation, racing clip/speed requests,
 late stem B responses, loops changed while playing, multiple players,
-StrictMode cleanup, real output levels, the built-in vocoder, and the wheel,
+StrictMode cleanup, real output levels, the realtime stretch, and the wheel,
 touch and right-click behaviour. It runs with the browser's autoplay policy
 switched off, so the first play from a click is checked by hand. It is not a
 listening-quality benchmark or a claim that Safari, Firefox, mobile devices and
@@ -935,5 +926,5 @@ whole combined program under the GPL, and this player's license adds conditions
 (the credit, open changes) that the GPL does not allow. In practice that means:
 do not ship the Rubber Band entry in an application other people get, a web page
 included, unless you hold a commercial Rubber Band licence. Without one, use the
-built-in vocoder. See
+built-in realtime stretch. See
 [Rubber Band's licensing terms](https://breakfastquay.com/rubberband/license.html).

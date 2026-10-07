@@ -163,7 +163,7 @@ test('a loop that ends on a segment boundary keeps playing, at 1x and at 1.5x', 
 
 test('back at 1x after another speed, playback returns to the original samples', async ({ page }) => {
     const r = await page.evaluate(async () => {
-        const { player } = mk();
+        const { player } = mk({ stretcher: undefined });
         await player.play({ manifest: `${longBase}/stereo70/manifest.json` });
         await until(() => h.rms(player) > 0.02);
         await player.setSpeed(1.5);

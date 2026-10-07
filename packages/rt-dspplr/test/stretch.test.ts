@@ -1,16 +1,13 @@
-// Node tests for the stretch pipeline (run: npm test). Bundled by
-// build/test-node.mjs with esbuild; no browser needed.
+// Node tests for the offline stretch pipeline (an offline strategy such as
+// Rubber Band; run: npm test). Bundled by build/test-node.mjs with esbuild; no
+// browser needed.
 //
-//  1. Stretched output has exactly round(N / speed) frames on both paths
-//     (built-in vocoder and Rubber Band), although the raw output buffers are
-//     longer: wrapping a whole `channel.buffer` would add frames.
-//     The lean (two-pass) vocoder gives the same samples, bit for bit.
-//  2. The vocoder keeps the input's level at every speed, and its output lands
-//     where the input was, scaled by the speed.
-//  3. Speed variants are accounted in the shared PCM byte budget.
-//  4. Prewarm puts the selected speed first, a playback request promotes a
+//  1. Rubber Band's output is N / speed frames long, although its raw output
+//     buffers are longer: wrapping a whole `channel.buffer` would add frames.
+//  2. Speed variants are accounted in the shared PCM byte budget.
+//  3. Prewarm puts the selected speed first, a playback request promotes a
 //     queued prewarm job, and cancelPrewarm() drops queued jobs.
-//  5. A silent worker is replaced by the watchdog; crashes are forgiven once a
+//  4. A silent worker is replaced by the watchdog; crashes are forgiven once a
 //     job completes.
 
 import assert from 'node:assert/strict';
@@ -18,10 +15,9 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { RubberBandInterface } from 'rubberband-wasm';
 import { runStretchRequest, type StretchWorkerRequest } from '../src/core/stretch/protocol';
-import { LEAN_AFTER_SECONDS, stretchChannel, stretchMultichannel, defaultStretchFftSize } from '../src/core/stretch/OfflineStretchCore';
 import { processWithRubberBand } from '../src/stretch-rubberband/rubberbandCore';
 import { StretchService, StretchUnavailableError } from '../src/core/stretch/StretchService';
-import { nativeStretcher, type StretchStrategy } from '../src/core/stretch/strategies';
+import type { StretchStrategy } from '../src/core/stretch/strategies';
 import { getAudioCacheStats, setAudioCacheBudget, clearAudioCache } from '../src/core/cache/pcmCache';
 
 const require = createRequire(import.meta.url);
@@ -59,20 +55,6 @@ async function testLengths(): Promise<void> {
     const frames = SAMPLE_RATE * 3;
     const source = [makeSignal(frames)];
 
-    for (const speed of [1.25, 1.5, 2]) {
-        const expected = Math.round(frames / speed);
-
-        // Built-in vocoder
-        const vocoderOut = stretchMultichannel(source.map((c) => c.slice()), { sampleRate: SAMPLE_RATE, rate: 1 / speed, transientSensitivity: 0.5 });
-        const vocoderWhole = wholeBufferFrames(vocoderOut[0]);
-        const vocoderLeadingPad = vocoderOut[0].byteOffset / 4;
-        const vocoder = await runStretchRequest(request(source, speed), (channels, sr, s, t) => stretchMultichannel(channels, { sampleRate: sr, rate: 1 / s, transientSensitivity: t }));
-        assert.equal(vocoder.response.length, expected, `vocoder length at ${speed}x`);
-        assert.equal(vocoder.response.channels[0].byteLength / 4, expected, `vocoder transferred buffer at ${speed}x`);
-        assert.ok(vocoderWhole > expected, 'the raw vocoder buffer is longer than the audio');
-        results.push(`vocoder    ${speed}x: expected ${expected} frames | whole buffer ${vocoderWhole} (+${vocoderWhole - expected}, of which ${vocoderLeadingPad} leading = ${(vocoderLeadingPad / SAMPLE_RATE * 1000).toFixed(1)} ms) | fixed ${vocoder.response.length}`);
-    }
-
     const wasmPath = require.resolve('rubberband-wasm/dist/rubberband.wasm');
     const api = await RubberBandInterface.initialize(await WebAssembly.compile(fs.readFileSync(wasmPath)));
     for (const speed of [1.25, 1.5, 2]) {
@@ -86,127 +68,6 @@ async function testLengths(): Promise<void> {
         assert.ok(rbWhole - produced >= 8000, 'the raw rubberband buffer carries the 8192-frame over-allocation');
         results.push(`rubberband ${speed}x: target ${target.toFixed(0)} frames | whole buffer ${rbWhole} (+${rbWhole - produced} = ${((rbWhole - produced) / SAMPLE_RATE * 1000).toFixed(0)} ms of zeros) | fixed ${produced}`);
     }
-
-    results.push(`(vocoder FFT size at 48 kHz = ${defaultStretchFftSize(SAMPLE_RATE)} frames)`);
-}
-
-// The lean vocoder must give the whole-buffer path's samples exactly.
-function testLeanMatchesFast(): void {
-    const frames = Math.round(SAMPLE_RATE * 2.5);
-    const signal = makeSignal(frames);
-    // Clicks and bursts, so the transient detector has onsets to flag.
-    for (let at = 4000; at < frames; at += 21000) {
-        for (let i = 0; i < 300 && at + i < frames; i += 1) signal[at + i] += 0.8 * Math.exp(-i / 60) * (i % 2 ? 1 : -1);
-    }
-    let compared = 0;
-    for (const speed of [0.75, 1.25, 1.5, 2]) {
-        for (const transientSensitivity of [0.5, 0]) {
-            const options = { sampleRate: SAMPLE_RATE, rate: 1 / speed, transientSensitivity };
-            const fast = stretchChannel(signal, { ...options, memory: 'fast' });
-            const lean = stretchChannel(signal, { ...options, memory: 'lean' });
-            assert.equal(lean.length, fast.length, `lean length at ${speed}x`);
-            for (let i = 0; i < fast.length; i += 1) {
-                if (lean[i] !== fast[i]) assert.fail(`lean differs at sample ${i} of ${speed}x (sensitivity ${transientSensitivity}): ${lean[i]} vs ${fast[i]}`);
-            }
-            compared += fast.length;
-        }
-    }
-    results.push(`lean vocoder: ${compared} samples over 4 speeds, with and without transients, identical to the whole-buffer path`);
-
-    // 'auto' switches at LEAN_AFTER_SECONDS. The paths tell themselves apart by their
-    // output: the whole-buffer one hands back a view past its analysis padding, the
-    // lean one an array of exactly the samples.
-    const pick = (seconds: number) => {
-        const out = stretchChannel(makeSignal(Math.round(SAMPLE_RATE * seconds)), { sampleRate: SAMPLE_RATE, rate: 1 / 1.5 });
-        return out.byteOffset === 0 && out.byteLength === out.buffer.byteLength ? 'lean' : 'fast';
-    };
-    assert.equal(pick(LEAN_AFTER_SECONDS - 1), 'fast', 'auto stays fast below the threshold');
-    assert.equal(pick(LEAN_AFTER_SECONDS + 1), 'lean', 'auto goes lean above the threshold');
-    results.push(`auto: ${LEAN_AFTER_SECONDS - 1} s fast, ${LEAN_AFTER_SECONDS + 1} s lean`);
-}
-
-// Level and timing. Coherent material (a tone, a voice-like harmonic stack) keeps
-// its level within half a decibel at every speed; noise loses a few decibels, as
-// it does in any phase vocoder that sums incoherent grains. The output's
-// envelope lands where the input's was, scaled by the speed, within a few
-// milliseconds (it was off by (fftSize/2)(1/speed − 1): about 20 ms at 2x).
-function testLevelAndTiming(): void {
-    const frames = SAMPLE_RATE * 6;
-    const tone = new Float32Array(frames);
-    const voice = new Float32Array(frames);
-    const noise = new Float32Array(frames);
-    let seed = 7;
-    for (let i = 0; i < frames; i += 1) {
-        const t = i / SAMPLE_RATE;
-        tone[i] = 0.3 * Math.sin(2 * Math.PI * 440 * t);
-        // Syllables: a harmonic stack under an envelope with hard edges every 250 ms.
-        const envelope = (Math.floor(t * 4) % 2 === 0 ? 1 : 0.15) * (0.7 + 0.3 * Math.sin(2 * Math.PI * 1.3 * t));
-        voice[i] = 0.2 * envelope * (Math.sin(2 * Math.PI * 140 * t) + 0.6 * Math.sin(2 * Math.PI * 280 * t)
-            + 0.4 * Math.sin(2 * Math.PI * 420 * t) + 0.3 * Math.sin(2 * Math.PI * 700 * t));
-        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-        noise[i] = 0.3 * (seed / 0x7fffffff - 0.5);
-    }
-    const rms = (x: Float32Array, from: number, to: number) => {
-        let sum = 0;
-        for (let i = from; i < to; i += 1) sum += x[i] * x[i];
-        return Math.sqrt(sum / (to - from));
-    };
-    const decibels = (ratio: number) => 20 * Math.log10(ratio);
-    const follow = (x: Float32Array) => {
-        const out = new Float32Array(x.length);
-        const release = Math.exp(-1 / (SAMPLE_RATE * 0.002));
-        let level = 0;
-        for (let i = 0; i < x.length; i += 1) {
-            level = Math.max(Math.abs(x[i]), level * release);
-            out[i] = level;
-        }
-        return out;
-    };
-    const voiceEnvelope = follow(voice);
-    const skip = 2048;
-    const levels: string[] = [];
-    const shifts: string[] = [];
-    for (const speed of [0.5, 0.75, 1.25, 1.5, 2]) {
-        const rate = 1 / speed;
-        for (const [name, signal, tolerance] of [['tone', tone, 0.5], ['voice', voice, 0.5], ['noise', noise, 6]] as const) {
-            const out = stretchChannel(signal, { sampleRate: SAMPLE_RATE, rate });
-            const delta = decibels(rms(out, skip, out.length - skip) / rms(signal, skip, signal.length - skip));
-            assert.ok(Math.abs(delta) <= tolerance, `${name} at ${speed}x: level changed by ${delta.toFixed(2)} dB`);
-            if (name !== 'noise') levels.push(`${name} ${speed}x ${delta >= 0 ? '+' : ''}${delta.toFixed(2)}`);
-        }
-
-        // The stretched envelope against the input's, laid on the output's timeline.
-        const out = stretchChannel(voice, { sampleRate: SAMPLE_RATE, rate });
-        const outEnvelope = follow(out);
-        const reference = new Float32Array(out.length);
-        for (let i = 0; i < out.length; i += 1) {
-            const position = i / rate;
-            const index = Math.floor(position);
-            reference[i] = index + 1 < voiceEnvelope.length
-                ? voiceEnvelope[index] + (voiceEnvelope[index + 1] - voiceEnvelope[index]) * (position - index)
-                : 0;
-        }
-        const from = Math.floor(out.length * 0.2);
-        const to = Math.floor(out.length * 0.8);
-        let bestLag = 0;
-        let best = -Infinity;
-        for (let lag = -2400; lag <= 2400; lag += 4) {
-            let sum = 0;
-            for (let i = from; i < to; i += 3) {
-                const j = i + lag;
-                if (j >= 0 && j < outEnvelope.length) sum += reference[i] * outEnvelope[j];
-            }
-            if (sum > best) {
-                best = sum;
-                bestLag = lag;
-            }
-        }
-        const ms = (bestLag / SAMPLE_RATE) * 1000;
-        assert.ok(Math.abs(ms) <= 5, `voice at ${speed}x: output shifted by ${ms.toFixed(2)} ms`);
-        shifts.push(`${speed}x ${ms >= 0 ? '+' : ''}${ms.toFixed(1)} ms`);
-    }
-    results.push(`vocoder level: ${levels.join(', ')} dB; noise within 6 dB`);
-    results.push(`vocoder timing: ${shifts.join(', ')}`);
 }
 
 // ---- Fakes for StretchService ------------------------------------------------
@@ -342,10 +203,10 @@ async function testBudgetAndScheduling(): Promise<void> {
     assert.ok(after.usedBytes <= sourceBytes, 'shrinking the budget evicts variants');
     results.push(`budget shrink to ${sourceBytes} B -> ${after.usedBytes} B used, ${after.variantEntries} variant entries left`);
 
-    // Native strategy: no worker, callers get StretchUnavailableError and fall back to playbackRate.
-    const native = StretchService.forStrategy(nativeStretcher);
-    await assert.rejects(native.ensureVariant(fakeContext, source, 1.5), StretchUnavailableError);
-    results.push('native strategy: ensureVariant rejects with StretchUnavailableError (Track falls back to playbackRate)');
+    // A strategy without a worker: callers get StretchUnavailableError and fall back to playbackRate.
+    const none = StretchService.forStrategy({ id: 'no-worker', createWorker: () => null });
+    await assert.rejects(none.ensureVariant(fakeContext, source, 1.5), StretchUnavailableError);
+    results.push('a strategy without a worker: ensureVariant rejects with StretchUnavailableError (Track falls back to playbackRate)');
 
     // Speculative renders must fit beside what the cache already holds: with one
     // variant in the cache, only the headroom left over is spent on another clip's.
@@ -429,8 +290,6 @@ async function testWorkerFailures(): Promise<void> {
 }
 
 await testLengths();
-testLeanMatchesFast();
-testLevelAndTiming();
 await testBudgetAndScheduling();
 await testWorkerFailures();
 console.log(results.map((line) => `  ok  ${line}`).join('\n'));

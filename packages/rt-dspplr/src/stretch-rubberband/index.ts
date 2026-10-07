@@ -39,9 +39,10 @@ function createRubberbandWorker(): Worker {
 }
 
 /**
- * Rubber Band (R3 "finer" engine) in a module worker. Higher quality than the
- * built-in vocoder, about 265 KB of WASM, loaded on first use.
- * Falls back to the built-in vocoder per job if the WASM cannot be loaded.
+ * Rubber Band (R3 "finer" engine) in a module worker, rendering each speed of a
+ * whole clip offline (about 265 KB of WASM, loaded on first use), in place of the
+ * built-in realtime stretch. Where the WASM cannot be loaded, that speed plays by
+ * playbackRate (the pitch follows the speed). Prepared clips keep the realtime stretch.
  *
  *   import { rubberbandStretcher } from '@saitdigital/rt-dspplr/stretch-rubberband';
  *   createAudioPlayer({ stretcher: rubberbandStretcher() });

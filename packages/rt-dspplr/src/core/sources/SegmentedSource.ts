@@ -12,6 +12,7 @@ import { decodePeaksFile, peaksToPyramid, readLevel, type PeaksFile } from '../s
 import { SegmentScheduler } from '../stream/SegmentScheduler';
 import { SegmentStore, type SegmentStoreStats } from '../stream/SegmentStore';
 import { loadStreamEngine, StreamEngine, type EngineReport } from '../engine/StreamEngine';
+import { engineWindow } from '../engine/engineWindow';
 import { decodeSpectrogramFile, toSpectralPyramid, type SpectrogramFile } from '../stream/spectrogramFile';
 import type { PlaybackSource, SourceCapabilities, SourceHost, StemSummary } from './types';
 
@@ -64,8 +65,6 @@ export interface SegmentedOptions {
      * AudioWorklet) falls back to AudioBufferSourceNodes on the context clock.
      */
     engine?: boolean;
-    /** Realtime stretch in the engine (Signalsmith Stretch). Default true. */
-    realtimeStretch?: boolean;
     /**
      * Opt-in, for hosts that publish a manifest before its stem is made: while
      * the active stem says 'processing', re-read the manifest this often (ms) and show
@@ -1116,7 +1115,8 @@ export class SegmentedSource implements PlaybackSource {
         if (this._options.engine === false) return;
         // The engine runs at the clip's rate (the stretcher too) and resamples its output
         // to the context's when they differ: a 44.1 or 16 kHz clip keeps realtime speed.
-        const stretch = this._options.realtimeStretch !== false;
+        // The player's `stretcher`: 'native' turns the stretch off (an offline strategy is for whole clips).
+        const stretch = this._host.options.stretcher !== 'native';
         const loaded = await loadStreamEngine(ctx, stretch);
         // Another clip was asked for while the module loaded: that load makes its own engine.
         if (!loaded || loadId !== this._loadId) return;
@@ -1232,41 +1232,16 @@ export class SegmentedSource implements PlaybackSource {
     /** Segments the engine should hold: playing (+ the one before, for the stretcher's history), ahead, loop, on screen. */
     private _wantedEngine(frame: number): number[] {
         const m = this._manifest;
-        const scheduler = this._scheduler;
-        if (!m || !scheduler) return [];
-        const out: number[] = [];
-        const add = (i: number) => {
-            if (i >= 0 && i < m.segments.list.length && !out.includes(i)) out.push(i);
-        };
-        const current = scheduler.segmentAt(Math.min(m.frames - 1, Math.max(0, Math.floor(frame))));
-        add(current);
-        const historyFrames = Math.max(this._eng?.stretch.latencyFrames ?? 0, 0.25 * m.sampleRate);
-        if (frame - m.segments.list[current].startFrame < historyFrames) add(current - 1);
+        if (!m) return [];
+        const starts = [...m.segments.list.map((s) => s.startFrame), m.frames];
         const loop = this._state.loop;
-        const loopFrames = loop ? { start: this._frameOf(loop.start), end: this._frameOf(loop.end) } : null;
-        let cursor = m.segments.list[current].startFrame + m.segments.list[current].frames;
-        const ahead = Math.max(1, this._options.prefetchSegments ?? 2);
-        for (let k = 0; k < ahead; k += 1) {
-            if (loopFrames && frame < loopFrames.end && cursor >= loopFrames.end) cursor = loopFrames.start;
-            if (cursor >= m.frames) {
-                if (!loopFrames) break;
-                cursor = loopFrames.start;
-            }
-            const i = scheduler.segmentAt(cursor);
-            add(i);
-            cursor = m.segments.list[i].startFrame + m.segments.list[i].frames;
-        }
-        if (loopFrames && loopFrames.end > loopFrames.start) {
-            // Both ends of the loop, as far as the engine reads across the wrap: its look-ahead
-            // past the end continues at the start, its history behind the start is the end.
-            const margin = historyFrames * Math.max(1, this._state.processing.speed);
-            const span = (from: number, to: number) => {
-                for (let i = scheduler.segmentAt(from); i <= scheduler.segmentAt(to); i += 1) add(i);
-            };
-            span(loopFrames.start, Math.min(loopFrames.end - 1, loopFrames.start + margin));
-            span(Math.max(loopFrames.start, loopFrames.end - margin), loopFrames.end - 1);
-        }
-        for (const i of this._visible) add(i);
+        const out = engineWindow(starts, frame, {
+            loop: loop ? { start: this._frameOf(loop.start), end: this._frameOf(loop.end) } : null,
+            ahead: this._options.prefetchSegments ?? 2,
+            historyFrames: Math.max(this._eng?.stretch.latencyFrames ?? 0, 0.25 * m.sampleRate),
+            speed: this._state.processing.speed,
+        });
+        for (const i of this._visible) if (!out.includes(i)) out.push(i);
         return out;
     }
 

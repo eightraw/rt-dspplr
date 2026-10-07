@@ -111,6 +111,20 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
 
 ### Changed
 
+- **Whole clips play through the stream engine too**, cut into 5-second pieces
+  around the playhead: speed changes at once, keeping the pitch, with the same
+  tonal/atonal realtime stretch as prepared clips; stem B is read beside A in the
+  engine. `stretcher` is now `'realtime'` (default), `'native'` (the pitch
+  follows the speed, for both kinds of clip) or an offline strategy such as
+  `rubberbandStretcher()`, with which a whole clip plays on AudioBufferSourceNodes
+  and renders each speed as before. Where the AudioWorklet cannot run, whole clips
+  play on AudioBufferSourceNodes, the pitch following the speed.
+- **The built-in phase vocoder is gone** (`vocoderStretcher`, `nativeStretcher`,
+  `VocoderMemory`, and `stretchChannel` / `stretchMultichannel` in `./advanced`):
+  it lost to the realtime stretch in blind listening, and spread the stereo image
+  apart. The Rubber Band worker no longer falls back to it: a speed it cannot render
+  plays by `playbackRate`. `segmented.realtimeStretch` is replaced by
+  `stretcher: 'native'`.
 - `./advanced` keeps the 0.3.0 surface (Track, Mixer, AudioEngine, BufferLoader,
   StretchService, WaveformAnalyzer, TimelineCore / mountTimeline, peak-pyramid and
   spectrogram helpers, DSP building blocks) and adds the types and plugin API of the
