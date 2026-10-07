@@ -19,6 +19,8 @@ export interface EngineReport {
     underruns: number;
     underrunFrames: number;
     stretching: boolean;
+    /** The last block stretched the tonal and atonal parts apart (the split is in). */
+    splitting: boolean;
     /** The last transport message (play / pause / seek) the engine has landed. */
     seq: number;
 }
@@ -50,15 +52,22 @@ export function loadStreamEngine(ctx: BaseAudioContext, stretch = true): Promise
         enginesLoaded.set(ctx, engine);
     }
     if (stretch && !stretchLoaded.has(ctx) && ctx.audioWorklet) {
-        // Its own chunk (~100 KB of WASM): fetched only when a prepared clip plays.
-        const loading = import('../../vendor/signalsmithStretch').then(async ({ default: code }) => {
+        const add = async (code: string) => {
             const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
             try {
                 await ctx.audioWorklet.addModule(url);
-                return true;
             } finally {
                 URL.revokeObjectURL(url);
             }
+        };
+        // Their own chunks (~100 KB and ~25 KB of WASM): fetched only when a prepared clip plays.
+        const loading = import('../../vendor/signalsmithStretch').then(async ({ default: code }) => {
+            await add(code);
+            // The tonal/atonal split: without it the mix is stretched whole.
+            await import('../../vendor/rtdSplit').then(({ default: split }) => add(split)).catch((error: unknown) => {
+                console.warn('[StreamEngine] the stretch split is unavailable; the mix is stretched whole', error);
+            });
+            return true;
         }).catch((error: unknown) => {
             console.warn('[StreamEngine] realtime stretch unavailable; speed falls back to resampling', error);
             return false;
@@ -76,7 +85,7 @@ export function stretchAvailable(ctx: BaseAudioContext): Promise<boolean> {
 export class StreamEngine {
     readonly node: AudioWorkletNode;
     private readonly _ctx: BaseAudioContext;
-    private _report: EngineReport = { position: 0, frame: 0, playing: false, stalled: false, underruns: 0, underrunFrames: 0, stretching: false, seq: 0 };
+    private _report: EngineReport = { position: 0, frame: 0, playing: false, stalled: false, underruns: 0, underrunFrames: 0, stretching: false, splitting: false, seq: 0 };
     private _seq = 0;
     /** The speed. */
     private _rate = 1;

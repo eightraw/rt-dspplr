@@ -9,7 +9,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = path.join(root, 'node_modules', '.cache', 'rtd-test');
 fs.mkdirSync(outDir, { recursive: true });
 
-for (const name of ['stretch', 'dynamics', 'ruler', 'manifest-schema']) {
+for (const name of ['stretch', 'dynamics', 'ruler', 'manifest-schema', 'split']) {
     const outFile = path.join(outDir, `${name}.test.mjs`);
     await build({
         entryPoints: [path.join(root, `test/${name}.test.ts`)],

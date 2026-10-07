@@ -432,10 +432,16 @@ useEffect(() => { void p.load({ manifest }); }, [manifest]);
 - A manifest's files must be `http(s)` URLs, relative to it or absolute (a CDN).
   `fetchOptions` headers and credentials go only to the manifest's origin and to
   those in `fetchOptionsOrigins`; files elsewhere are fetched without them.
-- Speed keeps the pitch through a realtime stretcher in the stream engine
+- Speed keeps the pitch through a realtime stretch in the stream engine
   (AudioWorklet), which runs at the clip's rate and converts to the context's.
-  Without it pitch follows speed and `capabilities.canPreservePitch` says so (the
-  card shows it).
+  Each stem is split into a tonal part (held notes) and an atonal one (attacks,
+  noise) by median filtering of its spectrum: Signalsmith Stretch stretches the
+  tonal part smoothly, a short overlap-add the atonal one, so an attack is played
+  once and stays sharp instead of being smeared or doubled. The split looks a few
+  hundred milliseconds ahead in the clip's audio, which costs no latency; after a
+  jump it is ready within a few milliseconds. About 1 % of a core per stem on a
+  desktop, Signalsmith about 3 %. Without the stretcher pitch follows speed and
+  `capabilities.canPreservePitch` says so (the card shows it).
 - Options under `segmented`: `cacheSeconds`, `prefetchSegments`, `engine`,
   `realtimeStretch`, `pollStemsMs`. `player.getStreamStats()` reports cache,
   fetches and latencies.
@@ -715,16 +721,16 @@ peaks worker (~8 KB), the spectrogram worker (~7 KB), the overview
 preview worker of prepared clips (~6 KB) and the stream engine AudioWorklet
 of prepared clips (~10 KB). The realtime stretcher of prepared clips
 (Signalsmith Stretch, MIT, ~100 KB of WASM; its notice is in the chunk and in
-THIRD_PARTY_NOTICES.md) is a separate chunk, loaded by a
-dynamic `import()` only when a prepared clip plays. Each is started from
+THIRD_PARTY_NOTICES.md) and its tonal/atonal split (our own, ~18 KB of WASM) are
+separate chunks, loaded by a dynamic `import()` only when a prepared clip plays. Each is started from
 a `blob:` URL the first time it is needed. No extra files, loaders, or `new URL()` patterns are involved. The
 same build is verified in Vite (dev and build) and webpack 5. Nothing in it is
 bundler-specific, so other ESM bundlers should behave the same.
 
 With a Content-Security-Policy, allow `blob:` in `worker-src` (workers) and
 `script-src` (the AudioWorklet modules), and `'wasm-unsafe-eval'` in `script-src`
-for the realtime stretcher of prepared clips (it compiles its WASM in the
-AudioWorklet). If they are blocked, the player still works: DSP falls back to
+for the realtime stretcher of prepared clips (it compiles its WASM, and the
+split's, in the AudioWorklet). If they are blocked, the player still works: DSP falls back to
 native nodes, speed to `playbackRate` (prepared clips: resampling, the pitch
 follows), and the waveform and the spectrogram stay empty. A warning is logged, also when a
 worker fails after it started.
