@@ -207,10 +207,11 @@ const sameSamples = (a: Float32Array[], b: Float32Array[]) => maxDiff(a, b) === 
 
 /**
  * A FLAC stream of the channels quantized as encodeWav() does: verbatim subframes (FLAC's
- * uncompressed form, every decoder reads it), fixed block size; optionally an ID3v2 tag in
+ * uncompressed form, every decoder reads it), fixed block size, or with `variable` block sizes
+ * that cycle through those given (frames then carry sample numbers); optionally an ID3v2 tag in
  * front and a padding block of `padding` bytes among the metadata.
  */
-function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, blockSize: number, extra: { id3?: number; padding?: number } = {}): Uint8Array {
+function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, blockSize: number, extra: { id3?: number; padding?: number; variable?: number[] } = {}): Uint8Array {
     const C = channels.length;
     const frames = channels[0].length;
     const full = 2 ** (bits - 1);
@@ -226,7 +227,10 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
     }
     put(0x66, 0x4c, 0x61, 0x43);
     put(extra.padding ? 0 : 0x80, 0, 0, 34); // STREAMINFO
-    put(blockSize >> 8, blockSize, blockSize >> 8, blockSize, 0, 0, 0, 0, 0, 0);
+    const sizes = extra.variable ?? [blockSize];
+    const min = Math.min(...sizes);
+    const max = Math.max(...sizes);
+    put(min >> 8, min, max >> 8, max, 0, 0, 0, 0, 0, 0);
     // rate (20 bits), channels − 1 (3), bits − 1 (5), total frames (36), then a zero MD5
     put(rate >> 12, rate >> 4, ((rate & 15) << 4) | ((C - 1) << 1) | ((bits - 1) >> 4), (((bits - 1) & 15) << 4) | Math.floor(frames / 2 ** 32), frames >>> 24, frames >>> 16, frames >>> 8, frames);
     for (let i = 0; i < 16; i += 1) put(0);
@@ -235,13 +239,18 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
         put(0x81, n >> 16, n >> 8, n);
         for (let i = 0; i < n; i += 1) put(0);
     }
-    for (let f = 0, start = 0; start < frames; f += 1, start += blockSize) {
-        const n = Math.min(blockSize, frames - start);
-        const frame: number[] = [0xff, 0xf8, 0x70, (C - 1) << 4];
-        // frame number, UTF-8 coded
-        if (f < 0x80) frame.push(f);
-        else if (f < 0x800) frame.push(0xc0 | (f >> 6), 0x80 | (f & 63));
-        else frame.push(0xe0 | (f >> 12), 0x80 | ((f >> 6) & 63), 0x80 | (f & 63));
+    // The frame's coded number, UTF-8 style: n continuation bytes hold 5n + 6 bits.
+    const utf8 = (v: number): number[] => {
+        if (v < 0x80) return [v];
+        let n = 1;
+        while (v >= 2 ** (5 * n + 6)) n += 1;
+        const bytes: number[] = [];
+        for (let k = 0; k < n; k += 1) { bytes.unshift(0x80 | (v % 64)); v = Math.floor(v / 64); }
+        return [((0xff << (7 - n)) & 0xff) | v, ...bytes];
+    };
+    for (let f = 0, start = 0; start < frames; f += 1) {
+        const n = Math.min(sizes[f % sizes.length], frames - start);
+        const frame: number[] = [0xff, extra.variable ? 0xf9 : 0xf8, 0x70, (C - 1) << 4, ...utf8(extra.variable ? start : f)];
         frame.push((n - 1) >> 8, (n - 1) & 255);
         frame.push(crc8(frame));
         for (let c = 0; c < C; c += 1) {
@@ -255,6 +264,7 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
         const crc = crc16(frame);
         frame.push(crc >> 8, crc & 255);
         put(...frame);
+        start += n;
     }
     return Uint8Array.from(out);
 }
@@ -276,25 +286,46 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
         assert.equal(fromFlac.format.bitsPerSample, bits, name);
         assert.deepEqual(fromFlac.channels, fromWav.channels, `${name}: the same samples as the WAV`);
     }
-    // prepare from FLAC (not indexed: kept as a 16-bit WAV of its samples) writes the analyses it
-    // writes from the same samples in a WAV, and both play the same samples.
+    // prepare from FLAC keeps the file as it is, indexed by its frames (fixed block sizes count
+    // frames, variable ones samples), every segment reading back the decoder's samples; and it
+    // writes the analyses it writes from the same samples in a WAV.
     const flac = encodeFlac(src, rate, 16, 4096);
     const viaFlac = await prepareMemory(flac, { segmentSeconds: 1 });
     const viaWav = await prepareMemory(encodeWav(src, rate, { tag: 1, bits: 16 }), { segmentSeconds: 1 });
-    assert.equal(viaFlac.manifest.source.encoding, 'flac');
-    assert.equal(viaFlac.manifest.segments.source.url, 'source.wav');
-    assert.equal(viaFlac.manifest.segments.source.codec, 'wav');
     const keys = [...viaWav.storage.objects.keys()].filter((k) => k !== 'manifest.json' && k !== 'source.wav').sort();
-    assert.deepEqual([...viaFlac.storage.objects.keys()].filter((k) => k !== 'manifest.json' && k !== 'source.wav').sort(), keys);
+    assert.deepEqual([...viaFlac.storage.objects.keys()].filter((k) => k !== 'manifest.json' && k !== 'source.flac').sort(), keys);
     for (const k of keys) assert.ok(Buffer.from(viaFlac.storage.objects.get(k)!).equals(Buffer.from(viaWav.storage.objects.get(k)!)), `${k}: FLAC and WAV prepare alike`);
     assert.ok(sameSamples(await timelineAt(viaFlac.storage, viaFlac.manifest.segments, 2), await timelineAt(viaWav.storage, viaWav.manifest.segments, 2)), 'FLAC and WAV play the same samples');
+    const kept: Array<[string, Uint8Array]> = [
+        ['fixed block size', flac],
+        ['variable block sizes, 24-bit, ID3 tag', encodeFlac(src, rate, 24, 0, { id3: 300, variable: [4096, 1152, 576, 4608, 192] })],
+    ];
+    for (const [name, bytes] of kept) {
+        const { manifest: m, storage, job } = bytes === flac ? viaFlac : await prepareMemory(bytes, { segmentSeconds: 0.3 });
+        assert.equal(m.source.encoding, 'flac', name);
+        assert.equal(m.segments.source.url, 'source.flac', name);
+        assert.equal(m.segments.source.codec, 'flac', name);
+        assert.ok(Buffer.from(storage.objects.get('source.flac')!).equals(Buffer.from(bytes)), `${name}: kept byte for byte`);
+        assert.deepEqual(job.stats!.warnings, [], name);
+        // What a run is decoded after: fLaC and the STREAMINFO, the last metadata block; a run is
+        // not the stream, so its total samples and MD5 are unknown (0).
+        const header = Buffer.from(m.segments.source.header!, 'base64');
+        assert.equal(header.length, 42, name);
+        assert.equal(header.toString('latin1', 0, 4), 'fLaC', name);
+        assert.equal(header[4], 0x80, name);
+        assert.ok((header[8 + 13] & 15) === 0 && header.subarray(8 + 14).every((b) => b === 0), `${name}: total samples and MD5 unknown`);
+        assert.ok(m.segments.list.every((seg) => seg.range && seg.range[1] - seg.range[0] < bytes.length), `${name}: ranges`);
+        const { channels } = await decodeAll(builtinDecoder, chunks(bytes, 7, 65536));
+        assert.equal(maxDiff(await timelineAt(storage, m.segments, 2), channels), 0, `${name}: every segment reads back the decoder's samples`);
+        assert.doesNotThrow(() => assertManifest(JSON.parse(JSON.stringify(m))), name);
+    }
     // A stream cut short after its header fails, it is not taken for a shorter one.
     await assert.rejects(decodeAll(builtinDecoder, chunks(flac.subarray(0, Math.floor(flac.length * 0.6)))), /FLAC stream is broken/);
     // Formats the built-in decoder does not read name the decoder hook; a broken FLAC says FLAC.
     await assert.rejects(decodeAll(builtinDecoder, chunks(new TextEncoder().encode('OggS\0\u0002 this is an ogg, honest'))), /not WAV, MP3, Opus or FLAC.*decoder/s);
     await assert.rejects(decodeAll(builtinDecoder, chunks(new TextEncoder().encode('fLaC\0\0\0"this is not a flac at all'))), /FLAC/);
     await assert.rejects(decodeAll(builtinDecoder, chunks(new Uint8Array(0))), /empty/);
-    results.push(`FLAC in process: ${cases.map((c) => c[0]).join('; ')}: the WAV's samples exactly; prepare writes the same ${keys.length} analysis files and keeps a WAV that plays the same samples; cut and foreign streams refused`);
+    results.push(`FLAC in process: ${cases.map((c) => c[0]).join('; ')}: the WAV's samples exactly; prepare writes the same ${keys.length} analysis files as from a WAV and keeps the FLAC as it is (${kept.map((c) => c[0]).join('; ')}), every segment reading back exactly; cut and foreign streams refused`);
 }
 
 {
@@ -1073,26 +1104,28 @@ function checkManifest(m: unknown, name: string): void {
 }
 
 {
-    // A stem the player reads as it is (an MP3 at A's rate, as a byte stream: spooled) is kept
-    // byte for byte, its index shifted by the offset: every segment reads back the decoder's
+    // A stem the player reads as it is (an MP3 or a FLAC at A's rate, as a byte stream: spooled) is
+    // kept byte for byte, its index shifted by the offset: every segment reads back the decoder's
     // samples, shifted, with silence where the stem has none (lead at the start, trail at the end).
     const fixtures = new URL('../../../test/fixtures/', import.meta.url);
     const mp3 = new Uint8Array(fs.readFileSync(new URL('sine-speech.mp3', fixtures)));
-    const decodedB = (await decodeAll(builtinDecoder, chunks(mp3))).channels;
     const rate = 44100;
+    const flacB = encodeFlac((await decodeAll(builtinDecoder, chunks(mp3))).channels.map((c) => Float64Array.from(c)), rate, 16, 4096);
     const notes: string[] = [];
+    for (const [codec, bytesB] of [['mp3', mp3], ['flac', flacB]] as const) {
+    const decodedB = (await decodeAll(builtinDecoder, chunks(bytesB))).channels;
     for (const shift of [-2205, 1323]) {
         // A[t] = B[t + shift]: B is `shift` frames late against A.
         const at = (c: Float32Array, t: number) => (t >= 0 && t < c.length ? c[t] : 0);
         const a = decodedB.map((c) => Float64Array.from({ length: c.length }, (_, t) => at(c, t + shift)));
         const storage = memoryStorage();
-        const job = prepareAudio(chunks(encodeWav(a, rate, { tag: 1, bits: 16 }), 3, 65536), { storage, concurrency: 1, segmentSeconds: 0.5, stems: { b: { input: () => chunks(mp3, 5, 4096) } } });
+        const job = prepareAudio(chunks(encodeWav(a, rate, { tag: 1, bits: 16 }), 3, 65536), { storage, concurrency: 1, segmentSeconds: 0.5, stems: { b: { input: () => chunks(bytesB, 5, 4096) } } });
         const m = await job.done;
         const b = m.stems!.b!;
         assert.equal(b.status, 'ready');
         assert.equal(b.alignment!.offsetFrames, shift);
-        assert.equal(b.segments!.source.url, 'b/r1/source.mp3');
-        assert.ok(Buffer.from(storage.objects.get('b/r1/source.mp3')!).equals(Buffer.from(mp3)), 'kept byte for byte');
+        assert.equal(b.segments!.source.url, `b/r1/source.${codec}`);
+        assert.ok(Buffer.from(storage.objects.get(`b/r1/source.${codec}`)!).equals(Buffer.from(bytesB)), `${codec}: kept byte for byte`);
         assert.deepEqual(job.stats!.warnings, []);
         const list = b.segments!.list;
         if (shift < 0) assert.equal(list[0].lead, -shift);
@@ -1106,12 +1139,13 @@ function checkManifest(m: unknown, name: string): void {
             }
         }
         const want = decodedB.map((c) => Float32Array.from({ length: m.frames }, (_, t) => at(c, t + shift)));
-        assert.ok(sameSamples(await timelineAt(storage, b.segments!, 2), want), `shift ${shift}: B's segments read back shifted`);
+        assert.ok(sameSamples(await timelineAt(storage, b.segments!, 2), want), `${codec}, shift ${shift}: B's segments read back shifted`);
         assert.ok(b.correlation!.global > 0.99, `ρ ${b.correlation!.global}`);
-        checkManifest(m, `mp3 stem kept, shift ${shift}`);
-        notes.push(`${shift} frames (${shift < 0 ? 'lead' : 'trail'} ${Math.abs(shift)})`);
+        checkManifest(m, `${codec} stem kept, shift ${shift}`);
+        notes.push(`${codec} ${shift} frames (${shift < 0 ? 'lead' : 'trail'} ${Math.abs(shift)})`);
     }
-    results.push(`stem kept as it is: an MP3 at A's rate stored byte for byte, its index shifted by the measured offset (${notes.join(', ')}); every segment reads back the decoder's samples`);
+    }
+    results.push(`stem kept as it is: an MP3 and a FLAC at A's rate stored byte for byte, the index shifted by the measured offset (${notes.join(', ')}); every segment reads back the decoder's samples`);
 }
 
 {

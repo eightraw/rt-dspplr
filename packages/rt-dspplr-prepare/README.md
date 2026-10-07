@@ -132,23 +132,26 @@ published shorter than it is.
 
 ### The source and its index
 
-WAV, MP3 and Ogg Opus (mono or stereo) are kept as they are. The index is
+WAV, MP3, Ogg Opus (mono or stereo) and FLAC are kept as they are. The index is
 checked before it is published: the first segment, one past the middle and the
 last are read back the player's way and compared with what was decoded, and for
 an MP3 also the segment whose run reaches back furthest, against the same
 segment from a run that starts much earlier. A file whose index does not read
 back right (a damaged or unusual stream) is kept as a 16-bit WAV of what was
-decoded instead, with a warning in `job.stats.warnings`; so is FLAC (not indexed
-yet), and anything read through `ffmpegDecoder()` or a decoder of your own.
+decoded instead, with a warning in `job.stats.warnings`; so is anything read
+through `ffmpegDecoder()` or a decoder of your own.
 
 | Source | A segment's run | Read back |
 |---|---|---|
 | WAV | its frames of the `data` chunk | exact |
 | MP3 | whole frames, from where the bit reservoir (511 bytes of main data, 255 for MPEG-2) is full two frames before the segment's: 6 frames from about 80 kbit/s (MPEG-1 stereo), 12 at 32 kbit/s and 48 kHz, around 50 in the silence of a VBR -V9 file | exact |
 | Opus | whole Ogg pages, from a packet at least 500 ms before the segment (the decoder converges) | within float rounding (about −140 dB) |
+| FLAC | whole frames, from the frame of the segment's first sample (frames decode on their own), after the stream's `fLaC` and STREAMINFO | exact |
 
 The fetch overhead is that warm-up and the page or frame granularity: about 2 %
-for MP3 and 10–20 % for Opus with 1 s pages at 10 s segments.
+for MP3 and for FLAC (4096-sample frames), 10–20 % for Opus with 1 s pages at
+10 s segments. Indexing a FLAC reads it once for its frame headers: 50 ms for
+46 MB.
 
 ### ffmpeg
 
@@ -209,7 +212,7 @@ Each stem takes exactly one of `input` (a path, a byte-stream factory, or
    A's rate on the worker pool, mapped onto A's channels, padded or trimmed to A's length.
 3. **Writes** it on A's segment grid under `<key>/r<revision>/`: the stem's own
    file with an index shifted by the offset when the player reads it as it is
-   (WAV, MP3 or Opus at A's rate, with A's channels or one), else a 16-bit WAV
+   (WAV, MP3, Opus or FLAC at A's rate, with A's channels or one), else a 16-bit WAV
    of the adapted stem; its own
    peaks (at A's finest level), bands and spectrogram; and records the correlation with A, the mix law
    (`crossfade` for a correlated pair, else `equal-power`), and its loudness
@@ -378,7 +381,7 @@ Validation and the binary formats are in `@saitdigital/rt-dspplr/format`
 
 ## Limitations
 
-- A source kept as a WAV (FLAC, formats read through a decoder of yours, a file
+- A source kept as a WAV (formats read through a decoder of yours, a file
   whose index did not read back) is rounded to 16 bits without dither.
 - RF64 (WAV over 4 GB) is not supported.
 - Opus with more than two channels (mapping family 1) is kept as a WAV.

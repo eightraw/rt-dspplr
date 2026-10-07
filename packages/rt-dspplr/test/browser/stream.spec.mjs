@@ -1,7 +1,7 @@
 // Prepared (manifest) clips on the one player core, and the same transport
 // suite on both sources. Fixtures from long-fixtures.mjs: stereo70 (70 s
 // stereo, 10 s segments) and mono30 (30 s mono, 3 s segments), each also as
-// the source WAV for the whole-clip source; mp3clip and opusclip (2 s, 0.5 s
+// the source WAV for the whole-clip source; mp3clip, opusclip and flacclip (2 s, 0.5 s
 // segments) with the decoder's samples beside them.
 import { test, expect } from '@playwright/test';
 
@@ -211,7 +211,7 @@ test('segment boundaries and a loop across one are sample-exact (OfflineAudioCon
     expect(result.loopErr).toBeLessThan(1e-6);
 });
 
-for (const codec of ['mp3', 'opus']) {
+for (const codec of ['mp3', 'opus', 'flac']) {
     test(`a ${codec} source: segments are Range requests of the file, decoded in a worker to the decoder's samples`, async ({ page }) => {
         const ranges = [];
         page.on('request', (req) => { if (req.url().endsWith(`/${codec}clip/source.${codec}`)) ranges.push(req.headers().range ?? ''); });
@@ -232,9 +232,9 @@ for (const codec of ['mp3', 'opus']) {
             return out;
         }, codec);
         expect(r.frames).toBeGreaterThan(r.total / 2);
-        expect(r.rate).toBe(codec === 'mp3' ? 44100 : 48000);
-        // MP3: the same samples; Opus: within float rounding (a run starts with a fresh decoder).
-        expect(r.worst).toBeLessThan(codec === 'mp3' ? 1e-12 : 1e-6);
+        expect(r.rate).toBe(codec === 'opus' ? 48000 : 44100);
+        // MP3 and FLAC: the same samples; Opus: within float rounding (a run starts with a fresh decoder).
+        expect(r.worst).toBeLessThan(codec === 'opus' ? 1e-6 : 1e-12);
         expect(ranges.length).toBeGreaterThan(1);
         expect(ranges.every((h) => /^bytes=\d+-\d+$/.test(h))).toBe(true);
     });
