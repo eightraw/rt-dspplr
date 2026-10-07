@@ -1,5 +1,7 @@
 /// <reference path="../dsp/audioworklet-env.d.ts" />
 
+import { SplitSource, type SplitExports, type SplitState } from './splitSource';
+
 // ---------------------------------------------------------------------------
 // The stream engine: block-based playback of segmented audio in the audio
 // thread. Bundled into a self-contained string at build time.
@@ -8,7 +10,7 @@
 //        │   voices A and B read the same timeline position (lockstep)
 //        ▼
 //   mix (gainA·A + gainB·B, smoothed)  ── rate 1: direct, sample-exact
-//        │                              └─ rate ≠ 1: Signalsmith Stretch (pitch kept)
+//        │                              └─ rate ≠ 1: the stretch (pitch kept),
 //        ▼                                 blended in/out over 20 ms
 //   volume (smoothed) · declick on jumps
 //        │   all of the above at the clip's own rate
@@ -38,6 +40,14 @@
 // window is read through the loop (the samples before the loop start are the
 // end of the loop). Stem mixing happens before the stretcher: one stretcher,
 // A and B can never drift apart.
+//
+// The stretch splits each stem into a tonal and an atonal part first
+// (splitSource.ts, median filtering of the spectrum): Signalsmith stretches the
+// tonal part, whose held notes it keeps smooth, and a short overlap-add (12 ms
+// windows, no search) the atonal one, so an attack is played once and stays
+// sharp instead of being smeared or doubled. The parts of A and B are mixed with
+// the block's gains. Without the split module (or for more than two channels, or
+// where a part's audio is not in memory yet) the mix is stretched whole.
 // ---------------------------------------------------------------------------
 
 declare const currentFrame: number;
@@ -92,6 +102,14 @@ const REPORT_EVERY = 2; // render quanta
 const XFADE_AVERAGE_SECONDS = 0.005;
 /** Render at most this many clip frames at a time (the scratch buffers' size). */
 const BLOCK = 128;
+/** The split's work per block (a grain costs 1, a spectrum 0.25): spread over a few blocks after a jump. */
+const SPLIT_BUDGET = 3;
+/** What a block may add when the parts it needs are not ready while playing (a loop wrap's new region). */
+const SPLIT_BUDGET_EXTRA = 9;
+/** Frames past what a block reads that its spare budget prepares, so new regions are ready in time. */
+const SPLIT_AHEAD = 4096;
+/** Half the atonal part's overlap-add window (the window is 12 ms). */
+const OLA_HALF_SECONDS = 0.006;
 
 /** Zero crossings of the resampler's kernel on each side, at the lower of the two rates. */
 const SINC_ZERO_CROSSINGS = 16;
@@ -286,6 +304,18 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     private readonly mixScratch: Float32Array[];
     private readonly direct: Float32Array[];
     private readonly stretched: Float32Array[];
+    /** Each stem's tonal and atonal parts, once the split module is in (null: the mix is stretched whole). */
+    private split: Record<Stem, SplitSource> | null = null;
+    private splitLoading = false;
+    private splitError = '';
+    private readonly splitBudget = { left: 0 };
+    /** The atonal part's overlap-add: its window, the output frames since the last restart, each sounding window's first source frame. */
+    private readonly olaHalf: number;
+    private readonly olaWindow: Float32Array;
+    private olaOut = 0;
+    private readonly olaStarts = new Map<number, number>();
+    /** Whether the last block used the split (else the overlap-add restarts). */
+    private olaRunning = false;
     /** The clip's rate: the timeline, the ramps and the stretcher all run at it. */
     private readonly clipRate: number;
     private readonly xfAverage: number;
@@ -307,6 +337,10 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         this.mixScratch = Array.from({ length: this.channels }, () => new Float32Array(1));
         this.direct = Array.from({ length: this.channels }, () => new Float32Array(BLOCK));
         this.stretched = Array.from({ length: this.channels }, () => new Float32Array(BLOCK));
+        this.olaHalf = Math.max(4, Math.round(OLA_HALF_SECONDS * this.clipRate));
+        this.olaWindow = new Float32Array(2 * this.olaHalf);
+        // Periodic Hann: two windows half overlapped sum to one.
+        for (let i = 0; i < this.olaWindow.length; i += 1) this.olaWindow[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / this.olaWindow.length);
         this.port.onmessage = (event: MessageEvent<Message>) => {
             const message = event.data;
             if (!this.playing) {
@@ -333,9 +367,12 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         this.stems.b.clear();
         this.invalidate('a');
         this.invalidate('b');
+        this.split?.a.clear();
+        this.split?.b.clear();
         if (!dispose) return;
         this.disposing = true;
         this.stretch = null;
+        this.split = null;
     }
 
     // ---- segments ------------------------------------------------------------------------
@@ -484,6 +521,91 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         });
     }
 
+    /** The split module (added to the scope with the stretcher), one instance per stem. */
+    private ensureSplit(): void {
+        if (this.split || this.splitLoading || this.splitError || this.channels > 2) return;
+        const bytes = (globalThis as unknown as { __rtdSplitWasm?: Uint8Array }).__rtdSplitWasm;
+        if (!bytes) return; // not added (yet): the mix is stretched whole
+        this.splitLoading = true;
+        const imports = { wasi_snapshot_preview1: { random_get: () => 0 } };
+        const make = async (module: WebAssembly.Module, stem: Stem) => {
+            const instance = await WebAssembly.instantiate(module, imports);
+            const x = instance.exports as unknown as SplitExports;
+            x._initialize?.();
+            return new SplitSource(x, this.channels, (frame, channel) => this.sample(stem, frame, channel), (from, to) => this.hasRange(stem, from, to));
+        };
+        WebAssembly.compile(bytes)
+            .then(async (module) => ({ a: await make(module, 'a'), b: await make(module, 'b') }))
+            .then((split) => {
+                this.splitLoading = false;
+                if (!this.disposing) this.split = split;
+            }, (error: unknown) => {
+                this.splitLoading = false;
+                this.splitError = String(error);
+            });
+    }
+
+    /**
+     * The split parts this block's stretch reads (the stretcher's input window and the
+     * overlap-add's windows, through the loop), made ready within the block's budget.
+     */
+    private prepareSplit(start: number, rate: number, n: number, withB: boolean, extra: number): SplitState {
+        const split = this.split!;
+        const st = this.stretch!;
+        const end = Math.round(start + st.outLat * rate + st.inLat);
+        const lo = Math.min(end - st.len - start, -this.olaHalf - 1);
+        const hi = Math.max(end - start, n * rate + this.olaHalf + 1);
+        const frames = (i: number) => this.mapFrame(start, Math.round(start + lo + i));
+        const count = Math.ceil(hi - lo);
+        this.splitBudget.left = SPLIT_BUDGET + extra;
+        let state = split.a.prepare(count, frames, this.splitBudget);
+        if (state === 'ready' && withB) state = split.b.prepare(count, frames, this.splitBudget);
+        if (state !== 'ready') return state;
+        // What is left prepares the frames just ahead (through the loop too), a little each block.
+        const ahead = (i: number) => this.mapFrame(start, Math.round(start + hi + i));
+        if (split.a.prepare(SPLIT_AHEAD, ahead, this.splitBudget) === 'ready' && withB) split.b.prepare(SPLIT_AHEAD, ahead, this.splitBudget);
+        return 'ready';
+    }
+
+    /**
+     * The atonal part, stretched by overlap-add (no search) onto stretched[]: 12 ms windows
+     * every 6 ms of output, each read from the source frame its centre maps to.
+     */
+    private addAtonal(start: number, rate: number, n: number, ga: number, gb: number): void {
+        const split = this.split!;
+        const hs = this.olaHalf;
+        const L = 2 * hs;
+        const w = this.olaWindow;
+        if (!this.olaRunning) {
+            this.olaOut = 0;
+            this.olaStarts.clear();
+        }
+        const o0 = this.olaOut;
+        const firstK = Math.floor((o0 - L + 1 + hs) / hs);
+        const lastK = Math.floor((o0 + n - 1 + hs) / hs);
+        for (let k = firstK; k <= lastK; k += 1) {
+            const oStart = k * hs - hs;
+            let from = this.olaStarts.get(k);
+            if (from === undefined) {
+                from = this.mapFrame(start, Math.round(start + (oStart + hs - o0) * rate)) - hs;
+                this.olaStarts.set(k, from);
+            }
+            const a = Math.max(o0, oStart);
+            const b = Math.min(o0 + n, oStart + L);
+            for (let c = 0; c < this.channels; c += 1) {
+                const dst = this.stretched[c];
+                for (let t = a; t < b; t += 1) {
+                    const i = t - oStart;
+                    const frame = from + i;
+                    const v = split.a.atonal(frame, c) * ga + (gb !== 0 ? split.b.atonal(frame, c) * gb : 0);
+                    dst[t - o0] += v * w[i];
+                }
+            }
+        }
+        for (const k of this.olaStarts.keys()) if (k < firstK) this.olaStarts.delete(k);
+        this.olaOut += n;
+    }
+
     private memory(): ArrayBuffer {
         const mod = this.stretch!.mod;
         return (mod.exports ? mod.exports.memory.buffer : mod.HEAP8!.buffer) as ArrayBuffer;
@@ -506,6 +628,8 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                 this.stems.b.clear();
                 this.invalidate('a');
                 this.invalidate('b');
+                this.split?.a.clear();
+                this.split?.b.clear();
                 break;
             case 'play':
                 if (this.playing) {
@@ -566,6 +690,8 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                 break;
             case 'resetB':
                 this.bFresh = true;
+                // Another stem B: its parts are another stem's.
+                this.split?.b.clear();
                 break;
             case 'dispose':
                 this.disposing = true;
@@ -657,7 +783,25 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         // At 1x the direct path reads whole frames (exact, no interpolation). Rounding moves
         // the playhead by at most half a frame: a step no larger than the signal's own.
         if (unity && this.pos !== Math.floor(this.pos)) this.pos = Math.round(this.pos);
-        const wantStretch = useStretch && this.stayStretched;
+        let wantStretch = useStretch && this.stayStretched;
+        // The split's parts for this block. Still being made after a start or a jump: wait for
+        // them (the start fades in anyway); while playing: stay on the direct path until they
+        // are, then blend in. Its audio not in memory: the mix is stretched whole this block.
+        let splitHere = false;
+        if (wantStretch && this.split) {
+            const withB = this.targetB > 0 || this.gainB.value > 0;
+            let state = this.prepareSplit(this.pos, this.rate, n, withB, 0);
+            // While playing, a block that needs more than its share gets more, once.
+            if (state === 'budget' && !this.snapBlend) state = this.prepareSplit(this.pos, this.rate, n, withB, SPLIT_BUDGET_EXTRA);
+            if (state === 'ready') splitHere = true;
+            else if (state === 'budget') {
+                if (this.snapBlend) {
+                    for (const ch of out) ch.fill(0, offset, offset + n);
+                    return;
+                }
+                wantStretch = false;
+            }
+        }
         if (this.snapBlend) {
             this.blend.snap(wantStretch ? 1 : 0);
             this.snapBlend = false;
@@ -722,17 +866,21 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                 // What leaves the stretcher now was analysed outLat earlier: ask for the input
                 // that many frames (at this rate) ahead, so the output lands on the playhead.
                 const end = Math.round(start + s.outLat * rate + s.inLat);
+                const split = splitHere ? this.split! : null;
                 for (let c = 0; c < this.channels; c += 1) {
                     const buf = new Float32Array(memory, s.inPtr[c], s.len);
                     for (let k = 0; k < s.len; k += 1) {
                         const f = this.mapFrame(start, end - s.len + k);
-                        buf[k] = this.sample('a', f, c) * gaStart + (gbStart !== 0 ? this.sample('b', f, c) * gbStart : 0);
+                        buf[k] = split
+                            ? split.a.tonal(f, c) * gaStart + (gbStart !== 0 ? split.b.tonal(f, c) * gbStart : 0)
+                            : this.sample('a', f, c) * gaStart + (gbStart !== 0 ? this.sample('b', f, c) * gbStart : 0);
                     }
                 }
                 s.mod._seek(s.len, rate);
                 s.mod._process(0, n);
                 const after = this.memory();
                 for (let c = 0; c < this.channels; c += 1) this.stretched[c].set(new Float32Array(after, s.outPtr[c], n));
+                if (split) this.addAtonal(start, rate, n, gaStart, gbStart);
             } catch (error) {
                 // A trap in the stretcher: drop it for good, keep playing by resampling.
                 this.stretch = null;
@@ -795,6 +943,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
             }
         }
         if (this.xfFrom !== null) this.xfFrom = this.blend.settled ? null : this.through(this.xfFrom, n);
+        this.olaRunning = stretched && splitHere;
         this.advance(n * rate);
         if (!this.loop && this.pos >= this.total) {
             this.playing = false;
@@ -831,7 +980,10 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     process(_inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
         const out = outputs[0];
         if (!out || out.length === 0) return !this.disposing;
-        if (this.stretchWanted) this.ensureStretch();
+        if (this.stretchWanted) {
+            this.ensureStretch();
+            this.ensureSplit();
+        }
         const n = out[0].length;
         this.queue.sort((x, y) => (x.frame < 0 ? -1 : x.frame) - (y.frame < 0 ? -1 : y.frame));
         if (this.resampler) {
@@ -865,6 +1017,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
             this.stems.a.clear();
             this.stems.b.clear();
             this.stretch = null;
+            this.split = null;
             this.queue = [];
             return false;
         }
@@ -881,6 +1034,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                 underruns: this.underruns,
                 underrunFrames: this.underrunFrames,
                 stretching: this.blend.value > 0,
+                splitting: this.olaRunning,
                 segmentsA: this.stems.a.size,
                 segmentsB: this.stems.b.size,
             });

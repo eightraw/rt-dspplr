@@ -214,3 +214,63 @@ test('realtime stretch: loop wraps and speed changes stay continuous (no gap, no
     expect(result.delta).toBeLessThan(result.natural * 1.3);
     console.log(`stretch window ${result.latency} frames (${(result.latency / 48).toFixed(0)} ms, compensated by look-ahead); RMS range over wraps and speed moves ${(result.hi - result.lo).toFixed(2)} dB; max step ${result.delta.toFixed(3)} vs ${result.natural.toFixed(3)} natural`);
 });
+
+test('the stretch keeps an attack single: clicks over a held tone at 0.75x, split into tonal and atonal parts', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const sr = 48000;
+        const n = sr * 4;
+        const x = Float32Array.from({ length: n }, (_, i) => 0.15 * Math.sin(2 * Math.PI * 220 * i / sr));
+        const clicks = [];
+        let seed = 3;
+        for (let at = Math.round(0.5 * sr); at < n - sr / 2; at += Math.round(0.3 * sr)) {
+            clicks.push(at);
+            for (let k = 0; k < 240; k += 1) {
+                seed = (seed * 16807) % 2147483647;
+                x[at + k] += (seed / 2147483647 - 0.5) * 1.5 * Math.exp(-k / 30);
+            }
+        }
+        const speed = 0.75;
+        const ctx = new OfflineAudioContext(1, Math.round(n / speed) + sr, sr);
+        await h.internals.loadStreamEngine(ctx, true);
+        await h.internals.stretchAvailable(ctx);
+        const engine = new h.internals.StreamEngine(ctx, { channels: 1, starts: [0, n], stretch: true });
+        engine.node.connect(ctx.destination);
+        engine.feed('a', 0, [x.slice()]);
+        engine.setRate(speed);
+        let splitting = 0;
+        engine.onReport = (report) => { if (report.splitting) splitting += 1; };
+        ctx.suspend(256 / sr).then(async () => {
+            const t = performance.now();
+            while (!engine.stretch.ready && performance.now() - t < 20000) await h.sleep(5);
+            await h.sleep(300);
+            engine.play(0);
+            await settle();
+            ctx.resume();
+        });
+        const out = (await ctx.startRendering()).getChannelData(0);
+        // The first difference keeps the clicks and all but drops the 220 Hz tone; its energy in
+        // 2 ms windows peaks once per click. Peaks closer than 10 ms count as one (an
+        // overlap-add's own 1.5 ms echo fuses with the click; a doubled attack is further apart).
+        const W = 96;
+        const env = [];
+        for (let i = 1; i + W < out.length; i += W) {
+            let s = 0;
+            for (let k = 0; k < W; k += 1) { const d = out[i + k] - out[i + k - 1]; s += d * d; }
+            env.push(s);
+        }
+        const top = Math.max(...env);
+        const peaks = [];
+        for (let k = 1; k < env.length - 1; k += 1) {
+            if (env[k] < 0.05 * top || env[k] < env[k - 1] || env[k] < env[k + 1]) continue;
+            const t = (k * W) / sr;
+            if (peaks.length && t - peaks[peaks.length - 1] < 0.01) continue;
+            peaks.push(t);
+        }
+        const gaps = peaks.slice(1).map((t, i) => t - peaks[i]);
+        return { splitting, peaks: peaks.length, expected: clicks.length, minGap: Math.min(...gaps), maxGap: Math.max(...gaps) };
+    });
+    console.log(`clicks at 0.75x: ${r.peaks} attacks heard for ${r.expected} clicks, spaced ${(r.minGap * 1000).toFixed(0)}-${(r.maxGap * 1000).toFixed(0)} ms (400 ms expected); split on in ${r.splitting} reports`);
+    expect(r.splitting).toBeGreaterThan(0);
+    expect(r.peaks).toBe(r.expected);
+    expect(r.minGap).toBeGreaterThan(0.35);
+});

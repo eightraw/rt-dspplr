@@ -98,7 +98,7 @@ export interface StreamStats extends SegmentStoreStats {
     /** Frames of silence the engine played while waiting for segments. */
     underrunFrames: number;
     /** The realtime stretcher: ready, and its window (input + output latency) in frames. */
-    stretch: { ready: boolean; latencyFrames: number; active: boolean };
+    stretch: { ready: boolean; latencyFrames: number; active: boolean; /** The tonal and atonal parts are stretched apart. */ split: boolean };
 }
 
 const LOOKAHEAD = 0.025;
@@ -235,7 +235,7 @@ export class SegmentedSource implements PlaybackSource {
             fetchesB: this._storeB?.stats().fetches ?? 0,
             underruns: this._eng ? (this._lastReport?.underruns ?? 0) : this._stats.underruns,
             underrunFrames: this._lastReport?.underrunFrames ?? 0,
-            stretch: { ready: !!this._eng?.stretch.ready, latencyFrames: this._eng?.stretch.latencyFrames ?? 0, active: !!this._lastReport?.stretching },
+            stretch: { ready: !!this._eng?.stretch.ready, latencyFrames: this._eng?.stretch.latencyFrames ?? 0, active: !!this._lastReport?.stretching, split: !!this._lastReport?.splitting },
         };
     }
 

@@ -121,7 +121,10 @@ for (const file of walkDist()) {
             if (d.name === 'rtdDecodeOpus' && !/Redistribution and use in source and binary forms/.test(code)) errors.push(`${file} lost the BSD text`);
         }
     }
-    const known = new Set(['signalsmithStretch.ts', ...decoders.map((d) => `${d.name}.ts`)]);
+    // Our own code, built from wasm/split.c (no third-party notice): one chunk.
+    const splitChunks = walkDist().filter((f) => f.startsWith('chunks/rtdSplit-') && f.endsWith('.js'));
+    if (splitChunks.length !== 1) errors.push(`expected one rtdSplit chunk, found ${splitChunks.length}`);
+    const known = new Set(['signalsmithStretch.ts', 'rtdSplit.ts', ...decoders.map((d) => `${d.name}.ts`)]);
     const vendorDir = path.join(root, 'src', 'vendor');
     for (const name of fs.existsSync(vendorDir) ? fs.readdirSync(vendorDir) : []) {
         if (!known.has(name)) errors.push(`src/vendor/${name}: new vendored code needs a notice check in check-dist and THIRD_PARTY_NOTICES.md`);
