@@ -81,6 +81,8 @@ interface Options {
     starts: number[];
     /** The clip's rate (timeline frames per second). Default: the context's. */
     sampleRate?: number;
+    /** The realtime stretch (default true): off, the pitch follows the speed. */
+    stretch?: boolean;
 }
 
 interface WasmStretch {
@@ -103,7 +105,7 @@ interface WasmStretch {
  * long before that. The split module is compiled once.
  */
 const pool: { stretch: WasmStretch[]; split: SplitExports[]; splitModule: Promise<WebAssembly.Module> | null } = { stretch: [], split: [], splitModule: null };
-const POOL_MAX = 4;
+const POOL_MAX = 2;
 
 function giveBack<T>(list: T[], item: T): void {
     if (list.length < POOL_MAX) list.push(item);
@@ -348,6 +350,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         super();
         const o = options.processorOptions;
         this.channels = o.channels;
+        this.stretchWanted = o.stretch !== false;
         this.starts = Float64Array.from(o.starts);
         this.total = o.starts[o.starts.length - 1] ?? 0;
         this.clipRate = o.sampleRate && o.sampleRate > 0 ? o.sampleRate : sampleRate;
@@ -543,7 +546,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         const pooled = pool.stretch.pop();
         if (pooled) {
             try {
-                this.configureStretch(pooled);
+                this.configureStretch(pooled, true);
             } catch (error) {
                 failed(error);
             }
@@ -563,7 +566,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     }
 
     /** A stretcher instance (new, or another engine's) set up for this clip's channels and rate. */
-    private configureStretch(mod: WasmStretch): void {
+    private configureStretch(mod: WasmStretch, reused = false): void {
         // Configured first (a stretcher that never was divides by zero in reset()), then cleared of another clip's audio.
         mod._presetDefault(this.channels, this.clipRate);
         mod._reset();
@@ -580,7 +583,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
             inPtr: Array.from({ length: this.channels }, (_, c) => pointer + bytes * c),
             outPtr: Array.from({ length: this.channels }, (_, c) => pointer + bytes * (c + this.channels)),
         };
-        this.port.postMessage({ type: 'stretch', ready: true, latencyFrames: len, inputLatency: inLat });
+        this.port.postMessage({ type: 'stretch', ready: true, latencyFrames: len, inputLatency: inLat, reused });
     }
 
     /**
@@ -598,7 +601,11 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         }
         this.splitLoading = true;
         const imports = { wasi_snapshot_preview1: { random_get: () => 0 } };
-        pool.splitModule ??= WebAssembly.compile(bytes);
+        // A failed compile is not kept: the next engine tries again.
+        pool.splitModule ??= WebAssembly.compile(bytes).catch((error: unknown) => {
+            pool.splitModule = null;
+            throw error;
+        });
         pool.splitModule
             .then((module) => WebAssembly.instantiate(module, imports))
             .then((instance) => {
@@ -733,6 +740,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                     this.pendingJump = null;
                     this.pos = message.position;
                     this.wrapped = false;
+                    this.olaRunning = false;
                     this.playing = true;
                     this.ended = false;
                     this.stalled = false;
@@ -756,16 +764,23 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                 } else {
                     this.pos = message.position;
                     this.wrapped = false;
+                    this.olaRunning = false;
                     this.seq = message.seq;
                 }
                 break;
-            case 'loop':
+            case 'loop': {
+                const was = this.loop;
                 this.loop = message.start === null ? null : { start: message.start, end: message.end };
-                if (!this.loop) this.wrapped = false;
+                const loop = this.loop;
+                // A loop moved away from the playhead is entered from before it, not wrapped
+                // into; one edited around the playhead keeps what came before it.
+                const moved = !loop || !was || loop.start !== was.start || loop.end !== was.end;
+                if (moved && !(loop && this.pos >= loop.start && this.pos < loop.end)) this.wrapped = false;
                 // The split near the loop's edges is the loop's audio there.
                 this.split?.a.setLoop(this.loop);
                 this.split?.b.setLoop(this.loop);
                 break;
+            }
             case 'rate':
                 this.rate = message.rate > 0 ? message.rate : 1;
                 break;
@@ -820,6 +835,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         if (message.type === 'seek' || message.type === 'play') {
             this.pos = message.position;
             this.wrapped = false;
+            this.olaRunning = false;
             this.ended = false;
             this.stalled = false;
             this.starting = true;
@@ -1090,7 +1106,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     process(_inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
         const out = outputs[0];
         if (!out || out.length === 0) return !this.disposing;
-        if (this.stretchWanted) {
+        if (this.stretchWanted && !this.disposing) {
             this.ensureStretch();
             this.ensureSplit();
         }
@@ -1123,11 +1139,8 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         }
 
         if (this.disposing && !this.playing) {
-            // Faded out: let go of the audio and the stretcher, and stop being processed.
-            this.stems.a.clear();
-            this.stems.b.clear();
-            this.stretch = null;
-            this.split = null;
+            // Faded out: let go of the audio, give the instances to the next engine, and stop being processed.
+            this.release(true);
             this.queue = [];
             return false;
         }

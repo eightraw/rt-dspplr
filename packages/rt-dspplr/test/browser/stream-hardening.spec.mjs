@@ -1,11 +1,11 @@
 // Prepared clips against hosts, servers and manifests that misbehave: a resume
-// raced by a pause or a seek while the clip is set up; servers that ignore
-// Range requests or serve another file; manifests that name other origins or
-// schemes, or that a refresh replaces with another recording; a source that
-// decodes to another rate than its manifest says; loads superseded while their
-// overview files are on the way. Fixtures from long-fixtures.mjs: mono30
-// (30 s mono, 3 s segments), stereo70 (70 s stereo, 10 s segments), mp3clip
-// (2 s, 44.1 kHz).
+// raced by a pause or a seek while the clip is set up, and a loop set then;
+// servers that ignore Range requests or serve another file; manifests that
+// name other origins or schemes, or that a refresh replaces with another
+// recording; a source that decodes to another rate than its manifest says;
+// loads superseded while their overview files are on the way. Fixtures from
+// long-fixtures.mjs: mono30 (30 s mono, 3 s segments), stereo70 (70 s stereo,
+// 10 s segments), mp3clip (2 s, 44.1 kHz).
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -124,6 +124,36 @@ test('resume() while the clip is set up, then seek(): playback starts at the see
     expect(r.startPoint).toBeCloseTo(1.5, 3);
     expect(r.time).toBeGreaterThanOrEqual(1.49);
     expect(r.time).toBeLessThan(3);
+});
+
+test('a loop set while a prepared clip is set up is in place once it plays', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const { player } = mk();
+        let set = false;
+        // Before the manifest is in: the loop goes into the state only, for now.
+        const off = player.subscribe(() => {
+            if (set || player.getState().status !== 'loading') return;
+            set = true;
+            player.setLoop({ start: 0.5, end: 1.25 });
+        });
+        const started = await player.play({ manifest: `${longBase}/mono30/manifest.json` });
+        off();
+        await until(() => player.getState().isPlaying && h.rms(player) > 0.02, 5000);
+        // Into the loop from 0 and round it: still inside it 1.6 s on.
+        await h.sleep(1600);
+        const s = player.getState();
+        const r = { set, started, loop: s.loop, time: player.getCurrentTime(), playing: s.isPlaying, rms: h.rms(player) };
+        player.dispose();
+        return r;
+    });
+    expect(r.set).toBe(true);
+    expect(r.started).toBe(true);
+    expect(r.playing).toBe(true);
+    expect(r.loop.start).toBeCloseTo(0.5, 2);
+    expect(r.loop.end).toBeCloseTo(1.25, 2);
+    expect(r.time).toBeGreaterThanOrEqual(0.49);
+    expect(r.time).toBeLessThan(1.26);
+    expect(r.rms).toBeGreaterThan(0.02);
 });
 
 // ---- servers -----------------------------------------------------------------------------

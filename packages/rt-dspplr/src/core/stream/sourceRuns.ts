@@ -39,7 +39,7 @@ export function decodePcmRun(bytes: Uint8Array, source: ManifestSource): Float32
     return decodeInterleaved({ encoding: pcm.encoding, bitsPerSample: pcm.bitsPerSample, channels: source.channels }, bytes.subarray(0, frames * pcm.blockAlign), frames);
 }
 
-// ---- the codecs' WebAssembly (see rt-dspplr-prepare/wasm/decoders.c) ------------------------
+// ---- the codecs' WebAssembly (see wasm/decoders.c) ------------------------------------------
 
 interface RunExports {
     memory: WebAssembly.Memory;

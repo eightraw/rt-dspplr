@@ -1,7 +1,7 @@
 # Prepared-audio manifest
 
-Normative description of `manifest.json`, the file that `@saitdigital/rt-dspplr-prepare`
-writes and `@saitdigital/rt-dspplr` reads with `player.play({ manifest })`. The key
+Normative description of `manifest.json`, the file that `@saitdigital/rt-dspplr` writes
+(its `./prepare` entry and `rtd-prepare` CLI) and reads with `player.play({ manifest })`. The key
 words MUST, SHOULD and MAY are used as in RFC 2119.
 
 - JSON Schema (draft 2020-12): `packages/rt-dspplr/schema/manifest.schema.json`,

@@ -1,14 +1,15 @@
 # Changelog
 
-Two packages are released from this repository: `@saitdigital/rt-dspplr` (the
-player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0).
+One package is released from this repository: `@saitdigital/rt-dspplr`, the
+player and, from 0.4.0, the Node prepare step for long recordings (its
+`./prepare` entry and the `rtd-prepare` CLI), at one version.
 
 ## @saitdigital/rt-dspplr 0.4.0
 
 ### Long recordings (prepared files)
 
 - `play({ manifest })` (or a URL ending in `.json`) plays a recording prepared with
-  `@saitdigital/rt-dspplr-prepare` segment by segment, on the same player core as
+  `./prepare` or `rtd-prepare` (below) segment by segment, on the same player core as
   whole clips: one `createAudioPlayer()`, one state, the same React card,
   `<Timeline>` and `createTimeline()`. Switching between a whole clip and a
   prepared one on one player stops and unloads the other source.
@@ -132,8 +133,9 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
   spectrogram helpers, DSP building blocks) and adds the types and plugin API of the
   main entry. The new streaming machinery stays internal; the file formats are in
   `./format`.
-- The package contains no Node-only code (checked at build time). Preparing long
-  recordings is a separate package, `@saitdigital/rt-dspplr-prepare`.
+- The browser entries contain no Node-only code and never load `./prepare`
+  (checked at build time). `engines` is Node 20.3 or later (the prepare step
+  needs `AbortSignal.any`).
 - Play and resume no longer reset the timeline's zoom and pan; only another clip does.
 - `THIRD_PARTY_NOTICES.md` ships in the package with the notices of Signalsmith
   Stretch (MIT), dr_mp3 and dr_flac (public domain or MIT-0) and libopus
@@ -219,9 +221,10 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
   `fetchOptions.signal` is honoured. The `webkitAudioContext` fallback is gone:
   Safari 14.1 or later.
 
-## @saitdigital/rt-dspplr-prepare 0.1.0
+### Preparing long recordings: `./prepare` and the `rtd-prepare` CLI (Node)
 
-First release: the prepare step for long recordings. Node ≥ 20.19, ESM.
+New in the same package: the prepare step for long recordings
+(`@saitdigital/rt-dspplr/prepare`), Node 20.3 or later, ESM. See PREPARE.md.
 
 - `prepareAudio(input, options)` and the `rtd-prepare` CLI read a recording once,
   as a stream (a path, a ReadableStream or an async iterable), and write

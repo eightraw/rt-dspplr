@@ -9,6 +9,13 @@
         "rootDir": "src",
         "stripInternal": true
     },
-    "include": ["src"],
-    "exclude": ["src/**/*.worker.ts", "src/**/*.worklet.ts", "src/stretch-rubberband/rubberbandCore.ts"]
+    "include": [
+        "src"
+    ],
+    "exclude": [
+        "src/**/*.worker.ts",
+        "src/**/*.worklet.ts",
+        "src/stretch-rubberband/rubberbandCore.ts",
+        "src/prepare"
+    ]
 }

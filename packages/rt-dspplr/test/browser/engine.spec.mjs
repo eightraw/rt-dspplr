@@ -1,6 +1,7 @@
 // The stream engine (AudioWorklet), rendered offline: sample-exact segments
 // and loop wraps, click-free volume / mix / seek, underrun hold and recovery;
-// and the realtime player's seek latency.
+// the realtime player's seek latency; the realtime stretch and its split, and
+// their instances handed from one engine to the next.
 import { test, expect } from '@playwright/test';
 
 const BASE = '/node_modules/.cache/rtd-long';
@@ -213,6 +214,79 @@ test('realtime stretch: loop wraps and speed changes stay continuous (no gap, no
     expect(result.lo).toBeGreaterThan(-10.5);
     expect(result.delta).toBeLessThan(result.natural * 1.3);
     console.log(`stretch window ${result.latency} frames (${(result.latency / 48).toFixed(0)} ms, compensated by look-ahead); RMS range over wraps and speed moves ${(result.hi - result.lo).toFixed(2)} dB; max step ${result.delta.toFixed(3)} vs ${result.natural.toFixed(3)} natural`);
+});
+
+test('an engine that is let go hands its stretcher and split to the next one, cleared of its clip', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const sr = 48000;
+        // The first clip is loud noise, the second a held tone: anything the first left in the
+        // instances would show in the second's output.
+        let seed = 9;
+        const noise = Float32Array.from({ length: sr * 2 }, () => { seed = (seed * 16807) % 2147483647; return (seed / 2147483647 - 0.5) * 1.8; });
+        const tone = sine(sr * 6, 375, 0.5);
+        const natural = maxDelta(tone);
+        const ctx = new OfflineAudioContext(1, sr * 3, sr);
+        await h.internals.loadStreamEngine(ctx, true);
+        await h.internals.stretchAvailable(ctx);
+        const make = (x) => {
+            const engine = new h.internals.StreamEngine(ctx, { channels: 1, starts: [0, x.length], stretch: true });
+            engine.node.connect(ctx.destination);
+            engine.feed('a', 0, [x.slice()]);
+            engine.setRate(1.5);
+            return engine;
+        };
+        const ready = async (engine) => {
+            const t = performance.now();
+            while (!engine.stretch.ready && !engine.stretch.error && performance.now() - t < 20000) await h.sleep(5);
+        };
+        const first = make(noise);
+        let second = null;
+        let splitting = 0;
+        ctx.suspend(256 / sr).then(async () => {
+            await ready(first);
+            first.play(0);
+            await settle();
+            ctx.resume();
+        });
+        // Let go while playing: it fades out, then gives its instances back.
+        ctx.suspend(0.5).then(async () => {
+            first.pause();
+            first.dispose();
+            await settle();
+            ctx.resume();
+        });
+        ctx.suspend(0.6).then(async () => {
+            second = make(tone);
+            second.onReport = (report) => { if (report.splitting) splitting += 1; };
+            await settle();
+            ctx.resume();
+        });
+        ctx.suspend(0.7).then(async () => {
+            await ready(second);
+            second.play(sr);
+            await settle();
+            ctx.resume();
+        });
+        const out = (await ctx.startRendering()).getChannelData(0);
+        // 10 ms RMS windows from 50 ms after the second start.
+        const from = Math.round(0.75 * sr);
+        let lo = Infinity, hi = -Infinity;
+        for (let i = from; i + 480 < out.length; i += 480) {
+            let s = 0; for (let k = 0; k < 480; k += 1) s += out[i + k] * out[i + k];
+            const db = 10 * Math.log10(s / 480 + 1e-20);
+            lo = Math.min(lo, db); hi = Math.max(hi, db);
+        }
+        return { first: first.stretch.reused, reused: second.stretch.reused, ready: second.stretch.ready, splitting, lo, hi, delta: maxDelta(out, from), natural };
+    });
+    console.log(`pooled: the second engine's stretcher reused ${r.reused}; its tone after the noise: RMS ${r.lo.toFixed(2)}..${r.hi.toFixed(2)} dB, max step ${r.delta.toFixed(3)} vs ${r.natural.toFixed(3)} natural; split on in ${r.splitting} reports`);
+    expect(r.first).toBe(false);
+    expect(r.ready).toBe(true);
+    expect(r.reused).toBe(true);
+    expect(r.splitting).toBeGreaterThan(0);
+    // A 0.5 sine is -9 dB RMS; nothing of the noise (it would raise the level and the steps).
+    expect(r.hi - r.lo).toBeLessThan(1.5);
+    expect(r.lo).toBeGreaterThan(-10.5);
+    expect(r.delta).toBeLessThan(r.natural * 1.3);
 });
 
 test('the stretch keeps an attack single: clicks over a held tone at 0.75x, split into tonal and atonal parts', async ({ page }) => {

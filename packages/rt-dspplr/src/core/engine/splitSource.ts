@@ -44,8 +44,9 @@ const KEEP_GRAINS = 96;
 const REACH_BEHIND = SPLIT_SIZE / SPLIT_HOP + SPLIT_HT - 1;
 const REACH_AHEAD = SPLIT_SIZE / SPLIT_HOP + SPLIT_HT;
 /**
- * Added to grain numbers in a loop's caches: the module leaves out spectra of negative frames
- * (before the clip's start: silence), but in a loop, what comes before its start is its end.
+ * Added to grain numbers in the cache of a loop all round: the module leaves out spectra of
+ * negative frames (before the clip's start: silence), but there what comes before the loop's
+ * start is its end. (Mode 1 reads what lies before the loop, as the clip does.)
  */
 const LOOPED_INDEX = 1 << 20;
 
@@ -137,7 +138,14 @@ class SplitCache {
     chunk(q: number, budget: { left: number }): SplitState {
         if (this._chunks.has(q)) return 'ready';
         for (let f = q + 1; f <= q + SPLIT_SIZE / SPLIT_HOP; f += 1) {
-            if (f + this._index < 0 || this._grains.has(f)) continue;
+            if (f + this._index < 0) continue;
+            const have = this._grains.get(f);
+            if (have) {
+                // Kept as the newest: making the chunk's other grain cannot evict it.
+                this._grains.delete(f);
+                this._grains.set(f, have);
+                continue;
+            }
             const state = this._grain(f, budget);
             if (state !== 'ready') return state;
         }
@@ -236,7 +244,7 @@ export class SplitSource {
     constructor(x: SplitExports, ctx: number, channels: number, read: Read, has: Has) {
         x.split_init(SPLIT_HOP, SPLIT_HT, channels);
         this._linear = new SplitCache(x, ctx, channels, read, has, 0);
-        this._ahead = new SplitCache(x, ctx + 1, channels, (f, c) => read(this._wrap(f, false), c), (from, to) => this._hasLooped(from, to, false, has), LOOPED_INDEX);
+        this._ahead = new SplitCache(x, ctx + 1, channels, (f, c) => read(this._wrap(f, false), c), (from, to) => this._hasLooped(from, to, false, has), 0);
         this._around = new SplitCache(x, ctx + 2, channels, (f, c) => read(this._wrap(f, true), c), (from, to) => this._hasLooped(from, to, true, has), LOOPED_INDEX);
         this._sc = this._linear;
     }

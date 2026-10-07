@@ -8,13 +8,13 @@
     ],
     "scripts": {
         "build": "npm run build:lib && npm run build -w examples/gallery",
-        "build:lib": "npm run build -w packages/rt-dspplr && npm run build -w packages/rt-dspplr-prepare",
+        "build:lib": "npm run build -w packages/rt-dspplr",
         "dev": "npm run build:lib && npm run dev -w examples/gallery",
         "gallery": "npm run build:lib && npm run dev -w examples/gallery",
         "typecheck": "npm run typecheck --workspaces --if-present",
-        "test": "npm run test -w packages/rt-dspplr && npm run test -w packages/rt-dspplr-prepare",
+        "test": "npm run test -w packages/rt-dspplr",
         "test:browser": "npm run build:lib && npm run test:browser -w packages/rt-dspplr",
-        "test:package": "npm run build:lib && npm run test:package -w packages/rt-dspplr && npm run test:package -w packages/rt-dspplr-prepare"
+        "test:package": "npm run build:lib && npm run test:package -w packages/rt-dspplr"
     },
     "overrides": {
         "rollup": "4.64.0"

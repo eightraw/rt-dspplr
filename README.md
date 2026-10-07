@@ -11,8 +11,8 @@ with the framework-independent audio engine. TypeScript types are included.
 ## Features
 
 - **Playback and navigation:** seek, step through audio and loop a selected range.
-- **Pitch-preserving speed:** worker-based processing prepares a new speed while
-  playback continues, then switches at the live position.
+- **Pitch-preserving speed:** changed at once by a realtime stretch in an
+  AudioWorklet that keeps attacks single and sharp.
 - **Real-time DSP:** high-pass filter, compression, output gain and limiting.
 - **Interactive waveform:** click to seek, drag to loop, zoom and pan.
 - **Live spectrogram:** both stems on a logarithmic axis, repainted as the mix moves.
@@ -23,19 +23,24 @@ with the framework-independent audio engine. TypeScript types are included.
 - **Custom interfaces:** a headless engine, and the timeline, the spectrogram and the
   author menu without React, for any framework.
 
-Ordinary files are decoded into memory in full; DSP controls operate during
-playback, and pitch-preserving speed changes prepare a rendered variant. Long
-recordings can instead be **prepared once on the server** and played segment by
+Ordinary files are decoded into memory in full; DSP controls and speed operate
+during playback. Long recordings can instead be **prepared once on the server**
+(the same package, in Node) and played segment by
 segment: the whole timeline (waveform, DSP preview, spectrogram) is there at once,
 audio is fetched around the playhead, speed keeps the pitch in realtime, and the
 A⇄B knob blends the recording with one of its named, server-made stems.
 
-## Packages
+## The package
 
-| Package | | |
+One package, [`@saitdigital/rt-dspplr`](packages/rt-dspplr/README.md), holds both sides, at one version:
+
+| Entry | Runs in | |
 |---|---|---|
-| [`@saitdigital/rt-dspplr`](packages/rt-dspplr/README.md) | browser | The player: headless engine, React component, timeline, spectrogram, prepared-file playback, the file formats (`./format`) and the manifest schema. |
-| [`@saitdigital/rt-dspplr-prepare`](packages/rt-dspplr-prepare/README.md) | Node ≥ 20.19 | `rtd-prepare` CLI and API: segments, overview files and named stems for long recordings. |
+| `@saitdigital/rt-dspplr`, `/react`, `/advanced` | browser | The player: headless engine, React component, timeline, spectrogram, prepared-file playback. |
+| `@saitdigital/rt-dspplr/format` | anywhere | The file formats and the manifest schema (`/manifest.schema.json`). |
+| `@saitdigital/rt-dspplr/prepare`, `rtd-prepare` CLI | Node ≥ 20.3 | Preparing long recordings: the source's index, overview files and named stems, see [PREPARE.md](packages/rt-dspplr/PREPARE.md). |
+
+Browser bundles never include the Node side: it is only loaded where it is imported.
 
 The prepared-file format is specified in [docs/manifest.md](docs/manifest.md).
 
@@ -92,8 +97,7 @@ Audio in the animations:
 ## Install
 
 ```bash
-npm install @saitdigital/rt-dspplr
-npm install @saitdigital/rt-dspplr-prepare   # on the server, for long recordings
+npm install @saitdigital/rt-dspplr   # the player, and on the server the prepare step
 ```
 
 The React component additionally needs `react >= 18` and your application's React
@@ -150,7 +154,7 @@ npx rtd-prepare talk.wav public/media/talk
 await player.play({ manifest: '/media/talk/manifest.json' });
 ```
 
-See [the prepare package](packages/rt-dspplr-prepare/README.md) for the CLI, the API,
+See [PREPARE.md](packages/rt-dspplr/PREPARE.md) for the CLI, the API (`@saitdigital/rt-dspplr/prepare`),
 named stems and server-side processors, and
 [Long recordings](packages/rt-dspplr/README.md#long-recordings-prepared-files) for the
 player side.
@@ -158,7 +162,7 @@ player side.
 ## Documentation
 
 - [API, React examples, themes, browser support and memory](packages/rt-dspplr/README.md)
-- [Preparing long recordings](packages/rt-dspplr-prepare/README.md) and [the manifest format](docs/manifest.md)
+- [Preparing long recordings](packages/rt-dspplr/PREPARE.md) and [the manifest format](docs/manifest.md)
 - [Speed and time stretch](packages/rt-dspplr/README.md#speed-and-time-stretch)
 - [Workers, bundlers and CSP](packages/rt-dspplr/README.md#bundlers-workers-csp)
 
@@ -204,18 +208,17 @@ npm run dev
 ## Development
 
 ```text
-packages/rt-dspplr/          the player: source, documentation and tests
-packages/rt-dspplr-prepare/  the prepare step (Node): source, documentation and tests
+packages/rt-dspplr/   the package: the player (src/), the prepare step (src/prepare/), documentation and tests
 examples/gallery/    the five interfaces shown above
 ```
 
 ```bash
-npm run build          # both packages and the gallery
+npm run build          # the package (player, then ./prepare) and the gallery
 npm run typecheck
 npm test
 npx playwright install chromium
 npm run test:browser   # audio, workers, React and attribution UI
-npm run test:package   # install the tarballs in an isolated consumer (the prepare CLI's output played in Chromium)
+npm run test:package   # install the tarball in an isolated consumer (the rtd-prepare CLI's output played in Chromium)
 ```
 
 After changing library source, run `npm run build:lib` and refresh the demo.

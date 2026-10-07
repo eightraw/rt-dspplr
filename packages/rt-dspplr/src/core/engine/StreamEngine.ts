@@ -93,7 +93,7 @@ export class StreamEngine {
     private readonly _scale: number;
     private _loop: { start: number; end: number } | null = null;
     private readonly _sent: Record<EngineStem, Set<number>> = { a: new Set(), b: new Set() };
-    private _stretchState: { ready: boolean; latencyFrames: number; error?: string } = { ready: false, latencyFrames: 0 };
+    private _stretchState: { ready: boolean; latencyFrames: number; error?: string; reused?: boolean } = { ready: false, latencyFrames: 0 };
     onReport: ((report: EngineReport) => void) | null = null;
     onEnded: (() => void) | null = null;
     onStretch: ((state: { ready: boolean; latencyFrames: number; error?: string }) => void) | null = null;
@@ -109,7 +109,7 @@ export class StreamEngine {
             numberOfInputs: 0,
             numberOfOutputs: 1,
             outputChannelCount: [options.channels],
-            processorOptions: { channels: options.channels, starts: options.starts, sampleRate: clipRate },
+            processorOptions: { channels: options.channels, starts: options.starts, sampleRate: clipRate, stretch: options.stretch !== false },
         });
         this.node.onprocessorerror = () => this.onError?.(new Error('stream engine: the audio processor failed'));
         this.node.port.onmessage = (event: MessageEvent<{ type: string } & Record<string, unknown>>) => {
@@ -127,7 +127,7 @@ export class StreamEngine {
                 // An end from before the last transport message (a play sent meanwhile) is stale.
                 if (Number(m.seq ?? 0) >= this._seq) this.onEnded?.();
             } else if (m.type === 'stretch') {
-                this._stretchState = { ready: !!m.ready, latencyFrames: Number(m.latencyFrames ?? 0), error: m.error as string | undefined };
+                this._stretchState = { ready: !!m.ready, latencyFrames: Number(m.latencyFrames ?? 0), error: m.error as string | undefined, reused: !!m.reused };
                 this.onStretch?.(this._stretchState);
             }
         };
@@ -143,7 +143,8 @@ export class StreamEngine {
         return this._report;
     }
 
-    get stretch(): { ready: boolean; latencyFrames: number; error?: string } {
+    /** The stretcher's state; `reused`: its instance came from an engine before this one (internal). */
+    get stretch(): { ready: boolean; latencyFrames: number; error?: string; reused?: boolean } {
         return this._stretchState;
     }
 

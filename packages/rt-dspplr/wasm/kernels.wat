@@ -1,4 +1,4 @@
-;; prepare's numeric kernels, WebAssembly SIMD (simd128), compiled by build/build-wasm.mjs.
+;; prepare's numeric kernels, WebAssembly SIMD (simd128), compiled by build/build-prepare-wasm.mjs.
 ;;
 ;; Two lanes of f64x2 carry two independent filter chains; each lane does the JS
 ;; code's arithmetic in the JS code's order (IEEE double, no fused multiply-add

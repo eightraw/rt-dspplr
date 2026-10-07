@@ -6,7 +6,7 @@
 //   node bench/long-audio-bench.mjs --dir <folder> [--mode buffer|stream|both] [--only name] [--out results.json] [--mbps 50 --rtt 40]
 //
 // <folder> holds <name>.wav sources and, for the manifest mode, <name>/manifest.json
-// (from `rtd-prepare`, @saitdigital/rt-dspplr-prepare). Needs a built dist/
+// (from `rtd-prepare`, the package's ./prepare). Needs a built dist/
 // (npm run build:lib); the internals it measures directly are bundled from
 // src/ by bench/internals.ts at start. Each run gets a
 // fresh browser; memory is the summed private bytes of every browser process

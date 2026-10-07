@@ -6,7 +6,7 @@ import { jobTransfers, runJob, resultTransfers, type AnyJob, type AnyResult } fr
 
 // ---------------------------------------------------------------------------
 // A small worker_threads pool for prepare's analysis jobs. The worker script
-// is `prepare-worker.mjs` next to the bundle (dist/ or the test cache). When it
+// is `prepare-worker.mjs` next to the bundle (dist/prepare/ or the test cache). When it
 // cannot start (another bundler, a sandbox), jobs run inline on the main
 // thread: same function, same output, only slower.
 // ---------------------------------------------------------------------------

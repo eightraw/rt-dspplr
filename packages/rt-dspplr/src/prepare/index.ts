@@ -1,4 +1,4 @@
-// @saitdigital/rt-dspplr-prepare — Node only. Ingest-time preparation of long
+// @saitdigital/rt-dspplr/prepare — Node only. Ingest-time preparation of long
 // recordings for the RT-DSPPLR player (`player.play({ manifest })`): the
 // original file with an index of its segments, overview peaks, bands and
 // spectrogram, and named stems, under one manifest. The formats are those of `@saitdigital/rt-dspplr/format` (one
