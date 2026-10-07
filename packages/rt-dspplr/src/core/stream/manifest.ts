@@ -245,10 +245,28 @@ const optNums = (v: unknown) => v === undefined || (Array.isArray(v) && v.every(
 export const STEM_GAIN_DB_MIN = -60;
 export const STEM_GAIN_DB_MAX = 12;
 
+// What a manifest may describe: the player allocates from these numbers, so a
+// manifest outside them is refused (and prepare refuses such inputs).
+/** The longest segment, in seconds: a segment is decoded and held whole. */
+export const MAX_SEGMENT_SECONDS = 60;
+/** Sample rates of a timeline and of a source, Hz. */
+export const MIN_SAMPLE_RATE = 8000;
+export const MAX_SAMPLE_RATE = 384000;
+/** Channels of a timeline and of a source (Web Audio's limit for a node). */
+export const MAX_CHANNELS = 32;
+/** The rate every Opus stream decodes at. */
+const OPUS_RATE = 48000;
+
+const isRate = (v: unknown): v is number => isInt(v, MIN_SAMPLE_RATE) && v <= MAX_SAMPLE_RATE;
+const isChannels = (v: unknown): v is number => isInt(v, 1) && v <= MAX_CHANNELS;
+
 function checkSource(src: unknown, where: string): string | null {
     if (!isObj(src) || !isStr(src.url) || !isInt(src.bytes) || !(SOURCE_CODECS as readonly unknown[]).includes(src.codec) || !isInt(src.sampleRate, 1) || !isInt(src.channels, 1)) {
         return `${where} needs url, bytes, codec (${SOURCE_CODECS.join(', ')}), sampleRate and channels`;
     }
+    if (!isRate(src.sampleRate)) return `${where}.sampleRate must be ${MIN_SAMPLE_RATE}-${MAX_SAMPLE_RATE} Hz`;
+    if (!isChannels(src.channels)) return `${where}.channels must be 1-${MAX_CHANNELS}`;
+    if (src.codec === 'opus' && src.sampleRate !== OPUS_RATE) return `${where}: an opus source decodes at ${OPUS_RATE} Hz, not ${src.sampleRate}`;
     if (src.codec === 'wav') {
         const p = src.pcm;
         if (!isObj(p) || (p.encoding !== 'int' && p.encoding !== 'float') || !isInt(p.bitsPerSample, 8) || !isInt(p.blockAlign, 1)) {
@@ -259,9 +277,12 @@ function checkSource(src: unknown, where: string): string | null {
     return null;
 }
 
-function checkSegments(s: unknown, where: string): string | null {
+/** `sampleRate`: the timeline's, for the longest segment (MAX_SEGMENT_SECONDS). */
+function checkSegments(s: unknown, where: string, sampleRate: number): string | null {
     if (!isObj(s)) return `${where} is missing`;
     if (!isInt(s.framesPerSegment, 1)) return `${where}.framesPerSegment must be a positive integer`;
+    const most = MAX_SEGMENT_SECONDS * sampleRate;
+    if (s.framesPerSegment > most) return `${where}.framesPerSegment is over ${MAX_SEGMENT_SECONDS} s (${most} frames)`;
     const source = checkSource(s.source, `${where}.source`);
     if (source) return source;
     const bytes = (s.source as ManifestSource).bytes;
@@ -270,6 +291,7 @@ function checkSegments(s: unknown, where: string): string | null {
         if (!isObj(seg) || !isInt(seg.index) || !isInt(seg.startFrame) || !isInt(seg.frames) || !isInt(seg.tail) || !optInt(seg.lead) || !optInt(seg.trail)) {
             return `${where}.list[${i}] needs index, startFrame, frames and tail (lead and trail counts)`;
         }
+        if (seg.frames > most) return `${where}.list[${i}] is over ${MAX_SEGMENT_SECONDS} s (${seg.frames} frames)`;
         if ((seg.lead ?? 0) + (seg.trail ?? 0) > seg.frames) return `${where}.list[${i}]: lead + trail exceed its frames`;
         const r = seg.range;
         if (r !== null && !(Array.isArray(r) && r.length === 2 && isInt(r[0]) && isInt(r[1]) && r[1] > r[0] && r[1] <= bytes)) {
@@ -393,14 +415,20 @@ export function manifestProblem(value: unknown): string | null {
     if (!isNum(m.duration) || m.duration < 0 || !isInt(m.sampleRate, 1) || !isInt(m.sourceSampleRate, 1) || !isInt(m.channels, 1) || !isInt(m.frames)) {
         return 'Manifest is missing required fields (duration, sampleRate, sourceSampleRate, channels, frames)';
     }
+    if (!isRate(m.sampleRate) || !isRate(m.sourceSampleRate)) return `sampleRate and sourceSampleRate must be ${MIN_SAMPLE_RATE}-${MAX_SAMPLE_RATE} Hz`;
+    if (!isChannels(m.channels)) return `channels must be 1-${MAX_CHANNELS}`;
     if (m.revision !== undefined && !isInt(m.revision, 1)) return 'revision must be a positive integer';
     const src = m.source;
     if (!isObj(src) || !(src.name === null || isStr(src.name)) || !isInt(src.bytes) || !isStr(src.encoding) || !isInt(src.bitsPerSample, 1) || !isInt(src.frames)) {
         return 'Manifest is missing required fields (source)';
     }
-    const problem = checkSegments(m.segments, 'segments') ?? checkPeaks(m.peaks, 'peaks') ?? checkLoudness(m.loudness, 'loudness')
+    const problem = checkSegments(m.segments, 'segments', m.sampleRate) ?? checkPeaks(m.peaks, 'peaks') ?? checkLoudness(m.loudness, 'loudness')
         ?? checkBlock(m.bands, 'bands', 'rtd-bands') ?? checkBlock(m.spectrogram, 'spectrogram', 'rtd-spectrogram');
     if (problem) return problem;
+    const a = (m.segments as AudioManifest['segments']).source;
+    if (a.sampleRate !== m.sampleRate || a.channels !== m.channels) {
+        return `segments.source decodes to ${a.sampleRate} Hz, ${a.channels} channel(s); the timeline is ${m.sampleRate} Hz, ${m.channels}`;
+    }
     const grid = (m.segments as AudioManifest['segments']).list;
     const tiling = checkTiling(grid, m.frames, 'segments');
     if (tiling) return tiling;
@@ -425,13 +453,19 @@ export function manifestProblem(value: unknown): string | null {
             if (fields) return fields;
             // The blocks are checked whenever present; a ready stem must have segments and peaks.
             if (stem.status === 'ready' && (stem.segments === undefined || stem.peaks === undefined)) return `${where} is ready but has no segments or peaks`;
-            const p = (stem.segments === undefined ? null : checkSegments(stem.segments, `${where}.segments`))
+            const p = (stem.segments === undefined ? null : checkSegments(stem.segments, `${where}.segments`, m.sampleRate))
                 ?? (stem.peaks === undefined ? null : checkPeaks(stem.peaks, `${where}.peaks`))
                 ?? checkBlock(stem.bands, `${where}.bands`, 'rtd-bands') ?? checkBlock(stem.spectrogram, `${where}.spectrogram`, 'rtd-spectrogram');
             if (p) return p;
             if (stem.status === 'ready') {
-                const g = checkGrid((stem.segments as AudioManifest['segments']).list, grid, `${where}.segments`);
+                const segments = stem.segments as AudioManifest['segments'];
+                const g = checkGrid(segments.list, grid, `${where}.segments`);
                 if (g) return g;
+                // Played under A: at A's rate, on A's channels or on all of them from one.
+                const s = segments.source;
+                if (s.sampleRate !== m.sampleRate || (s.channels !== m.channels && s.channels !== 1)) {
+                    return `${where}.segments.source decodes to ${s.sampleRate} Hz, ${s.channels} channel(s); a stem is at A's rate (${m.sampleRate} Hz) with A's channels (${m.channels}) or 1`;
+                }
             }
         }
     }

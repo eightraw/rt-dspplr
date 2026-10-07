@@ -96,3 +96,40 @@ export function computeGainReductionDb(
     const x = envDb - thresholdDb + halfKnee;
     return (1 / ratio - 1) * x * x / (2 * kneeDb);
 }
+
+/**
+ * The automatic makeup gain a native DynamicsCompressorNode applies:
+ * (1 / curve(1.0))^0.6, where curve is the node's static curve (Web Audio
+ * spec; Blink's kernel, which WebKit and Gecko share). The curve is linear to
+ * the threshold, bends in an exponential knee from the threshold up to
+ * threshold + knee, and follows the ratio above it.
+ */
+export function nativeCompressorMakeupGain(thresholdDb: number, kneeDb: number, ratio: number): number {
+    const linearThreshold = dbToGain(thresholdDb);
+    const slope = 1 / Math.max(1, ratio);
+    const kneeCurve = (x: number, k: number): number => (x < linearThreshold
+        ? x
+        : linearThreshold + (1 - Math.exp(-k * (x - linearThreshold))) / k);
+    const kneeTopDb = thresholdDb + kneeDb;
+    const kneeTop = dbToGain(kneeTopDb);
+    // The knee's sharpness k is searched (as the browser does) so that the knee
+    // meets the ratio's slope at its top.
+    const slopeAt = (x: number, k: number): number => {
+        if (x < linearThreshold) return 1;
+        const x2 = x * 1.001;
+        return (gainToDb(kneeCurve(x2, k)) - gainToDb(kneeCurve(x, k))) / (gainToDb(x2) - gainToDb(x));
+    };
+    let minK = 0.1;
+    let maxK = 10000;
+    let k = 5;
+    for (let i = 0; i < 15; i += 1) {
+        if (slopeAt(kneeTop, k) < slope) maxK = k;
+        else minK = k;
+        k = Math.sqrt(minK * maxK);
+    }
+    // curve(1.0): 0 dB in.
+    const fullRange = 1 < kneeTop
+        ? kneeCurve(1, k)
+        : dbToGain(gainToDb(kneeCurve(kneeTop, k)) - slope * kneeTopDb);
+    return Math.pow(1 / fullRange, 0.6);
+}

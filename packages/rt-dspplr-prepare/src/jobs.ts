@@ -49,7 +49,8 @@ export interface JobSpec {
 
 export interface JobResult {
     index: number;
-    peaks: { min: Int16Array[]; max: Int16Array[]; sumSq: Float64Array[]; frames: Float64Array; peak: number[] };
+    /** Finest bins of framesPerPeak frames each (the timeline's last one may hold fewer). */
+    peaks: { min: Int16Array[]; max: Int16Array[]; sumSq: Float64Array[]; peak: number[] };
     bands: { meanSquares: Float32Array; bins: number; cutoffs: number[]; framesPerBin: number } | null;
     spectrogram: { a: Uint8Array; columns: number; reference: number; hop: number; rows: number; minHz: number; maxHz: number } | null;
 }
@@ -62,7 +63,7 @@ export function jobFrames(framesPerPeak: number, bandBin: number, hop: number): 
 }
 
 /** One channel's finest peaks (min, max, Σx² per bin); returns its peak |x|. */
-function peakBins(x: Float32Array, warmup: number, frames: number, fpp: number, bins: number, min: Int16Array, max: Int16Array, sumSq: Float64Array, binFrames: Float64Array): number {
+function peakBins(x: Float32Array, warmup: number, frames: number, fpp: number, bins: number, min: Int16Array, max: Int16Array, sumSq: Float64Array): number {
     let p = 0;
     for (let b = 0; b < bins; b += 1) {
         const from = warmup + b * fpp;
@@ -79,7 +80,6 @@ function peakBins(x: Float32Array, warmup: number, frames: number, fpp: number, 
         min[b] = quantizePeak(lo);
         max[b] = quantizePeak(hi);
         sumSq[b] = sq;
-        binFrames[b] = to - from;
         const a = Math.max(-lo, hi);
         if (a > p) p = a;
     }
@@ -87,7 +87,7 @@ function peakBins(x: Float32Array, warmup: number, frames: number, fpp: number, 
 }
 
 /** peakBins()'s outputs for two channels from wasmPeaksStereo()'s lanes (lo, hi, Σx² per bin, each l then r). */
-function peaksFromLanes(v: Float64Array, frames: number, fpp: number, bins: number, min: Int16Array[], max: Int16Array[], sumSq: Float64Array[], binFrames: Float64Array, peak: number[]): void {
+function peaksFromLanes(v: Float64Array, bins: number, min: Int16Array[], max: Int16Array[], sumSq: Float64Array[], peak: number[]): void {
     for (let b = 0; b < bins; b += 1) {
         const o = 6 * b;
         for (let c = 0; c < 2; c += 1) {
@@ -99,7 +99,6 @@ function peaksFromLanes(v: Float64Array, frames: number, fpp: number, bins: numb
             const a = Math.max(-lo, hi);
             if (a > peak[c]) peak[c] = a;
         }
-        binFrames[b] = Math.min(frames, (b + 1) * fpp) - b * fpp;
     }
 }
 
@@ -124,12 +123,11 @@ export function analyzeJob(job: JobSpec): JobResult {
     const min = Array.from({ length: C }, () => new Int16Array(bins));
     const max = Array.from({ length: C }, () => new Int16Array(bins));
     const sumSq = Array.from({ length: C }, () => new Float64Array(bins));
-    const binFrames = new Float64Array(bins);
     const peak = new Array<number>(C).fill(0);
     // Two channels in WebAssembly (both at once, the same numbers), else channel by channel.
     const both = C === 2 ? wasmPeaksStereo(channels[0].subarray(warmup), channels[1].subarray(warmup), frames, fpp) : null;
-    if (both) peaksFromLanes(both, frames, fpp, bins, min, max, sumSq, binFrames, peak);
-    else for (let c = 0; c < C; c += 1) peak[c] = peakBins(channels[c], warmup, frames, fpp, bins, min[c], max[c], sumSq[c], binFrames);
+    if (both) peaksFromLanes(both, bins, min, max, sumSq, peak);
+    else for (let c = 0; c < C; c += 1) peak[c] = peakBins(channels[c], warmup, frames, fpp, bins, min[c], max[c], sumSq[c]);
 
     // ---- band energies ----------------------------------------------------------------
     let bands: JobResult['bands'] = null;
@@ -163,13 +161,13 @@ export function analyzeJob(job: JobSpec): JobResult {
         };
     }
 
-    return { index: job.index, peaks: { min, max, sumSq, frames: binFrames, peak }, bands, spectrogram };
+    return { index: job.index, peaks: { min, max, sumSq, peak }, bands, spectrogram };
 }
 
 /** Transferable buffers of a result (zero-copy back to the main thread). */
 export function resultTransfers(r: JobResult): ArrayBuffer[] {
     const out: ArrayBuffer[] = [];
-    for (const a of [...r.peaks.min, ...r.peaks.max, ...r.peaks.sumSq, r.peaks.frames]) out.push(a.buffer as ArrayBuffer);
+    for (const a of [...r.peaks.min, ...r.peaks.max, ...r.peaks.sumSq]) out.push(a.buffer as ArrayBuffer);
     if (r.bands) out.push(r.bands.meanSquares.buffer as ArrayBuffer);
     if (r.spectrogram) out.push(r.spectrogram.a.buffer as ArrayBuffer);
     return [...new Set(out)];

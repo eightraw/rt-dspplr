@@ -139,13 +139,36 @@ export interface AudioPlayerOptions {
     loadB?: LoaderB;
     /** Fetch stem B right after load instead of waiting for mix > 0. Default false. */
     prefetchB?: boolean;
-    /** Extra fetch() options for URL sources (credentials, headers...). */
+    /**
+     * Extra fetch() options for URL sources (credentials, headers...). For a
+     * prepared clip, its headers and credentials go to the manifest's own origin
+     * only, and to the origins in `fetchOptionsOrigins`.
+     */
     fetchOptions?: RequestInit;
+    /**
+     * Further origins (e.g. 'https://cdn.example.com') that get the headers and
+     * credentials of `fetchOptions` when a manifest names files there. Files on
+     * other origins are still fetched, without them. Default none.
+     */
+    fetchOptionsOrigins?: readonly string[];
     /**
      * Shared byte budget for decoded audio and speed variants (all players on
      * the page share one cache). Default 150 MiB. Not a total memory cap.
      */
     cacheBudgetBytes?: number;
+    /**
+     * Whole clips (`src`, decoded in full, stem B too): the largest file, in
+     * bytes. A URL is checked against its Content-Length before the download
+     * and against the bytes read while it runs; bytes and Blobs by their size.
+     * A larger file fails at once with an error named 'ClipTooLargeError'.
+     * Default: no limit. Long recordings play prepared: `play({ manifest })`.
+     */
+    maxClipBytes?: number;
+    /**
+     * Whole clips: the longest clip, in seconds, checked once decoded (before
+     * any speed variant is rendered). Fails like `maxClipBytes`. Default: no limit.
+     */
+    maxClipSeconds?: number;
     /**
      * Sample rate of the shared AudioContext; only the first player to start
      * decides. Default: the device's rate when it is 44100 or 48000, else 48000.
@@ -186,10 +209,18 @@ export interface AudioPlayerState {
     /** The clip's URL when it was loaded from one. */
     src: string | null;
     status: PlayerStatus;
-    /** Download progress 0..1 while loading (NaN without Content-Length). */
+    /** Download progress 0..1 while loading (NaN when the size is unknown: no Content-Length, or a Content-Encoding). */
     progress: number;
     error: Error | null;
     isPlaying: boolean;
+    /**
+     * Why the audio output is held, or null. 'interrupted': the system took it
+     * while playing (a call or Siri on iOS, another app) and the player paused;
+     * 'blocked': play() could not start it (not from a user gesture, or during
+     * an interruption). The next play() from a user gesture resumes; a UI can
+     * say "tap to resume". Clears when playback starts or the output runs again.
+     */
+    suspended: 'interrupted' | 'blocked' | null;
     /** Position in seconds. Updated ~30 times per second while playing; use getCurrentTime() for a live value. */
     currentTime: number;
     duration: number;
@@ -256,6 +287,9 @@ export interface LoadOptions {
 }
 
 let autoClipId = 0;
+
+/** How long a play request may wait for the output to resume before `suspended` says 'blocked'. */
+const START_WATCH_MS = 3000;
 
 /** Before any clip: what the buffer source offers (the default). */
 const DEFAULT_CAPABILITIES: SourceCapabilities = {
@@ -390,12 +424,26 @@ export class AudioPlayerCore {
             if (!effect) throw new Error(`effects.setParam: no effect "${id}"`);
             this._setEffectParam(effect, param, validateParam(effect.plugin, param, value));
         },
+        /**
+         * Take an effect out of the signal (true) or put it back (false). A failed
+         * effect (its `error` is set) stays out: putting it back is ignored, with
+         * a warning. Remove it and add it again to retry it.
+         */
         bypass: (id: string, bypassed: boolean): void => {
             const effect = this._state.effects.find((e) => e.id === id);
             if (!effect || effect.bypassed === bypassed) return;
+            if (!bypassed && effect.error) {
+                console.warn(`[AudioPlayer] the ${JSON.stringify(id)} effect failed (${effect.error}); remove it and add it again to retry`);
+                return;
+            }
             this._setEffects(this._state.effects.map((e) => (e === effect ? { ...e, bypassed } : e)));
             this._output?.bypass(id, bypassed);
         },
+    };
+
+    /** @internal A preview worker could not compile a plugin's process() (preview.ts then leaves it out): count that in previewCoverage. */
+    refreshPreviewCoverage = (): void => {
+        this._setEffects(this._state.effects);
     };
 
     private _setEffects(effects: EffectState[]): void {
@@ -425,6 +473,9 @@ export class AudioPlayerCore {
     }
     private _outputPromise: Promise<SourceOutput | null> | null = null;
     private _outputGeneration = 0;
+    private _unsubscribeEngine: (() => void) | null = null;
+    /** The latest play request whose outcome `_watchStart` reports. */
+    private _startId = 0;
 
     private readonly _host: SourceHost;
     private readonly _bufferSource: BufferSource;
@@ -592,29 +643,41 @@ export class AudioPlayerCore {
         if (options.autoplay) this._requireInterface();
         if (this._disposed) return false;
         const info = normalizeClip(clip);
-        return this._sourceFor(info).load(info, options.startAt, options.autoplay ?? false);
+        if (!options.autoplay) return this._sourceFor(info).load(info, options.startAt, false);
+        const woke = this._wake(true);
+        const started = this._sourceFor(info).load(info, options.startAt, true);
+        this._watchStart(woke, started);
+        return started;
     };
 
     /**
-     * Without arguments: resume the current clip.
+     * Without arguments: resume the current clip (while it is still loading:
+     * play it once it is in).
      * With a clip: play it from `startAt` (default 0). Passing the clip that is
      * already loaded restarts it without reloading.
      * `{ manifest: url }` plays a prepared long recording segment by segment.
-     * Must be called from a user gesture the first time (browser autoplay policy).
+     * Must be called from a user gesture the first time (browser autoplay policy):
+     * the audio output is resumed at once, inside the gesture. When it will not
+     * start, `state.suspended` says so (see there).
      * Rejects when no interface element is mounted (see `mount()`).
      */
     play = async (clip?: ClipInput, options: Omit<LoadOptions, 'autoplay'> = {}): Promise<boolean> => {
         this._requireInterface();
         if (clip === undefined) {
-            await this._source.resume();
+            const woke = this._wake(false);
+            const resumed = this._source.resume();
+            this._watchStart(woke, resumed);
+            await resumed;
             return this._state.isPlaying;
         }
         if (this._disposed) return false;
         const info = normalizeClip(clip);
-        if (this._source.isLoaded(info) && (info.manifest !== null) === (this._source.kind === 'segmented')) {
-            return this._source.restart(options.startAt ?? 0);
-        }
-        return this._sourceFor(info).load(info, options.startAt, true);
+        const woke = this._wake(true);
+        const started = this._source.isLoaded(info) && (info.manifest !== null) === (this._source.kind === 'segmented')
+            ? this._source.restart(options.startAt ?? 0)
+            : this._sourceFor(info).load(info, options.startAt, true);
+        this._watchStart(woke, started);
+        return started;
     };
 
     pause = async (): Promise<void> => this._source.pause();
@@ -624,8 +687,7 @@ export class AudioPlayerCore {
             await this.pause();
             return;
         }
-        this._requireInterface();
-        await this._source.resume();
+        await this.play();
     };
 
     stop = (): void => this._source.stop();
@@ -768,7 +830,10 @@ export class AudioPlayerCore {
         this._output?.dispose();
         this._output = null;
         this._outputPromise = null;
+        this._unsubscribeEngine?.();
+        this._unsubscribeEngine = null;
         this._engine = null;
+        this._startId += 1;
         this._setState(this._initialState(this._state.processing, this._state.pauseMode));
     };
 
@@ -824,11 +889,14 @@ export class AudioPlayerCore {
                 const ctx = engine.context;
                 if (!ok || !ctx || generation !== this._outputGeneration || this._disposed) return null;
                 const chain = new EffectChain(ctx, (id, message) => this._onEffectError(id, message), dbToGain(LIMITER_CEILING_DB));
-                this._state.effects.forEach((e, i) => chain.add(e.id, e.plugin, e.params, e.bypassed || !!e.error, i));
+                // A failed effect comes back failed: not instantiated again, kept out of the signal.
+                this._state.effects.forEach((e, i) => chain.add(e.id, e.plugin, e.params, e.bypassed || !!e.error, i, !!e.error));
                 chain.setInputGain(outputGainDbToGain(this._state.processing.inputGainDb));
                 chain.setOutputGain(outputGainDbToGain(this._state.processing.outputGainDb));
                 this._engine = engine;
                 this._output = chain;
+                this._unsubscribeEngine?.();
+                this._unsubscribeEngine = engine.subscribe(() => this._onEngineChange());
                 this._update({ audioContext: ctx });
                 return { engine, ctx, input: chain.input };
             })().finally(() => {
@@ -836,6 +904,57 @@ export class AudioPlayerCore {
             });
         }
         return this._outputPromise;
+    }
+
+    /**
+     * Resume the shared AudioContext now, inside the caller's user gesture
+     * (`create`: make it first when there is none yet). The sources resume it
+     * again before they start, but after a download or a decode, which can fall
+     * outside the gesture's activation (iOS Safari): the context then stays
+     * suspended and nothing plays.
+     */
+    private _wake(create: boolean): Promise<boolean> {
+        if (this._disposed) return Promise.resolve(false);
+        // Builds the context synchronously; the rest of the output follows.
+        if (create) void this._ensureOutput().catch(() => null);
+        const engine = AudioEngine.getInstance();
+        return engine.context ? engine.resume() : Promise.resolve(false);
+    }
+
+    /**
+     * Once a play request and the resume made for it have settled: when nothing
+     * plays because the output would not start, say so in `state.suspended`
+     * instead of failing silently. A resume that never settles (a browser that
+     * holds it until a gesture) is caught after a while.
+     */
+    private _watchStart(woke: Promise<boolean>, started: Promise<unknown>): void {
+        const id = ++this._startId;
+        const settled = Promise.all([woke, started]).catch(() => undefined);
+        const timeout = new Promise<void>((resolve) => setTimeout(resolve, START_WATCH_MS));
+        void Promise.race([settled, timeout]).then(() => {
+            if (id !== this._startId || this._disposed || this._state.isPlaying) return;
+            const state = AudioEngine.getInstance().context?.state as string | undefined;
+            if (state === 'suspended' || state === 'interrupted') this._update({ suspended: 'blocked' });
+        });
+    }
+
+    /**
+     * The shared context changed state. While playing, 'interrupted' (a call or
+     * Siri on iOS) or a 'suspended' nobody asked for (the player never suspends
+     * it) stopped the sound and froze the clock: pause through the source,
+     * which keeps the position (as any pause does in its pause mode), and say
+     * so. Running again, the note clears; playback waits for play().
+     */
+    private _onEngineChange(): void {
+        const state = this._engine?.context?.state as string | undefined;
+        if (state === 'running') {
+            if (this._state.suspended) this._update({ suspended: null });
+            return;
+        }
+        if ((state === 'interrupted' || state === 'suspended') && this._state.isPlaying) {
+            void this._source.pause();
+            this._update({ suspended: 'interrupted' });
+        }
     }
 
     private _initialState(processing: ProcessingState, pauseMode: PauseMode): AudioPlayerState {
@@ -846,6 +965,7 @@ export class AudioPlayerCore {
             progress: 0,
             error: null,
             isPlaying: false,
+            suspended: null,
             currentTime: 0,
             duration: 0,
             ended: false,
@@ -878,7 +998,9 @@ export class AudioPlayerCore {
     }
 
     private _update(patch: Partial<AudioPlayerState>): void {
-        this._setState({ ...this._state, ...patch });
+        // Playing again ends a hold of the output.
+        const resumed = patch.isPlaying === true && this._state.suspended !== null && patch.suspended === undefined;
+        this._setState({ ...this._state, ...patch, ...(resumed ? { suspended: null } : {}) });
     }
 
     private _setState(next: AudioPlayerState): void {

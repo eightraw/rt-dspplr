@@ -75,6 +75,7 @@ export function encodeBandsFile(file: BandsFile): Uint8Array {
 }
 
 export function decodeBandsFile(buffer: ArrayBuffer): BandsFile {
+    if (buffer.byteLength < 24) throw new Error('Not an rtd bands file (too short)');
     const view = new DataView(buffer);
     const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
     if (magic !== BANDS_MAGIC) throw new Error('Not an rtd bands file');
@@ -84,8 +85,12 @@ export function decodeBandsFile(buffer: ArrayBuffer): BandsFile {
     const framesPerBin = view.getUint32(12, true);
     const bins = view.getUint32(16, true);
     const k = view.getUint16(20, true);
-    const cutoffs = Array.from({ length: k }, (_, i) => view.getFloat32(24 + 4 * i, true));
     const n = bins * (1 + k);
+    // The sizes come from the file: check them against its length before allocating anything.
+    if (header < 24 + 4 * k || buffer.byteLength < header + 2 * n) {
+        throw new Error(`rtd bands file: ${buffer.byteLength} bytes, its header says ${header} + ${bins} bins × ${1 + k} values`);
+    }
+    const cutoffs = Array.from({ length: k }, (_, i) => view.getFloat32(24 + 4 * i, true));
     const meanSquares = new Float32Array(n);
     for (let i = 0; i < n; i += 1) meanSquares[i] = decodeMeanSquare(view.getUint16(header + 2 * i, true));
     return { sampleRate, framesPerBin, bins, cutoffs, meanSquares };

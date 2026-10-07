@@ -9,9 +9,15 @@ words MUST, SHOULD and MAY are used as in RFC 2119.
 - Runtime validation: `assertManifest()` / `manifestProblem()` from
   `@saitdigital/rt-dspplr/format`. Its rules are the schema's, plus the rules a
   schema cannot express: stem keys differ case-insensitively, segments tile the
-  timeline, a ready stem's segments sit on A's grid, and byte ranges lie within
-  their source. A test checks that both agree on every fixture and on a set of
-  broken manifests.
+  timeline, a ready stem's segments sit on A's grid, byte ranges lie within
+  their source, no segment is longer than 60 s of the timeline
+  (`MAX_SEGMENT_SECONDS`), and a source decodes to the timeline's rate and
+  channels (a ready stem's: A's rate, A's channels or 1). A test checks that both
+  agree on every fixture and on a set of broken manifests.
+- Limits (`MIN_SAMPLE_RATE`, `MAX_SAMPLE_RATE`, `MAX_CHANNELS`, `MAX_SEGMENT_SECONDS`
+  from `@saitdigital/rt-dspplr/format`): rates 8000–384000 Hz, 1–32 channels,
+  segments of at most 60 s. The player allocates from these numbers, so a manifest
+  outside them is refused; prepare refuses inputs outside them.
 - Current version: **formatVersion 4** (`MANIFEST_FORMAT_VERSION`), analyzer `2.0.0`.
 
 ## Versions and compatibility
@@ -50,7 +56,12 @@ The policy:
   appear only in `duration` (`frames / sampleRate`).
 - Sizes are bytes. Levels are dBFS unless stated. Frequencies are Hz.
 - URLs are **relative to the manifest's URL** (resolved with `new URL(url, manifestUrl)`).
-  Absolute URLs MAY be used; prepare writes relative ones.
+  Absolute URLs MAY be used (a CDN); prepare writes relative ones. Every URL MUST
+  resolve to `http:` or `https:` (a manifest the player gets as a `blob:` URL MAY
+  also name `blob:` files); the player refuses a manifest that names anything else.
+  It sends the host's `fetchOptions` headers and credentials only to the manifest's
+  own origin and to the origins in its `fetchOptionsOrigins` option: files on other
+  origins are fetched without them.
 - The manifest is written **last** and atomically: when it exists, every file it
   lists is in place. Every other file is immutable: writers MUST NOT change the
   bytes behind a URL that a published manifest lists, so files can be cached for
@@ -60,10 +71,14 @@ The policy:
   place for readers that still hold the older manifest. Hosts MAY delete those
   once no cached manifest can list them.
 - Servers MUST support HTTP Range requests on the source files (every segment is a
-  Range request of its source; a server that ignores the header sends the whole file
-  each time, which plays but costs the whole file per segment). They SHOULD support
-  them on `peaks.bin` and `spectrogram.bin` too (the player fetches their coarse
-  levels with one Range request; it falls back to a full GET).
+  Range request of its source). From a server that ignores the header, the player
+  reads a source of up to 64 MB whole, once, and cuts every segment from that copy;
+  a bigger one fails with `The server ignores HTTP Range requests: <url>`. Where
+  `Content-Range` is readable (same origin, or exposed with
+  `Access-Control-Expose-Headers`), it must start at the byte asked for and give
+  the source's `bytes`; otherwise the file changed and the clip fails. They SHOULD
+  support them on `peaks.bin` and `spectrogram.bin` too (the player fetches their
+  coarse levels with one Range request; it falls back to a full GET).
 
 ## Top level
 
@@ -72,13 +87,13 @@ The policy:
 | `format` | `"rtd-audio-manifest"` | yes | 1 | Identifies the file. |
 | `formatVersion` | integer ≥ 1 | yes | 1 | See [Versions](#versions-and-compatibility). |
 | `analyzerVersion` | string (semver) | yes | 1 | Version of the analysis that made the index, peaks, loudness. |
-| `revision` | integer ≥ 1 | no | 3 | Bumped on every rewrite of the manifest (a stem attached). `refreshManifest()` applies only a higher revision. Absent = 1. |
+| `revision` | integer ≥ 1 | no | 3 | Bumped on every rewrite of the manifest (a stem attached). `refreshManifest()` applies only a higher revision of the same recording (the same `id`, rate, channels and segment grid), and takes from it only stems made from that recording (`aSourceId`, when given). Absent = 1. |
 | `id` | string | yes | 1 | `sha256:<hex>` of the source file's bytes: a content id, stable across hosts. |
 | `createdAt` | string (ISO 8601) | yes | 1 | |
 | `duration` | number ≥ 0, seconds | yes | 1 | `frames / sampleRate`. |
-| `sampleRate` | integer ≥ 1, Hz | yes | 1 | Rate of the timeline: of the source, the peaks and analyses. The player converts to its context's rate. |
-| `sourceSampleRate` | integer ≥ 1, Hz | yes | 1 | Rate of the original: `sampleRate` (nothing is resampled). |
-| `channels` | integer ≥ 1 | yes | 1 | |
+| `sampleRate` | integer 8000–384000, Hz | yes | 1 | Rate of the timeline: of the source, the peaks and analyses. The player converts to its context's rate. |
+| `sourceSampleRate` | integer 8000–384000, Hz | yes | 1 | Rate of the original: `sampleRate` (nothing is resampled). |
+| `channels` | integer 1–32 | yes | 1 | |
 | `frames` | integer ≥ 0 | yes | 1 | Frames on the playback timeline. |
 | `source` | object | yes | 1 | `{ name: string \| null, bytes, encoding, bitsPerSample, frames }`: the original as read. `name` is a file name, never a path. |
 | `segments` | [Segments](#segments) | yes | 4 | The source and its index. |
@@ -95,7 +110,7 @@ each segment says which bytes of it hold its frames.
 
 | Field | Type | Req. | Meaning |
 |---|---|---|---|
-| `framesPerSegment` | integer ≥ 1 | yes | The grid; the last segment MAY be shorter. |
+| `framesPerSegment` | integer ≥ 1, at most 60 s | yes | The grid; the last segment MAY be shorter. |
 | `source` | object | yes | The file: `{ url, bytes, codec, sampleRate, channels, pcm?, header? }`, below. |
 | `list[]` | array | yes | In timeline order: `{ index, startFrame, frames, range, tail, lead?, trail? }`, below. |
 
@@ -106,7 +121,7 @@ each segment says which bytes of it hold its frames.
 | `url` | string | yes | The file, relative to the manifest. Prepare writes `source.<codec>`: the original byte for byte, or, for a format the player does not decode (or a file whose index does not read back right), a 16-bit WAV of the decoded audio. |
 | `bytes` | integer ≥ 0 | yes | Its size; every `range` lies within it. |
 | `codec` | `"wav"` \| `"mp3"` \| `"opus"` \| `"flac"` | yes | How a run of it decodes, see [Sources](#sources). |
-| `sampleRate`, `channels` | integers ≥ 1 | yes | What it decodes to. For A: the timeline's. For a stem: A's rate, and A's channels or 1 (played on all of them). |
+| `sampleRate`, `channels` | integers, 8000–384000 Hz and 1–32 | yes | What it decodes to. For A: the timeline's. For a stem: A's rate, and A's channels or 1 (played on all of them). An `opus` source is 48000 Hz. The player refuses a run that decodes to anything else. |
 | `pcm` | object | wav | `{ encoding: "int" \| "float", bitsPerSample, blockAlign }` of its samples. |
 | `header` | string, base64 | flac, opus | Put before a run to decode it: FLAC's `fLaC` and STREAMINFO, Opus's OpusHead packet. |
 
@@ -114,7 +129,7 @@ A segment:
 
 | Field | Type | Req. | Meaning |
 |---|---|---|---|
-| `index`, `startFrame`, `frames` | integers | yes | Its place on the timeline. |
+| `index`, `startFrame`, `frames` | integers | yes | Its place on the timeline; `frames` at most 60 s of it. |
 | `range` | `[start, end)` \| null | yes | The bytes of the source to fetch and decode as one **run**; null: the segment is silence (a stem that does not reach it). |
 | `tail` | integer ≥ 0 | yes | How many of the run's decoded samples, counted back from the run's **end**, belong to the segment and after it: the segment's first sample is the run's sample `length − tail`. |
 | `lead` | integer ≥ 0 | no | Frames of silence before the source's samples (a stem that starts after A). Absent = 0. |
@@ -255,6 +270,6 @@ same code, so what it indexes is what plays.
 | `codec` | The file | A run | Warm-up (prepare) |
 |---|---|---|---|
 | `wav` | RIFF/WAVE, PCM integer 8–32 bits or float 32/64 (`pcm`), any chunks around `data` | Whole frames of `data`: `(end − start) / blockAlign` frames, `tail` = the segment's frames. | none |
-| `mp3` | MPEG-1/2 Layer III; an ID3v2 tag and a Xing/Info frame may come first | Whole frames from the middle of the stream, decoded raw: no tag, no gapless trimming (the decoder's delay is in `tail`). | 6 frames before the segment's first (the bit reservoir, the overlap): the samples are the continuous decode's, exactly |
+| `mp3` | MPEG-1/2 Layer III; an ID3v2 tag and a Xing/Info frame may come first | Whole frames from the middle of the stream, decoded raw: no tag, no gapless trimming (the decoder's delay is in `tail`). | from where the bit reservoir (511 bytes of main data, 255 for MPEG-2/2.5) is full two frames before the segment's first (their overlap and filterbank state), and at least 6 frames before it: the samples are the continuous decode's, exactly |
 | `opus` | Ogg Opus, one logical stream, channel mapping family 0 (mono or stereo) | Whole Ogg pages. A packet continued from before the run is dropped, as is one that runs past it; each packet is decoded in order by a fresh decoder (48 kHz, the header's output gain applied). | from the first packet that begins on a page at least 500 ms before the segment: within float rounding of the continuous decode (80 ms left errors up to −35 dBFS) |
 | `flac` | native FLAC | `header` (`fLaC`, STREAMINFO) then whole frames. | none (frames are independent); prepare 0.1 keeps FLAC as a WAV |

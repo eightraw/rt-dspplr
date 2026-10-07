@@ -5,6 +5,7 @@
 // implementation, imported, not copied); see docs/manifest.md.
 export {
     prepareAudio,
+    checkSegmentSeconds,
     fsStorage,
     memoryStorage,
     type PrepareInput,
@@ -17,16 +18,18 @@ export {
     type StemSpec,
     type StemTimings,
 } from './prepareAudio';
-export { ffmpegDecoder, type FfmpegDecoderOptions } from './ffmpegDecoder';
+export { AUDIO_DEMUXERS, ffmpegDecoder, type FfmpegDecoderOptions } from './ffmpegDecoder';
 export { builtinDecoder, flacDecoder, mp3Decoder, opusDecoder } from './wasm/decoders';
 export { wavDecoder, UnsupportedFormatError, type AudioDecoder, type DecodedStream, type DecoderOptions, type SourceFormat } from './decoder';
-// The rule for `framesPerPeak` (a power of two from 16 to 65536), for hosts that check their input first.
+// The rules for `framesPerPeak` (a power of two from 16 to 65536), `segmentSeconds` (0.1 to 60) and
+// `concurrency` (1 to 64), and for a Docker image name, for hosts that check their input first.
 export { checkFramesPerPeak } from './analysis';
 export { attachStem, markStem, type AttachStemOptions, type StemTarget } from './attachStem';
 // Analysis threads a service keeps between calls.
-export { createPreparePool, type PreparePool } from './pool';
+export { checkConcurrency, createPreparePool, type PreparePool } from './pool';
 export { StemAlignmentError, type StemInput, type StemOptions } from './stem';
 export {
+    checkDockerImage,
     commandProcessor,
     dockerProcessor,
     functionProcessor,

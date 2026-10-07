@@ -5,7 +5,8 @@ import { findZeroCrossing } from '../engine/zeroCrossing';
 import type { SpectralPyramid } from '../spectrogram/protocol';
 import type { WaveformPeakLevel, WaveformPeakPyramid } from '../waveform/pyramid';
 import { decodeBandsFile, type BandsFile } from '../stream/bandsFile';
-import { assertManifest, DEFAULT_STEM_KEY, readyStemKeys, type AudioManifest, type ManifestStem } from '../stream/manifest';
+import { FileAccess, SourceError } from '../stream/fileAccess';
+import { assertManifest, DEFAULT_STEM_KEY, readyStemKeys, type AudioManifest, type ManifestSegment, type ManifestStem, type ManifestStems } from '../stream/manifest';
 import { mixGains, type MixLaw } from '../controls';
 import { decodePeaksFile, peaksToPyramid, readLevel, type PeaksFile } from '../stream/peaksFile';
 import { SegmentScheduler } from '../stream/SegmentScheduler';
@@ -152,9 +153,12 @@ export class SegmentedSource implements PlaybackSource {
     private _autoplay = false;
     private _loadId = 0;
     private _playId = 0;
+    /** Aborts what the current load fetches (manifest, overview files, refreshes); a new load or unload() aborts it. */
+    private _abort: AbortController | null = null;
     private _engine: AudioEngine | null = null;
     private _manifest: AudioManifest | null = null;
-    private _manifestUrl = '';
+    /** How the clip's files are fetched: their URLs, the host's options, the load's signal. */
+    private _files: FileAccess | null = null;
     private _clipId: string | null = null;
     private _store: SegmentStore | null = null;
     private _scheduler: SegmentScheduler | null = null;
@@ -241,6 +245,10 @@ export class SegmentedSource implements PlaybackSource {
         if (this._disposed || !clip.manifest) return false;
         const loadId = ++this._loadId;
         this._playId += 1;
+        // What the previous load still fetches is let go.
+        this._abort?.abort();
+        const abort = new AbortController();
+        this._abort = abort;
         this._halt();
         // The previous clip goes silent now (not when the new manifest is in), and
         // nothing of its stem carries over to the new one.
@@ -250,6 +258,7 @@ export class SegmentedSource implements PlaybackSource {
         this._store = null;
         this._scheduler = null;
         this._manifest = null;
+        this._files = null;
         this._peaks = null;
         this._spectro = null;
         this._merged.clear();
@@ -274,13 +283,16 @@ export class SegmentedSource implements PlaybackSource {
         let settle!: () => void;
         this._settling = new Promise<void>((resolve) => { settle = resolve; });
         try {
-            const response = await fetch(url, { ...this._host.options.fetchOptions });
+            const { fetchOptions, fetchOptionsOrigins } = this._host.options;
+            const files = new FileAccess(url, { fetchOptions, fetchOptionsOrigins, signal: abort.signal });
+            const response = await fetch(url, files.init(url));
             if (!response.ok) throw new Error(`Manifest: HTTP ${response.status}`);
             const manifest: unknown = await response.json();
             assertManifest(manifest);
+            files.check(manifest);
             if (loadId !== this._loadId) return false;
             this._manifest = manifest;
-            this._manifestUrl = url;
+            this._files = files;
             void this._loadPeaks(loadId);
             void this._loadBands(loadId);
             void this._loadSpectrogram(loadId);
@@ -294,8 +306,7 @@ export class SegmentedSource implements PlaybackSource {
             if (!out || loadId !== this._loadId) return false;
             this._engine = out.engine;
             const cacheSeconds = this._options.cacheSeconds ?? 60;
-            this._store = new SegmentStore(url, manifest, {
-                fetchOptions: this._host.options.fetchOptions,
+            this._store = new SegmentStore(files, manifest, {
                 maxBytes: Math.max(1, cacheSeconds) * manifest.sampleRate * manifest.channels * 4,
             });
             this._store.onLoad((index) => this._onSegment(index));
@@ -309,7 +320,7 @@ export class SegmentedSource implements PlaybackSource {
             this._host.emit('load', { clipId: clip.id, duration: manifest.duration });
             if (this._view) this.setView(this._view.start, this._view.end);
             // A pause or stop while the clip was being set up cancels the autoplay (a resume asks again).
-            if (this._autoplay) return this._startAt(this._pausedFrame, 'play');
+            if (this._autoplay) return this._startAt(null, 'play');
             if (autoplay) this._update({ buffering: false });
             void this._store.load(this._scheduler.segmentAt(this._pausedFrame));
             return true;
@@ -335,7 +346,8 @@ export class SegmentedSource implements PlaybackSource {
             if (this._state.status === 'loading') this._autoplay = true;
             return;
         }
-        await this._startAt(this._pausedFrame, 'play');
+        // From where playback rests once the clip is set up: a seek meanwhile moves it.
+        await this._startAt(null, 'play');
     }
 
     pause = async (): Promise<void> => {
@@ -461,20 +473,53 @@ export class SegmentedSource implements PlaybackSource {
     /** Re-read the manifest; a stem that became ready is attached without a reload. */
     async refreshManifest(): Promise<void> {
         const m = this._manifest;
+        const files = this._files;
         const ctx = this._engine?.context;
-        if (!m || !ctx) return;
+        if (!m || !files || !ctx) return;
         const loadId = this._loadId;
         try {
-            const response = await fetch(this._manifestUrl, { ...this._host.options.fetchOptions, cache: 'no-store' });
+            const response = await fetch(files.manifestUrl, files.init(files.manifestUrl, { cache: 'no-store' }));
             if (!response.ok) return;
             const next: unknown = await response.json();
             assertManifest(next);
             if (loadId !== this._loadId || (next.revision ?? 1) <= (m.revision ?? 1)) return;
-            this._manifest = { ...m, revision: next.revision, stems: next.stems };
+            // Another recording (or another grid) behind the URL is no newer revision of this clip: keep what plays.
+            if (next.id !== m.id || next.sampleRate !== m.sampleRate || next.channels !== m.channels || !SegmentedSource._sameGrid(next.segments.list, m.segments.list)) {
+                console.warn('[AudioPlayer] manifest refresh ignored: it describes another recording than the one playing');
+                return;
+            }
+            files.check(next);
+            this._manifest = { ...m, revision: next.revision, stems: SegmentedSource._stemsFor(next, m) };
             this._applyStems(this._manifest);
         } catch (error) {
-            console.warn('[AudioPlayer] manifest refresh failed', error);
+            if (loadId === this._loadId) console.warn('[AudioPlayer] manifest refresh failed', error);
         }
+    }
+
+    /**
+     * A refreshed manifest's stems that belong to the clip playing: made from this A
+     * (`aSourceId`, when given) and, when ready, on its grid. One that does not is not
+     * taken: the entry the clip had under that key stays.
+     */
+    private static _stemsFor(next: AudioManifest, current: AudioManifest): ManifestStems | undefined {
+        if (!next.stems) return undefined;
+        const out: ManifestStems = {};
+        for (const [key, stem] of Object.entries(next.stems)) {
+            const fits = (stem.aSourceId === undefined || stem.aSourceId === current.id)
+                && (stem.status !== 'ready' || (!!stem.segments && SegmentedSource._sameGrid(stem.segments.list, current.segments.list)));
+            if (fits) {
+                out[key] = stem;
+            } else {
+                console.warn(`[AudioPlayer] manifest refresh: stem ${JSON.stringify(key)} was not made from the recording playing; not taken`);
+                if (current.stems?.[key]) out[key] = current.stems[key];
+            }
+        }
+        return out;
+    }
+
+    /** Whether two segment lists cut the timeline in the same places. */
+    private static _sameGrid(a: ManifestSegment[], b: ManifestSegment[]): boolean {
+        return a.length === b.length && a.every((s, i) => s.startFrame === b[i].startFrame && s.frames === b[i].frames);
     }
 
     /**
@@ -548,15 +593,16 @@ export class SegmentedSource implements PlaybackSource {
         // (a newer revision re-processed it): the old B's segments are let go everywhere.
         const replaced = !!was && was.status === 'ready' && stem?.status === 'ready' && SegmentedSource._stemSignature(was) !== SegmentedSource._stemSignature(stem);
         if (replaced) this._eng?.resetB();
-        if (stem?.status === 'ready' && stem.segments && (was?.status !== 'ready' || !this._storeB || replaced)) {
+        const files = this._files;
+        if (stem?.status === 'ready' && stem.segments && files && (was?.status !== 'ready' || !this._storeB || replaced)) {
             const shim = { ...manifest, segments: stem.segments } as AudioManifest;
             this._storeB?.dispose();
-            this._storeB = new SegmentStore(this._manifestUrl, shim, {
-                fetchOptions: this._host.options.fetchOptions,
+            this._storeB = new SegmentStore(files, shim, {
                 maxBytes: Math.max(1, this._options.cacheSeconds ?? 60) * manifest.sampleRate * manifest.channels * 4,
             });
             this._storeB.onError((index, error, failures) => {
-                if (failures >= SEGMENT_FAILURES_MAX) this._failStemB(index, error);
+                // A source that cannot be read (SourceError) is let go at once: retries would not help.
+                if (error instanceof SourceError || failures >= SEGMENT_FAILURES_MAX) this._failStemB(index, error);
             });
             this._storeB.onLoad((index) => {
                 if (this._eng && this._bWanted()) this._feedEngine(this._wantedEngine(this._engPlaying ? this._eng.position() : this._pausedFrame));
@@ -588,13 +634,30 @@ export class SegmentedSource implements PlaybackSource {
     private _onSegmentError(index: number, error: Error, failures: number): void {
         const m = this._manifest;
         const scheduler = this._scheduler;
-        if (!m || !scheduler || failures < SEGMENT_FAILURES_MAX || !this._state.isPlaying) return;
+        if (!m || !scheduler) return;
+        if (error instanceof SourceError) {
+            this._failSource(error);
+            return;
+        }
+        if (failures < SEGMENT_FAILURES_MAX || !this._state.isPlaying) return;
         const frame = Math.floor((this.getCurrentTime() ?? 0) * m.sampleRate);
         if (scheduler.segmentAt(Math.min(m.frames - 1, frame)) !== index && this._waiting !== index) return;
         const err = new Error(`Segment ${index} failed ${failures} times: ${error.message}`);
         void this.pause();
         this._update({ error: err });
         this._host.emit('error', err);
+    }
+
+    /**
+     * A's source cannot be played as its manifest says (a SourceError: the server
+     * ignores Range requests, the file changed): no segment will load, so playback
+     * stops with the error at once, and every later start fails with it.
+     */
+    private _failSource(error: Error): void {
+        if (this._state.isPlaying) void this.pause();
+        else if (this._state.buffering) this._update({ buffering: false });
+        this._update({ error });
+        this._host.emit('error', error);
     }
 
     /** Stem B keeps failing: let it go, A plays on alone and statusB says why. */
@@ -620,10 +683,12 @@ export class SegmentedSource implements PlaybackSource {
     private async _loadOverviewB(loadId: number): Promise<void> {
         const stem = this._stemB;
         const key = this._stemKey;
-        if (!stem || stem.status !== 'ready') return;
+        const files = this._files;
+        if (!stem || stem.status !== 'ready' || !files) return;
         const get = async (url?: string) => {
             if (!url) return null;
-            const response = await fetch(new URL(url, this._manifestUrl).href, { ...this._host.options.fetchOptions });
+            const href = files.resolve(url);
+            const response = await fetch(href, files.init(href));
             return response.ok ? response.arrayBuffer() : null;
         };
         try {
@@ -648,7 +713,7 @@ export class SegmentedSource implements PlaybackSource {
             }
             this._publish(patch, 'spectrogram');
         } catch (error) {
-            console.warn('[AudioPlayer] stem B overview unavailable', error);
+            if (loadId === this._loadId) console.warn('[AudioPlayer] stem B overview unavailable', error);
         }
     }
 
@@ -760,6 +825,8 @@ export class SegmentedSource implements PlaybackSource {
     unload(): void {
         this._loadId += 1;
         this._playId += 1;
+        this._abort?.abort();
+        this._abort = null;
         this._clearStem();
         this._disposeEngine();
         this._halt();
@@ -767,6 +834,7 @@ export class SegmentedSource implements PlaybackSource {
         this._store = null;
         this._scheduler = null;
         this._manifest = null;
+        this._files = null;
         this._clipId = null;
         this._window = null;
         this._visible = [];
@@ -790,10 +858,10 @@ export class SegmentedSource implements PlaybackSource {
         this._host.emit('sourceupdate', { clipId: this._clipId, what });
     }
 
-    private async _fetchRange(url: string, from: number, to?: number): Promise<{ buffer: ArrayBuffer; partial: boolean }> {
-        const headers = new Headers(this._host.options.fetchOptions?.headers);
-        headers.set('Range', `bytes=${from}-${to === undefined ? '' : to}`);
-        const response = await fetch(url, { ...this._host.options.fetchOptions, headers });
+    /** A file of the clip, or (`from`) a byte range of it: `partial` false when the server sent all of it. */
+    private async _fetchFile(files: FileAccess, url: string, from?: number, to?: number): Promise<{ buffer: ArrayBuffer; partial: boolean }> {
+        const range = from === undefined ? undefined : `bytes=${from}-${to === undefined ? '' : to}`;
+        const response = await fetch(url, files.init(url, { range }));
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return { buffer: await response.arrayBuffer(), partial: response.status === 206 };
     }
@@ -801,42 +869,42 @@ export class SegmentedSource implements PlaybackSource {
     /** Header + coarse levels in one Range request, then the finest level. */
     private async _loadPeaks(loadId: number): Promise<void> {
         const m = this._manifest;
-        if (!m) return;
-        const url = new URL(m.peaks.url, this._manifestUrl).href;
+        const files = this._files;
+        if (!m || !files) return;
+        const url = files.resolve(m.peaks.url);
         const finest = [...m.peaks.levels].sort((a, b) => a.framesPerPeak - b.framesPerPeak)[0];
         try {
             const first = m.peaks.levels.length > 1 && finest
-                ? await this._fetchRange(url, 0, finest.byteOffset - 1)
-                : { buffer: await (await fetch(url, { ...this._host.options.fetchOptions })).arrayBuffer(), partial: false };
+                ? await this._fetchFile(files, url, 0, finest.byteOffset - 1)
+                : await this._fetchFile(files, url);
             if (loadId !== this._loadId) return;
             this._peaks = decodePeaksFile(first.buffer);
             this._stats.coarse = first.buffer.byteLength;
             this._publish({ peaks: peaksToPyramid(this._peaks, this._merged) }, 'peaks');
             const missing = this._peaks.levels.findIndex((level) => !level.channels);
             if (missing < 0 || !finest) return;
-            const rest = await this._fetchRange(url, finest.byteOffset, finest.byteOffset + finest.byteLength - 1);
+            const rest = await this._fetchFile(files, url, finest.byteOffset, finest.byteOffset + finest.byteLength - 1);
             if (loadId !== this._loadId || !this._peaks) return;
             this._stats.fine = rest.buffer.byteLength;
             const level = this._peaks.levels[missing];
             level.channels = readLevel(rest.buffer, rest.partial ? 0 : finest.byteOffset, level.peaks, this._peaks.channels);
             this._publish({ peaks: peaksToPyramid(this._peaks, this._merged) }, 'peaks');
         } catch (error) {
-            console.warn('[AudioPlayer] peaks unavailable; the waveform stays empty', error);
+            if (loadId === this._loadId) console.warn('[AudioPlayer] peaks unavailable; the waveform stays empty', error);
         }
     }
 
     private async _loadBands(loadId: number): Promise<void> {
         const m = this._manifest;
-        if (!m?.bands) return; // v1 manifest: no high-pass approximation
+        const files = this._files;
+        if (!m?.bands || !files) return; // v1 manifest: no high-pass approximation
         try {
-            const response = await fetch(new URL(m.bands.url, this._manifestUrl).href, { ...this._host.options.fetchOptions });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const buffer = await response.arrayBuffer();
+            const { buffer } = await this._fetchFile(files, files.resolve(m.bands.url));
             if (loadId !== this._loadId) return;
             this._stats.bands = buffer.byteLength;
             this._publish({ bands: decodeBandsFile(buffer) }, 'bands');
         } catch (error) {
-            console.warn('[AudioPlayer] bands unavailable; the high-pass preview is skipped outside the decoded window', error);
+            if (loadId === this._loadId) console.warn('[AudioPlayer] bands unavailable; the high-pass preview is skipped outside the decoded window', error);
         }
     }
 
@@ -844,13 +912,14 @@ export class SegmentedSource implements PlaybackSource {
     private async _loadSpectrogram(loadId: number): Promise<void> {
         const m = this._manifest;
         const spec = m?.spectrogram;
-        if (!m || !spec) return;
-        const url = new URL(spec.url, this._manifestUrl).href;
+        const files = this._files;
+        if (!m || !spec || !files) return;
+        const url = files.resolve(spec.url);
         const finest = [...spec.levels].sort((a, b) => a.framesPerColumn - b.framesPerColumn)[0];
         try {
             const first = spec.levels.length > 1 && finest
-                ? await this._fetchRange(url, 0, finest.byteOffset - 1)
-                : { buffer: await (await fetch(url, { ...this._host.options.fetchOptions })).arrayBuffer(), partial: false };
+                ? await this._fetchFile(files, url, 0, finest.byteOffset - 1)
+                : await this._fetchFile(files, url);
             if (loadId !== this._loadId) return;
             this._spectro = decodeSpectrogramFile(first.buffer);
             this._stats.spectroCoarse = first.buffer.byteLength;
@@ -858,14 +927,14 @@ export class SegmentedSource implements PlaybackSource {
             this._publish({ spectrogram: toSpectralPyramid(this._spectro) }, 'spectrogram');
             const missing = this._spectro.levels.findIndex((level) => !level.a);
             if (missing < 0 || !finest) return;
-            const rest = await this._fetchRange(url, finest.byteOffset, finest.byteOffset + finest.byteLength - 1);
+            const rest = await this._fetchFile(files, url, finest.byteOffset, finest.byteOffset + finest.byteLength - 1);
             if (loadId !== this._loadId || !this._spectro) return;
             this._stats.spectroFine = rest.buffer.byteLength;
             const offset = rest.partial ? 0 : finest.byteOffset;
             this._spectro.levels[missing].a = new Uint8Array(rest.buffer, offset, finest.byteLength);
             this._publish({ spectrogram: toSpectralPyramid(this._spectro) }, 'spectrogram');
         } catch (error) {
-            console.warn('[AudioPlayer] spectrogram overview unavailable', error);
+            if (loadId === this._loadId) console.warn('[AudioPlayer] spectrogram overview unavailable', error);
         }
     }
 
@@ -882,17 +951,24 @@ export class SegmentedSource implements PlaybackSource {
         return Math.ceil(t * rate) / rate;
     }
 
-    private async _startAt(frame: number, reason: 'play' | 'seek'): Promise<boolean> {
+    /** Play from `at` (a frame), or with null from where playback rests, read once the clip is set up. */
+    private async _startAt(at: number | null, reason: 'play' | 'seek'): Promise<boolean> {
         const loadId = this._loadId;
+        // Taken before the wait: a pause, stop or newer start while the clip is set up wins.
+        const playId = ++this._playId;
         await this._settling;
-        if (loadId !== this._loadId) return false;
+        if (loadId !== this._loadId || playId !== this._playId) return false;
         const m = this._manifest;
         const store = this._store;
         const scheduler = this._scheduler;
         const engine = this._engine;
         if (!m || !store || !scheduler || !engine?.context) return false;
-        if (this._eng) return this._startEngine(frame, reason);
-        const playId = ++this._playId;
+        if (store.broken) {
+            this._failSource(store.broken);
+            return false;
+        }
+        let frame = at ?? this._pausedFrame;
+        if (this._eng) return this._startEngine(frame, reason, playId);
         const ctx = engine.context;
         const loop = this._state.loop;
         if (loop && frame >= this._frameOf(loop.end)) frame = this._frameOf(loop.start);
@@ -1095,11 +1171,11 @@ export class SegmentedSource implements PlaybackSource {
     }
 
 
-    private async _startEngine(frame: number, reason: 'play' | 'seek'): Promise<boolean> {
+    /** `playId`: the start's, taken by _startAt before it waited for the clip's setup. */
+    private async _startEngine(frame: number, reason: 'play' | 'seek', playId: number): Promise<boolean> {
         const m = this._manifest!;
         const engine = this._eng!;
         const ctxEngine = this._engine!;
-        const playId = ++this._playId;
         const loop = this._state.loop;
         if (loop && frame >= this._frameOf(loop.end)) frame = this._frameOf(loop.start);
         if (frame >= m.frames) frame = 0;

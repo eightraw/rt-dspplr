@@ -49,6 +49,8 @@ type BufferReadyResponse = {
     sourcePyramid: WaveformPeakPyramid;
     processedPyramid: WaveformPeakPyramid;
     gain: GainTrack | null;
+    /** Plugin preview sources that did not compile (left out of `processedPyramid`). */
+    uncompiled: string[];
 };
 
 type ProcessedReadyResponse = {
@@ -56,6 +58,7 @@ type ProcessedReadyResponse = {
     requestId: number;
     pyramid: WaveformPeakPyramid;
     gain: GainTrack | null;
+    uncompiled: string[];
 };
 
 type WorkerResponse = BufferReadyResponse | ProcessedReadyResponse;
@@ -303,6 +306,8 @@ function buildSourcePyramid(): WaveformPeakPyramid {
 
 /** The dynamics gain of the last processed pyramid, per 256 frames (see gainTrack.ts). */
 let lastGain: GainTrack | null = null;
+/** The plugin previews the last processed pyramid left out because they did not compile. */
+let lastUncompiled: string[] = [];
 
 /** Peaks through the preview stages, chunk by chunk (no copy of the whole clip). */
 function computeStagedPeaks(
@@ -315,6 +320,7 @@ function computeStagedPeaks(
 ): Float32Array | null {
     const channelCount = Math.max(channelData.length, gainB !== 0 ? channelDataB.length : 0) || 1;
     const runner = createStageRunner(stages, channelCount, currentLength, BASE_BIN_SIZE * GAIN_FACTOR);
+    lastUncompiled = runner.uncompiled;
     const CHUNK = 32768;
     const chunk = Array.from({ length: channelCount }, () => new Float32Array(CHUNK));
     for (let from = 0; from < currentLength; from += CHUNK) {
@@ -344,6 +350,7 @@ function computeStagedPeaks(
 
 function buildProcessedPyramid(processing: WaveformProcessing): WaveformPeakPyramid {
     lastGain = null;
+    lastUncompiled = [];
     const { minPeaks, maxPeaks, rmsSq } = createBasePeakArrays();
 
     if (channelData.length === 0 || currentSampleRate <= 0 || currentLength <= 0) {
@@ -449,6 +456,7 @@ workerScope.onmessage = (event: MessageEvent<WorkerMessage>) => {
             sourcePyramid,
             processedPyramid,
             gain: lastGain,
+            uncompiled: lastUncompiled,
         };
         const transfers = [
             ...collectTransfers(sourcePyramid.levels),
@@ -465,6 +473,7 @@ workerScope.onmessage = (event: MessageEvent<WorkerMessage>) => {
             requestId: message.requestId,
             pyramid,
             gain: lastGain,
+            uncompiled: lastUncompiled,
         };
         workerScope.postMessage(response as WorkerResponse, collectTransfers(pyramid.levels));
     }

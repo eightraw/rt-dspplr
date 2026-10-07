@@ -33,6 +33,11 @@ export {
     type ManifestSource,
     type SourceCodec,
     SOURCE_CODECS,
+    // The limits a manifest is held to (prepare refuses inputs outside them).
+    MAX_SEGMENT_SECONDS,
+    MIN_SAMPLE_RATE,
+    MAX_SAMPLE_RATE,
+    MAX_CHANNELS,
 } from './core/stream/manifest';
 
 // ---- the source's runs (manifest v4: segments are byte ranges of the original) --------------

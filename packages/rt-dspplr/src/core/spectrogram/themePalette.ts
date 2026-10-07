@@ -14,7 +14,8 @@ export function resolvePalette(themed: SpectrogramPalette, given?: Partial<Spect
  * The spectrogram's colours from the theme where the canvas sits: the
  * `--rtd-spectrogram-*` custom properties of styles.css (light and dark), so
  * the picture follows the card's theme like the waveform does. A property
- * that is not set falls back to the default (dark) palette. Hex colours;
+ * that is not set falls back to the default (dark) palette. Any CSS colour,
+ * var() included (the computed value has it resolved);
  * `--rtd-spectrogram-colormap` names a colormap ('magma', 'magma_r', …).
  */
 export function themePalette(el: Element): SpectrogramPalette {

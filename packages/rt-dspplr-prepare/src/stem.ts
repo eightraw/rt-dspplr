@@ -5,7 +5,7 @@ import { pipeline } from 'node:stream/promises';
 import { type AudioManifest, type ManifestStem } from '@saitdigital/rt-dspplr/format';
 import { checkFramesPerPeak } from './analysis';
 import { bandwidthFrom, coarseDecimation, type CorrelateJob, type CorrelateResult } from './correlate';
-import { finiteBlocks, wavDecoder, type AudioDecoder, type SourceLayout } from './decoder';
+import { checkAudioShape, finiteBlocks, wavDecoder, type AudioDecoder, type SourceLayout } from './decoder';
 import { builtinDecoder } from './wasm/decoders';
 import { resamplerDesign } from './jobs';
 import { resampleInParallel } from './parallelResample';
@@ -129,17 +129,33 @@ function openB(input: StemInput, decoder: AudioDecoder, signal: AbortSignal, non
         }
         return { format: Promise.resolve({ sampleRate, channels: channels.length }), blocks: finiteBlocks(blocks(), nonFinite), bytes: () => bytes, digest: () => hash.copy().digest('hex') };
     }
+    // A read that failed is B's error, whatever the decoder makes of it (one that swallows it would
+    // end B early, and the grid would pad it with silence).
+    let readError: { error: unknown } | null = null;
     async function* tapped(): AsyncGenerator<Uint8Array> {
-        for await (const chunk of bytesOf(input as string | (() => AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>))) {
-            const b = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk as ArrayBufferLike);
-            bytes += b.length;
-            if (hashing.on) hash.update(b);
-            yield b;
+        try {
+            for await (const chunk of bytesOf(input as string | (() => AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>))) {
+                const b = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk as ArrayBufferLike);
+                bytes += b.length;
+                if (hashing.on) hash.update(b);
+                yield b;
+            }
+        } catch (error) {
+            readError = { error };
+            throw error;
         }
     }
     const decoded = decoder(tapped(), { signal });
     decoded.format.catch(() => undefined); // awaited only after the first block, which may fail first
-    return { format: decoded.format, blocks: finiteBlocks(decoded.blocks, nonFinite, decoded.format), bytes: () => bytes, digest: () => hash.copy().digest('hex') };
+    async function* checked(): AsyncGenerator<Float32Array[]> {
+        try {
+            yield* finiteBlocks(decoded.blocks, nonFinite, decoded.format);
+        } catch (error) {
+            throw readError ? readError.error : error;
+        }
+        if (readError) throw readError.error;
+    }
+    return { format: decoded.format, blocks: checked(), bytes: () => bytes, digest: () => hash.copy().digest('hex') };
 }
 
 /** out[o + i] += ch[s + i] / count, i < n (kernel: module level, sync, monomorphic). */
@@ -287,6 +303,7 @@ export async function buildStem(ctx: BuildStemContext): Promise<ManifestStem> {
         const opened = openB(input, decoder, signal, firstCount, hashing);
         let first = await opened.blocks.next();
         const format = await opened.format;
+        checkAudioShape(format, `stems.${stem}`, false);
         bRate = format.sampleRate;
         let keeping: Float32Array[][] | null = [];
         let keptBytes = 0;

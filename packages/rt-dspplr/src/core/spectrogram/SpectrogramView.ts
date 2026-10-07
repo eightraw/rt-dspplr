@@ -14,6 +14,7 @@ import {
     type SpectrogramColorMode,
 } from './paint';
 import { resolvePalette, themePalette } from './themePalette';
+import { watchPixelRatio } from '../timeline/pixelRatio';
 
 // ---------------------------------------------------------------------------
 // createSpectrogram — a canvas that draws the player's clip as a spectrogram
@@ -426,6 +427,7 @@ function createBufferSpectrogram(
         })
         : null;
     observer?.observe(canvas);
+    const unwatchRatio = watchPixelRatio(canvas, resize);
     resize();
     onState(player.getState());
     schedulePaint();
@@ -456,6 +458,7 @@ function createBufferSpectrogram(
             disposed = true;
             unsubscribe();
             observer?.disconnect();
+            unwatchRatio();
             sight?.disconnect();
             if (resizeTimer) clearTimeout(resizeTimer);
             if (frame) canvas.ownerDocument.defaultView?.cancelAnimationFrame(frame);

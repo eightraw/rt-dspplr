@@ -1,11 +1,32 @@
-import { checkFramesPerPeak, ffmpegDecoder, prepareAudio, type PrepareOptions, type StemSpec } from './index';
+import {
+    AUDIO_DEMUXERS,
+    checkConcurrency,
+    checkDockerImage,
+    checkFramesPerPeak,
+    checkSegmentSeconds,
+    ffmpegDecoder,
+    prepareAudio,
+    type PrepareOptions,
+    type StemSpec,
+} from './index';
 
-// rtd-prepare <input> <outDir> [--segment 10] [--peak 256 (a power of two, 16-65536)] [--concurrency N]
+// rtd-prepare <input> <outDir> [--segment 10 (0.1-60)] [--peak 256 (a power of two, 16-65536)] [--concurrency N (1-64)]
 //             [--stem <key>=<file.wav>]... [--label <key>=<text>]... [--quiet]
 //             [--decoder ffmpeg | docker:<image>]   (experimental: formats other than WAV, MP3, Opus and FLAC through ffmpeg)
+//             [--demuxers <name,...> | any]         (what ffmpeg may read: AUDIO_DEMUXERS by default)
 
 const USAGE = 'usage: rtd-prepare <input> <outDir> [--segment <seconds>] [--peak <framesPerPeak>] [--concurrency <threads>] '
-    + '[--stem <key>=<file>]... [--label <key>=<text>]... [--decoder ffmpeg|docker:<image>] [--quiet]';
+    + '[--stem <key>=<file>]... [--label <key>=<text>]... [--decoder ffmpeg|docker:<image>] [--demuxers <name,...>|any] [--quiet]';
+
+/** A numeric flag's value through its check: only plain decimal digits are a number, anything else is reported as given. */
+function numeric<T>(flag: string, value: string | undefined, pattern: RegExp, check: (value: unknown) => T): T | undefined {
+    if (value === undefined) return undefined;
+    try {
+        return check(pattern.test(value) ? Number(value) : value);
+    } catch (error) {
+        throw new Error(`--${flag}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
 
 /** `key=value` → [key, value]; the value may contain '='. */
 function pair(flag: string, value: string): [string, string] {
@@ -44,27 +65,26 @@ export async function main(argv: string[]): Promise<number> {
         return flags.help ? 0 : 2;
     }
     const [input, outDir] = positional;
-    let framesPerPeak: number | undefined;
-    if (flags.peak !== undefined) {
-        try {
-            framesPerPeak = checkFramesPerPeak(/^\d+$/.test(flags.peak) ? Number(flags.peak) : flags.peak);
-        } catch (error) {
-            console.error(`rtd-prepare: --peak: ${error instanceof Error ? error.message : String(error)}\n${USAGE}`);
-            return 2;
-        }
-    }
-    const options: PrepareOptions = {
-        outDir,
-        segmentSeconds: flags.segment ? Number(flags.segment) : undefined,
-        framesPerPeak,
-        concurrency: flags.concurrency ? Number(flags.concurrency) : undefined,
-        ...(Object.keys(stems).length ? { stems } : {}),
-    };
-    if (flags.decoder === 'ffmpeg') options.decoder = ffmpegDecoder();
-    else if (flags.decoder?.startsWith('docker:')) {
-        options.decoder = ffmpegDecoder({ command: ['docker', 'run', '--rm', '-i', '--network', 'none', '--security-opt', 'no-new-privileges', flags.decoder.slice(7), 'ffmpeg'] });
-    } else if (flags.decoder) {
-        console.error(`unknown --decoder ${flags.decoder}`);
+    let options: PrepareOptions;
+    try {
+        options = {
+            outDir,
+            segmentSeconds: numeric('segment', flags.segment, /^(?:\d+(?:\.\d*)?|\.\d+)$/, checkSegmentSeconds),
+            framesPerPeak: numeric('peak', flags.peak, /^\d+$/, checkFramesPerPeak),
+            concurrency: numeric('concurrency', flags.concurrency, /^\d+$/, checkConcurrency),
+            ...(Object.keys(stems).length ? { stems } : {}),
+        };
+        // ffmpeg reads the usual audio containers only, unless told otherwise: fewer parsers for what may be an upload.
+        if (flags.demuxers !== undefined && !flags.decoder) throw new Error('--demuxers goes with --decoder');
+        const demuxers = flags.demuxers === undefined ? AUDIO_DEMUXERS : flags.demuxers === 'any' ? undefined : flags.demuxers.split(',');
+        if (flags.decoder === 'ffmpeg') options.decoder = ffmpegDecoder({ demuxers });
+        else if (flags.decoder?.startsWith('docker:')) {
+            // The image goes on the docker line as it is: a name, never a flag (docker:--privileged).
+            const image = checkDockerImage(flags.decoder.slice(7));
+            options.decoder = ffmpegDecoder({ command: ['docker', 'run', '--rm', '-i', '--network', 'none', '--security-opt', 'no-new-privileges', image, 'ffmpeg'], demuxers });
+        } else if (flags.decoder !== undefined) throw new Error(`unknown --decoder ${JSON.stringify(flags.decoder)}`);
+    } catch (error) {
+        console.error(`rtd-prepare: ${error instanceof Error ? error.message : String(error)}\n${USAGE}`);
         return 2;
     }
     let peakRss = process.memoryUsage().rss;

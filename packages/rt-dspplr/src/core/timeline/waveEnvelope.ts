@@ -1,4 +1,5 @@
 import { pickPeakPyramidLevel, type WaveformPeakPyramid } from '../waveform/pyramid';
+import { pixelRatio } from './pixelRatio';
 
 // Envelope-style waveform: for every device-pixel column of the visible
 // sample range, the min/max peak (outer envelope) and the RMS (inner body)
@@ -102,7 +103,7 @@ export function drawEnvelope(
     peakColor: string,
     rmsColor: string,
 ): void {
-    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const dpr = pixelRatio(canvas);
     const pxW = Math.max(1, Math.round(width * dpr));
     const pxH = Math.max(1, Math.round(height * dpr));
     if (canvas.width !== pxW) canvas.width = pxW;

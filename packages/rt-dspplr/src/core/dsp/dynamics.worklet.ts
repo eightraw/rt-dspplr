@@ -53,12 +53,29 @@ class DynamicsProcessor extends AudioWorkletProcessor {
 
     private detectorEnvelope = 0;
     private appliedGain = 1;
+    /**
+     * Set by the node's 'dispose' message. Until then process() keeps the
+     * processor alive even with no input: a chain being rewired leaves it
+     * unconnected for a moment, and returning false would end it for good.
+     */
+    private disposed = false;
+
+    constructor() {
+        super();
+        // (The node test's stand-in for AudioWorkletProcessor has no port.)
+        if (this.port) {
+            this.port.onmessage = (event: MessageEvent) => {
+                if (event.data === 'dispose') this.disposed = true;
+            };
+        }
+    }
 
     process(
         inputs: Float32Array[][],
         outputs: Float32Array[][],
         parameters: Record<string, Float32Array>,
     ): boolean {
+        if (this.disposed) return false;
         const input = inputs[0];
         const output = outputs[0];
         if (!input || !output || input.length === 0) {

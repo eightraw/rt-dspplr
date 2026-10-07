@@ -92,12 +92,59 @@ const RATIO_STEPS = 64;
 
 type Rgb = [number, number, number];
 
+const parsedColors = new Map<string, Rgb>();
+let colorProbe: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null | undefined;
+
+/**
+ * Any CSS colour as sRGB bytes, cached: hex is read directly, anything else
+ * (rgb(), hsl(), a name, oklch(), color()) is painted on a 1×1 canvas and read
+ * back, so the browser's own parser decides. Not a colour (or no canvas, as in
+ * Node): black. The alpha is dropped. A var() is resolved where the palette is
+ * read from the theme (themePalette.ts), not here.
+ */
 function parseColor(value: string): Rgb {
-    const hex = value.trim().replace(/^#/, '');
-    const full = hex.length === 3 ? hex.split('').map((c) => c + c).join('') : hex;
-    const n = Number.parseInt(full.slice(0, 6), 16);
-    if (!Number.isFinite(n) || full.length < 6) return [0, 0, 0];
+    const key = value.trim();
+    let rgb = parsedColors.get(key);
+    if (!rgb) {
+        rgb = parseHex(key) ?? paintedColor(key) ?? [0, 0, 0];
+        if (parsedColors.size > 256) parsedColors.clear();
+        parsedColors.set(key, rgb);
+    }
+    return rgb;
+}
+
+/** #rgb, #rgba, #rrggbb, #rrggbbaa. */
+function parseHex(value: string): Rgb | null {
+    const match = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(value);
+    if (!match) return null;
+    const digits = match[1].length <= 4 ? match[1].split('').map((c) => c + c).join('') : match[1];
+    const n = Number.parseInt(digits.slice(0, 6), 16);
     return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+function paintedColor(value: string): Rgb | null {
+    if (colorProbe === undefined) {
+        colorProbe = null;
+        try {
+            if (typeof OffscreenCanvas === 'function') colorProbe = new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true });
+            else if (typeof document !== 'undefined') colorProbe = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+        } catch {
+            colorProbe = null;
+        }
+    }
+    const ctx = colorProbe;
+    if (!ctx) return null;
+    // An invalid colour leaves fillStyle as it was: set from two different colours, it reads back differently.
+    ctx.fillStyle = '#000';
+    ctx.fillStyle = value;
+    const first = ctx.fillStyle;
+    ctx.fillStyle = '#fff';
+    ctx.fillStyle = value;
+    if (ctx.fillStyle !== first) return null;
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.fillRect(0, 0, 1, 1);
+    const pixel = ctx.getImageData(0, 0, 1, 1).data;
+    return [pixel[0], pixel[1], pixel[2]];
 }
 
 function lerp(a: Rgb, b: Rgb, k: number): Rgb {

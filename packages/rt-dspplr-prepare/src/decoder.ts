@@ -1,4 +1,4 @@
-import { decodeInterleaved, looksLikeWav, parseWavHeader, WavFormatError, type WavFormat } from '@saitdigital/rt-dspplr/format';
+import { decodeInterleaved, looksLikeWav, MAX_CHANNELS, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, parseWavHeader, WavFormatError, type WavFormat } from '@saitdigital/rt-dspplr/format';
 
 // ---------------------------------------------------------------------------
 // Decoder hook. A decoder turns the source's bytes into planar Float32 blocks.
@@ -48,6 +48,24 @@ export class UnsupportedFormatError extends Error {
     constructor(message: string) {
         super(message);
         this.name = 'UnsupportedFormatError';
+    }
+}
+
+// What the player plays: the limits its manifest check holds a timeline to.
+export { MAX_CHANNELS, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE };
+
+/**
+ * A decoded input's channels, and its rate when it is the timeline's (A's: a stem at any other
+ * rate is converted to A's), checked against what the player plays, before any work is done.
+ */
+export function checkAudioShape(format: { sampleRate: number; channels: number }, what: string, timeline: boolean): void {
+    const { sampleRate, channels } = format;
+    if (!Number.isInteger(channels) || channels < 1 || channels > MAX_CHANNELS) {
+        throw new UnsupportedFormatError(`${what} has ${channels} channels: the player plays 1 to ${MAX_CHANNELS}`);
+    }
+    if (!Number.isInteger(sampleRate) || sampleRate < 1) throw new UnsupportedFormatError(`${what} says its rate is ${sampleRate} Hz`);
+    if (timeline && (sampleRate < MIN_SAMPLE_RATE || sampleRate > MAX_SAMPLE_RATE)) {
+        throw new UnsupportedFormatError(`${what} is at ${sampleRate} Hz: the player plays ${MIN_SAMPLE_RATE} to ${MAX_SAMPLE_RATE} Hz, so convert it first`);
     }
 }
 

@@ -27,20 +27,48 @@ export interface PreviewSettings {
     key: string;
 }
 
-const codes = new WeakMap<DspPlugin, string>();
+const codes = new WeakMap<DspPlugin, string | null>();
+/** Sources a preview worker could not compile: left out of the previews, and counted as missing. */
+const broken = new Set<string>();
 
-/** The source of a plugin's process() preview, as an expression the worker can evaluate. */
+/**
+ * The source of a plugin's process() preview: the function's own text, which
+ * the preview worker compiles (previewStages.ts). null without a preview, and
+ * for one that cannot run there: an async function or a generator (the
+ * worker reads the channels back as soon as the call returns), a bound or
+ * built-in function (it has no source), or a source a worker could not compile.
+ */
 export function previewCode(plugin: DspPlugin): string | null {
     const fn = plugin.preview?.process;
     if (!fn) return null;
     let code = codes.get(plugin);
-    if (!code) {
-        code = fn.toString().trim();
-        // A method shorthand (`process(channels) {…}`) is not an expression on its own.
-        if (!/^(async\s+)?function\b/.test(code) && !/^(async\s*)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.test(code)) code = `function ${code}`;
+    if (code === undefined) {
+        code = sourceOf(plugin, fn);
         codes.set(plugin, code);
     }
+    return code !== null && !broken.has(code) ? code : null;
+}
+
+function sourceOf(plugin: DspPlugin, fn: (...args: never[]) => unknown): string | null {
+    const kind = Object.prototype.toString.call(fn);
+    if (kind !== '[object Function]') {
+        const what = kind === '[object AsyncFunction]' ? 'an async function' : 'a generator';
+        console.warn(`[preview] ${plugin.name}: preview.process is ${what}; it must process the channels before it returns. It is left out of the previews.`);
+        return null;
+    }
+    const code = fn.toString().trim();
+    if (/\{\s*\[native code\]\s*\}$/.test(code)) {
+        console.warn(`[preview] ${plugin.name}: preview.process has no source (a bound or built-in function). It is left out of the previews.`);
+        return null;
+    }
     return code;
+}
+
+/** A preview worker could not compile `code`. Returns whether that is news (the coverage changes). */
+export function markPreviewBroken(code: string): boolean {
+    if (broken.has(code)) return false;
+    broken.add(code);
+    return true;
 }
 
 const active = (e: EffectState) => !e.bypassed && !e.error;
@@ -50,7 +78,7 @@ export function previewSettings(state: AudioPlayerState): PreviewSettings {
     const hp = effects.find((e) => e.plugin.builtin === 'highpass' && active(e));
     const dyn = effects.find((e) => e.plugin.builtin === 'dynamics' && active(e));
     const third = effects.filter((e) => !e.plugin.builtin && active(e));
-    const withProcess = third.filter((e) => e.plugin.preview?.process);
+    const withProcess = third.filter((e) => previewCode(e.plugin) !== null);
     let stages: PreviewStage[] | null = null;
     if (withProcess.length > 0) {
         stages = [];
@@ -85,8 +113,10 @@ export function previewCoverage(effects: EffectState[], hasSpectrogramFile: bool
     for (const e of effects) {
         if (e.plugin.builtin || !active(e)) continue;
         const p = e.plugin.preview;
-        if (!p?.process) { waveform = false; missing.add(e.plugin.name); }
-        if (!p?.process && !p?.magnitudeResponse) { spectrogram = false; missing.add(e.plugin.name); }
+        // A process() that cannot run in the worker (previewCode) counts as none.
+        const process = previewCode(e.plugin) !== null;
+        if (!process) { waveform = false; missing.add(e.plugin.name); }
+        if (!process && !p?.magnitudeResponse) { spectrogram = false; missing.add(e.plugin.name); }
         if (!(p?.magnitudeResponse && hasSpectrogramFile)) { overview = false; if (!p?.magnitudeResponse) missing.add(e.plugin.name); }
     }
     return { waveform, spectrogram, overview, missing: [...missing] };

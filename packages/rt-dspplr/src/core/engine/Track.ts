@@ -166,9 +166,10 @@ export class Track {
         this._loadId += 1;
         this._loader.abort();
         this.stop();
-        // Background renders of the clip we are leaving are no longer useful.
+        // Renders of the clip we are leaving are no longer useful to this track
+        // (another player on the same clip may still wait for them).
         if (this._buffer) {
-            this._stretch?.cancelPrewarm(this._buffer);
+            this._stretch?.release(this, this._buffer);
         }
         this._buffer = null;
         this._activeTarget = null;
@@ -211,8 +212,8 @@ export class Track {
 
         if (this._loopRange) {
             source.loop = true;
-            source.loopStart = this._mapSourceTimeToPlaybackTime(this._loopRange.start, playbackTarget.buffer.duration, playbackTarget.usesStretchedBuffer);
-            source.loopEnd = this._mapSourceTimeToPlaybackTime(this._loopRange.end, playbackTarget.buffer.duration, playbackTarget.usesStretchedBuffer);
+            source.loopStart = this._mapSourceTimeToPlaybackTime(this._loopRange.start, playbackTarget.buffer.duration, playbackTarget.usesStretchedBuffer, rate);
+            source.loopEnd = this._mapSourceTimeToPlaybackTime(this._loopRange.end, playbackTarget.buffer.duration, playbackTarget.usesStretchedBuffer, rate);
         }
 
         source.onended = () => {
@@ -233,7 +234,7 @@ export class Track {
 
         source.start(
             startWhen,
-            this._mapSourceTimeToPlaybackTime(startOffset, playbackTarget.buffer.duration, playbackTarget.usesStretchedBuffer),
+            this._mapSourceTimeToPlaybackTime(startOffset, playbackTarget.buffer.duration, playbackTarget.usesStretchedBuffer, rate),
         );
 
         this._startPositionReporting();
@@ -312,8 +313,8 @@ export class Track {
             if (range) {
                 const playbackDuration = this._source.buffer?.duration ?? this.duration;
                 this._source.loop = true;
-                this._source.loopStart = this._mapSourceTimeToPlaybackTime(range.start, playbackDuration, this._activeUsesStretchedBuffer);
-                this._source.loopEnd = this._mapSourceTimeToPlaybackTime(range.end, playbackDuration, this._activeUsesStretchedBuffer);
+                this._source.loopStart = this._mapSourceTimeToPlaybackTime(range.start, playbackDuration, this._activeUsesStretchedBuffer, this._activePlaybackRate);
+                this._source.loopEnd = this._mapSourceTimeToPlaybackTime(range.end, playbackDuration, this._activeUsesStretchedBuffer, this._activePlaybackRate);
             } else {
                 this._source.loop = false;
             }
@@ -376,7 +377,7 @@ export class Track {
             return;
         }
 
-        this._stretch.prewarm(ctx, this._buffer, speeds, this._playbackRate);
+        this._stretch.prewarm(ctx, this._buffer, speeds, this._playbackRate, this);
     }
 
     subscribe(listener: (state: TrackState) => void): () => void {
@@ -390,7 +391,7 @@ export class Track {
         this._loadId += 1;
         this.stop();
         if (this._buffer) {
-            this._stretch?.cancelPrewarm(this._buffer);
+            this._stretch?.release(this, this._buffer);
         }
         this._loader.dispose();
         if (this._gainNode) {
@@ -504,12 +505,18 @@ export class Track {
         return this._gainNode;
     }
 
+    /**
+     * A source-domain time in the buffer a source plays. `rate` is the speed
+     * that buffer was rendered for: the playing source's, not the requested
+     * one, which a setPlaybackRate() before the new source starts has changed.
+     */
     private _mapSourceTimeToPlaybackTime(
         sourceTime: number,
         playbackDuration: number,
         usesStretchedBuffer: boolean,
+        rate: number,
     ): number {
-        const mappedTime = usesStretchedBuffer ? (sourceTime / this._playbackRate) : sourceTime;
+        const mappedTime = usesStretchedBuffer ? (sourceTime / rate) : sourceTime;
         return Math.max(0, Math.min(mappedTime, playbackDuration));
     }
 
@@ -540,7 +547,7 @@ export class Track {
 
         try {
             const source = this._buffer;
-            const stretchedBuffer = await this._stretch.ensureVariant(ctx, source, rate, 'playback');
+            const stretchedBuffer = await this._stretch.ensureVariant(ctx, source, rate, 'playback', this);
             const target: PlaybackTarget = {
                 buffer: stretchedBuffer,
                 nativePlaybackRate: 1,
@@ -549,7 +556,10 @@ export class Track {
             if (source === this._buffer) this._activeTarget = { buffer: source, rate, target };
             return target;
         } catch (error) {
-            console.warn('[Track] Stretch worker failed, falling back to native playbackRate', error);
+            // An AbortError: this track left the clip and its render was dropped.
+            if ((error as { name?: string } | null)?.name !== 'AbortError') {
+                console.warn('[Track] Stretch worker failed, falling back to native playbackRate', error);
+            }
             return {
                 buffer: this._buffer,
                 nativePlaybackRate: rate,

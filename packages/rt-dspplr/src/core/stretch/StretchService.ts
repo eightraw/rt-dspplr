@@ -17,12 +17,18 @@ import type { StretchStrategy } from './strategies';
 //   - 'playback' jobs (the speed the listener actually selected) always run
 //     before 'prewarm' jobs, and a queued prewarm job is promoted when the
 //     same variant is requested for playback;
-//   - prewarm jobs of a clip can be cancelled (e.g. when the listener moves on
-//     to another clip) as long as they have not reached a worker yet;
+//   - every job knows who waits for it (owner tokens: the players' tracks).
+//     Players on one URL share the decoded buffer, so their requests merge
+//     into one job. When an owner moves on to another clip it releases its
+//     jobs; a job nobody waits for any more is dropped from the queue, or
+//     stopped in its worker;
 //   - channel data is copied for the worker only at dispatch time, so a long
 //     prewarm queue does not hold extra copies of the PCM.
 
 export type StretchPriority = 'playback' | 'prewarm';
+
+/** The owner of requests made without one: it never releases them. */
+const ANONYMOUS = {};
 
 /** Thrown when the strategy has no worker (native strategy, CSP, worker crash loop). */
 export class StretchUnavailableError extends Error {
@@ -48,7 +54,10 @@ interface Job {
     speed: number;
     transientSensitivity: number;
     context: BaseAudioContext;
+    /** 'playback' when any owner asked for playback. */
     priority: StretchPriority;
+    /** Who waits for the render, with the priority each asked for. */
+    owners: Map<object, StretchPriority>;
     seq: number;
     resolve: (buffer: AudioBuffer) => void;
     reject: (error: unknown) => void;
@@ -107,6 +116,7 @@ export class StretchService {
     private _queue: Job[] = [];
     private _inflight = new Map<string, { job: Job; promise: Promise<AudioBuffer> }>();
     private _slots: WorkerSlot[] | null = null;
+    private _sweepTimer: ReturnType<typeof setTimeout> | null = null;
 
     private constructor(strategy: StretchStrategy) {
         this.strategy = strategy;
@@ -121,13 +131,16 @@ export class StretchService {
      * Resolve the variant of `source` at `speed`, rendering it if needed.
      * Speed 1 resolves to the source itself. Rejects with
      * StretchUnavailableError when no worker can run, so callers can fall back
-     * to native playbackRate.
+     * to native playbackRate, and with an AbortError when the render was
+     * dropped (see `release()`). `owner` is the caller's token for `release()`;
+     * without one the request is never released.
      */
     ensureVariant(
         context: BaseAudioContext,
         source: AudioBuffer,
         speed: number,
         priority: StretchPriority = 'playback',
+        owner: object = ANONYMOUS,
         transientSensitivity = 0.5,
     ): Promise<AudioBuffer> {
         const normalizedSpeed = normalizeSpeed(speed);
@@ -147,10 +160,9 @@ export class StretchService {
 
         const inflight = this._inflight.get(key);
         if (inflight) {
-            if (priority === 'playback' && inflight.job.priority === 'prewarm') {
-                inflight.job.priority = 'playback';
-                this._sortQueue();
-            }
+            const { owners } = inflight.job;
+            if (owners.get(owner) !== 'playback') owners.set(owner, priority);
+            this._reprioritize(inflight.job);
             return inflight.promise;
         }
 
@@ -168,6 +180,7 @@ export class StretchService {
                 transientSensitivity,
                 context,
                 priority,
+                owners: new Map([[owner, priority]]),
                 seq: this._nextSeq++,
                 resolve,
                 reject,
@@ -187,13 +200,15 @@ export class StretchService {
 
     /**
      * Queue background renders of `source` at `speeds`. `preferred` (usually
-     * the currently selected speed) is queued first.
+     * the currently selected speed) is queued first. `owner`: as for
+     * `ensureVariant()`.
      */
     prewarm(
         context: BaseAudioContext,
         source: AudioBuffer,
         speeds: readonly number[],
         preferred?: number,
+        owner: object = ANONYMOUS,
     ): void {
         if (!this.available) return;
 
@@ -211,7 +226,7 @@ export class StretchService {
             const bytes = Math.round(source.length / speed) * source.numberOfChannels * 4;
             if (bytes > remaining) continue;
             remaining -= bytes;
-            void this.ensureVariant(context, source, speed, 'prewarm').catch((error: unknown) => {
+            void this.ensureVariant(context, source, speed, 'prewarm', owner).catch((error: unknown) => {
                 const name = (error as { name?: string } | null)?.name;
                 if (name === 'AbortError' || name === 'StretchUnavailableError') return;
                 console.warn('[StretchService] Failed to prewarm speed variant', speed, error);
@@ -220,8 +235,33 @@ export class StretchService {
     }
 
     /**
-     * Drop queued prewarm jobs. With `source`, only that clip's jobs; without,
-     * all of them. Jobs already running in a worker finish normally.
+     * `owner` no longer waits for the renders of `source` (of every source
+     * without one): its player moved on to another clip. A render nobody else
+     * waits for is dropped from the queue, or stopped in its worker (which is
+     * replaced). That happens after the current task, so asking for the same
+     * render again at once (the same clip loaded again) keeps it going.
+     */
+    release(owner: object, source?: AudioBuffer): void {
+        const sourceId = source ? audioBufferId(source) : null;
+        let abandoned = false;
+        for (const { job } of this._inflight.values()) {
+            if ((sourceId !== null && job.sourceId !== sourceId) || !job.owners.delete(owner)) continue;
+            if (job.owners.size === 0) abandoned = true;
+            else this._reprioritize(job);
+        }
+        if (abandoned && this._sweepTimer === null) {
+            this._sweepTimer = setTimeout(() => {
+                this._sweepTimer = null;
+                this._dropAbandoned();
+            }, 0);
+        }
+    }
+
+    /**
+     * Drop queued prewarm jobs, whoever asked for them. With `source`, only
+     * that clip's jobs; without, all of them. Jobs already running in a worker
+     * finish normally. (Players use `release()`, which keeps what another
+     * player still waits for.)
      */
     cancelPrewarm(source?: AudioBuffer): void {
         const sourceId = source ? audioBufferId(source) : null;
@@ -251,6 +291,49 @@ export class StretchService {
             if (a.priority !== b.priority) return a.priority === 'playback' ? -1 : 1;
             return a.seq - b.seq;
         });
+    }
+
+    /** A job is a playback job while any of its owners asked for playback. */
+    private _reprioritize(job: Job): void {
+        let priority: StretchPriority = 'prewarm';
+        for (const asked of job.owners.values()) {
+            if (asked === 'playback') priority = 'playback';
+        }
+        if (priority === job.priority) return;
+        job.priority = priority;
+        this._sortQueue();
+    }
+
+    /** Drop the jobs nobody waits for any more: queued ones, and running ones with their worker. */
+    private _dropAbandoned(): void {
+        const kept: Job[] = [];
+        for (const job of this._queue) {
+            if (job.owners.size === 0) this._settle(job, abortError());
+            else kept.push(job);
+        }
+        this._queue = kept;
+
+        for (const slot of this._slots ?? []) {
+            const running = slot.current;
+            const worker = slot.worker;
+            if (!running || running.job.owners.size > 0 || !worker) continue;
+            // A worker cannot be told to stop a render: replace it. Not a crash,
+            // so the slot's crash count stays as it is.
+            this._disarm(slot);
+            slot.busy = false;
+            slot.current = null;
+            this._settle(running.job, abortError());
+            worker.onmessage = null;
+            worker.onerror = null;
+            try {
+                worker.terminate();
+            } catch {
+                // no-op
+            }
+            slot.worker = this.strategy.createWorker();
+            if (slot.worker) this._attach(slot, slot.worker);
+        }
+        this._schedule();
     }
 
     private _ensureSlots(): WorkerSlot[] {
@@ -348,6 +431,8 @@ export class StretchService {
      * the count, so a rare crash does not switch pitch preservation off for good.
      */
     private _crash(slot: WorkerSlot, worker: Worker, error: Error): void {
+        // A late error of a worker the slot already replaced.
+        if (slot.worker !== worker) return;
         this._disarm(slot);
         const failed = slot.current;
         slot.busy = false;

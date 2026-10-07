@@ -1,4 +1,5 @@
 import createPeaksWorker from './peaks.worker.ts?inline-worker';
+import { markPreviewBroken } from '../effects/preview';
 import type { WaveformPeakPyramid } from './pyramid';
 import type { WaveformProcessing } from './types';
 import type { GainTrack } from './gainTrack';
@@ -10,8 +11,13 @@ import type { GainTrack } from './gainTrack';
 // Usage:
 //   const analyzer = new WaveformAnalyzer(({ source, processed }) => draw(processed ?? source));
 //   analyzer.setBuffers(buffer, bufferB, processing);  // new clip / stem B
-//   analyzer.setProcessing(processing);                        // knob moved (debounced)
+//   analyzer.setProcessing(processing);                        // knob moved
 //   analyzer.dispose();
+//
+// One request is in the worker at a time and only the latest one waits: a
+// knob dragged over a long clip (a rebuild can take most of a second) never
+// queues up work, and the waveform follows as fast as the worker can go. The
+// result of a request that belongs to an earlier clip is dropped.
 
 export interface WaveformPyramids {
     /** Peaks of the untouched clip. */
@@ -28,6 +34,7 @@ type BufferReadyMessage = {
     sourcePyramid: WaveformPeakPyramid;
     processedPyramid: WaveformPeakPyramid;
     gain: GainTrack | null;
+    uncompiled?: string[];
 };
 
 type ProcessedReadyMessage = {
@@ -35,11 +42,14 @@ type ProcessedReadyMessage = {
     requestId: number;
     pyramid: WaveformPeakPyramid;
     gain: GainTrack | null;
+    uncompiled?: string[];
 };
 
 type WaveformWorkerMessage = BufferReadyMessage | ProcessedReadyMessage;
 
-const PROCESSED_DEBOUNCE_MS = 16;
+type Job =
+    | { type: 'loadBuffer'; requestId: number; buffer: AudioBuffer; bufferB: AudioBuffer | null; processing: WaveformProcessing }
+    | { type: 'buildProcessed'; requestId: number; loadId: number; processing: WaveformProcessing };
 
 function copyChannels(buffer: AudioBuffer, into: ArrayBuffer[], transfers: ArrayBuffer[]): void {
     for (let index = 0; index < buffer.numberOfChannels; index += 1) {
@@ -53,13 +63,18 @@ export class WaveformAnalyzer {
     private _worker: Worker | null = null;
     private _loadRequestId = 0;
     private _processedRequestId = 0;
-    private _debounce: ReturnType<typeof setTimeout> | null = null;
+    /** The request the worker is on, and the one to send when it is done (the latest only). */
+    private _inFlight: Job | null = null;
+    private _waiting: Job | null = null;
     private _hasBuffer = false;
     private _pyramids: WaveformPyramids = { source: null, processed: null };
     private readonly _onUpdate: (pyramids: WaveformPyramids) => void;
+    private readonly _onPreviewBroken: (() => void) | undefined;
 
-    constructor(onUpdate: (pyramids: WaveformPyramids) => void) {
+    /** `onPreviewBroken`: a plugin's preview did not compile in the worker (previewCode() now leaves it out). */
+    constructor(onUpdate: (pyramids: WaveformPyramids) => void, onPreviewBroken?: () => void) {
         this._onUpdate = onUpdate;
+        this._onPreviewBroken = onPreviewBroken;
         try {
             this._worker = createPeaksWorker();
         } catch (error) {
@@ -74,6 +89,13 @@ export class WaveformAnalyzer {
             if (!message) {
                 return;
             }
+            const job = this._inFlight;
+            this._inFlight = null;
+            const next = this._waiting;
+            this._waiting = null;
+            if (next) this._post(next);
+
+            if (message.uncompiled && message.uncompiled.filter(markPreviewBroken).length > 0) this._onPreviewBroken?.();
 
             if (message.type === 'bufferReady') {
                 if (message.requestId === this._loadRequestId) {
@@ -83,7 +105,9 @@ export class WaveformAnalyzer {
                 return;
             }
 
-            if (message.requestId === this._processedRequestId) {
+            // A rebuild for the clip still loaded is shown even when newer settings wait:
+            // it is closer to them than what is drawn.
+            if (job?.type === 'buildProcessed' && job.loadId === this._loadRequestId) {
                 this._pyramids = { ...this._pyramids, processed: message.pyramid, gain: message.gain };
                 this._onUpdate(this._pyramids);
             }
@@ -109,65 +133,67 @@ export class WaveformAnalyzer {
 
     /**
      * Analyse a new clip (and optionally its stem B). Channel data is
-     * copied, so the buffers stay usable for playback.
+     * copied when the request goes to the worker, so the buffers stay usable
+     * for playback.
      */
     setBuffers(buffer: AudioBuffer, bufferB: AudioBuffer | null, processing: WaveformProcessing): void {
-        const worker = this._worker;
-        if (!worker) return;
-
-        const requestId = ++this._loadRequestId;
-        // A pending processed-only rebuild belongs to the previous buffers.
-        this._clearDebounce();
-        this._processedRequestId += 1;
+        if (!this._worker) return;
         this._hasBuffer = true;
-
-        const channels: ArrayBuffer[] = [];
-        const channelsB: ArrayBuffer[] = [];
-        const transfers: ArrayBuffer[] = [];
-        copyChannels(buffer, channels, transfers);
-        if (bufferB) {
-            copyChannels(bufferB, channelsB, transfers);
-        }
-
-        worker.postMessage({
-            type: 'loadBuffer',
-            sampleRate: buffer.sampleRate,
-            length: buffer.length,
-            channels,
-            channelsB,
-            processing,
-            requestId,
-        }, transfers);
+        // Supersedes whatever waits, and a rebuild in the worker belongs to the previous buffers.
+        this._send({ type: 'loadBuffer', requestId: ++this._loadRequestId, buffer, bufferB, processing });
     }
 
-    /** Rebuild the processed pyramid for new DSP settings (debounced to one frame). */
+    /** Rebuild the processed pyramid for new DSP settings (the latest settings win while the worker is busy). */
     setProcessing(processing: WaveformProcessing): void {
-        const worker = this._worker;
-        if (!worker || !this._hasBuffer) return;
-
-        const requestId = ++this._processedRequestId;
-        this._clearDebounce();
-        this._debounce = setTimeout(() => {
-            this._debounce = null;
-            worker.postMessage({
-                type: 'buildProcessed',
-                requestId,
-                processing,
-            });
-        }, PROCESSED_DEBOUNCE_MS);
+        if (!this._worker || !this._hasBuffer) return;
+        const waiting = this._waiting;
+        if (waiting?.type === 'loadBuffer') {
+            // The waiting load builds its processed pyramid with these settings.
+            waiting.processing = processing;
+            return;
+        }
+        this._send({ type: 'buildProcessed', requestId: ++this._processedRequestId, loadId: this._loadRequestId, processing });
     }
 
     dispose(): void {
-        this._clearDebounce();
         this._worker?.terminate();
         this._worker = null;
+        this._inFlight = null;
+        this._waiting = null;
         this._hasBuffer = false;
     }
 
-    private _clearDebounce(): void {
-        if (this._debounce) {
-            clearTimeout(this._debounce);
-            this._debounce = null;
+    private _send(job: Job): void {
+        if (this._inFlight) {
+            this._waiting = job;
+            return;
         }
+        this._post(job);
+    }
+
+    private _post(job: Job): void {
+        const worker = this._worker;
+        if (!worker) return;
+        this._inFlight = job;
+        if (job.type === 'buildProcessed') {
+            worker.postMessage({ type: 'buildProcessed', requestId: job.requestId, processing: job.processing });
+            return;
+        }
+        const channels: ArrayBuffer[] = [];
+        const channelsB: ArrayBuffer[] = [];
+        const transfers: ArrayBuffer[] = [];
+        copyChannels(job.buffer, channels, transfers);
+        if (job.bufferB) {
+            copyChannels(job.bufferB, channelsB, transfers);
+        }
+        worker.postMessage({
+            type: 'loadBuffer',
+            sampleRate: job.buffer.sampleRate,
+            length: job.buffer.length,
+            channels,
+            channelsB,
+            processing: job.processing,
+            requestId: job.requestId,
+        }, transfers);
     }
 }

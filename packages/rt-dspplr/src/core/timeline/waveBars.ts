@@ -1,4 +1,5 @@
 import { pickPeakPyramidLevel, type WaveformPeakPyramid } from '../waveform/pyramid';
+import { pixelRatio } from './pixelRatio';
 
 // Bar-style waveform: the visible sample range is split into evenly spaced
 // columns, each drawn as a rounded vertical bar mirrored around the centre.
@@ -77,7 +78,7 @@ export function drawBars(
     color: string,
     layout: BarLayout = DEFAULT_BAR_LAYOUT,
 ): void {
-    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const dpr = pixelRatio(canvas);
     const pxW = Math.max(1, Math.round(width * dpr));
     const pxH = Math.max(1, Math.round(height * dpr));
     if (canvas.width !== pxW) canvas.width = pxW;

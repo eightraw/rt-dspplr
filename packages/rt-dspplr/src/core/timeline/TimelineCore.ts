@@ -10,6 +10,7 @@ import { createSpectrogram, type SpectrogramOptions, type SpectrogramView } from
 import type { WaveformPeakPyramid } from '../waveform/pyramid';
 import { clamp, formatClock, spokenTime } from './format';
 import { computeTicks } from './ruler';
+import { watchPixelRatio } from './pixelRatio';
 import { barCountFor, computeBarHeights, drawBars } from './waveBars';
 import { drawEnvelope } from './waveEnvelope';
 
@@ -23,11 +24,14 @@ import { drawEnvelope } from './waveEnvelope';
 //   Ctrl/Cmd + wheel zoom around the pointer, in proportion to the wheel's
 //                    travel, down to a 0.5 s window (wheelZoom 'plain': the
 //                    wheel alone). Only a change of zoom takes the event from
-//                    the page, so at 1x the page keeps scrolling.
+//                    the page: scrolling down at 1x, or up at the closest zoom,
+//                    scrolls the page; scrolling up over a clip at 1x zooms in
+//                    until the closest zoom before the page moves again.
 //   Shift + wheel /  pan while zoomed; the overview strip under the ruler
 //   horizontal wheel can also be dragged or clicked
 //   keyboard         ←/→ ±1 s, PageUp/PageDown ±5 s, Home/End,
-//                    + / − zoom, 0 resets zoom, Esc clears the loop
+//                    + / − zoom, 0 resets zoom, [ / ] set the loop's start /
+//                    end at the playhead, Esc clears the loop
 //
 // With `zoomable` off there is no zoom or pan by any means (wheel, keys,
 // overview strip): the view is the whole clip and the wheel scrolls the
@@ -256,6 +260,8 @@ export class TimelineCore {
             });
             this._resize.observe(this._track);
         }
+        // Another screen density keeps the CSS size: the canvases are redrawn at the new ratio.
+        this._off.push(watchPixelRatio(element, () => this._draw()));
         this._draw();
         this._render();
     }
@@ -752,6 +758,8 @@ export class TimelineCore {
             case '-':
             case '_': event.preventDefault(); this._zoomTo(this._zoom / 1.5, clamp(this._fraction(now), 0, 1)); return;
             case '0': event.preventDefault(); this._zoomTo(1, 0); return;
+            case '[':
+            case ']': event.preventDefault(); this._loopEdgeAt(event.key === '[' ? 'start' : 'end', now); return;
             case 'Escape':
                 if (this._core.getState().loop) {
                     event.preventDefault();
@@ -762,6 +770,22 @@ export class TimelineCore {
         }
         event.preventDefault();
         this._seekTo(target);
+    }
+
+    /**
+     * `[` / `]`: the loop's start (end) at `t`. Its other edge stays where it is, or,
+     * without a loop or past that edge, is the clip's end (start).
+     */
+    private _loopEdgeAt(edge: 'start' | 'end', t: number): void {
+        const duration = this._input.duration;
+        const at = clamp(t, 0, duration);
+        const loop = this._core.getState().loop;
+        const range = edge === 'start'
+            ? { start: at, end: loop && loop.end - at >= MIN_LOOP_SECONDS ? loop.end : duration }
+            : { start: loop && at - loop.start >= MIN_LOOP_SECONDS ? loop.start : 0, end: at };
+        // At the clip's very edge there is no room for a loop: nothing changes.
+        if (range.end - range.start < MIN_LOOP_SECONDS) return;
+        this._core.setLoop(range);
     }
 
     private _onEdgeKeyDown(edge: 'start' | 'end', event: KeyboardEvent): void {
