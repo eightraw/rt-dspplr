@@ -1,6 +1,6 @@
 // Playwright global setup for the stream-player tests: writes synthetic
-// recordings and prepares them with the built @saitdigital/rt-dspplr-prepare
-// (packages/rt-dspplr-prepare/dist: `npm run build:lib` at the root builds it)
+// recordings and prepares them with the package's built "./prepare" entry
+// (dist/prepare: `npm run build` builds it)
 // into node_modules/.cache/rtd-long (served by the test server at /node_modules/.cache/rtd-long/).
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,12 +8,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const FIXTURES = path.join(root, 'node_modules', '.cache', 'rtd-long');
-const PREPARE = path.resolve(root, '..', 'rt-dspplr-prepare', 'dist', 'index.js');
+const PREPARE = path.resolve(root, 'dist', 'prepare', 'index.js');
 
-/** The built prepare package (a sibling workspace package; its dist must exist). */
+/** The package's built "./prepare" entry (dist/prepare must exist). */
 export async function loadPrepare() {
     if (!fs.existsSync(PREPARE)) {
-        throw new Error(`${PREPARE} is missing: build it first (npm run build -w packages/rt-dspplr-prepare, or npm run build:lib at the root)`);
+        throw new Error(`${PREPARE} is missing: build it first (npm run build -w packages/rt-dspplr, or npm run build:lib at the root)`);
     }
     return import(pathToFileURL(PREPARE).href);
 }
@@ -180,7 +180,7 @@ export default async function setup() {
  */
 async function lossy() {
     const { prepareAudio, builtinDecoder } = await loadPrepare();
-    const fixtures = path.resolve(root, '..', 'rt-dspplr-prepare', 'test', 'fixtures');
+    const fixtures = path.resolve(root, 'test', 'fixtures', 'sources');
     for (const codec of ['mp3', 'opus', 'flac']) {
         const src = codec === 'flac' ? path.join(FIXTURES, 'flacclip-src.flac') : path.join(fixtures, `sine-speech.${codec}`);
         if (codec === 'flac') flac16(src, 2, 44100, 2);

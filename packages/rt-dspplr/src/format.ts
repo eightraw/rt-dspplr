@@ -1,5 +1,5 @@
 // `@saitdigital/rt-dspplr/format` — the prepared-audio formats, shared by the
-// player and `@saitdigital/rt-dspplr-prepare`: the manifest (types,
+// player and `./prepare`: the manifest (types,
 // validation, stem keys), the binary overview files (peaks.bin, bands.bin,
 // spectrogram.bin), the source's runs (the segments: byte ranges of the
 // original, decoded) and WAV. Pure code: no DOM, no Node APIs, no workers, so it
@@ -8,9 +8,9 @@
 // The normative description is docs/manifest.md in the repository; the JSON
 // Schema ships as `@saitdigital/rt-dspplr/manifest.schema.json`.
 //
-// One implementation, two packages: the prepare package imports this entry
-// instead of carrying its own copy, so what prepare writes is what this
-// version of the player reads.
+// One implementation for both sides: the package's "./prepare" entry imports
+// this entry instead of carrying its own copy, so what prepare writes is what
+// this version of the player reads.
 
 // ---- the manifest ---------------------------------------------------------------------
 export {
@@ -101,9 +101,9 @@ export {
 // The overview files are made with exactly the player's own analysis (the
 // spectrogram worker's spectral code, the DSP chain's high-pass
 // coefficients), so the prepared previews match what the player computes.
-/** @experimental Shared with `@saitdigital/rt-dspplr-prepare`; may change in minor releases. */
+/** @experimental Shared with `./prepare`; may change in minor releases. */
 export { frameRows, planBands, quantizeRows, PYRAMID_BANDS, type Band } from './core/spectrogram/spectral';
 // For a host with a faster real FFT (the prepare step plugs its WebAssembly in).
 export { setSpectralBackend, transformJs, type Fft } from './core/spectrogram/spectral';
-/** @experimental Shared with `@saitdigital/rt-dspplr-prepare`; may change in minor releases. */
+/** @experimental Shared with `./prepare`; may change in minor releases. */
 export { computeHighPassCoefficients, HIGH_PASS_SECTION_Q, type HighPassCoefficients } from './core/dsp/highPass';

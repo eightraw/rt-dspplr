@@ -4,7 +4,7 @@ import { Mixer, Track, type LoopRange, type TrackState } from '../engine';
 import type { PlaybackTarget } from '../engine/Track';
 import type AudioEngine from '../engine/AudioEngine';
 import { engineWindow } from '../engine/engineWindow';
-import { loadStreamEngine, StreamEngine, type EngineStem } from '../engine/StreamEngine';
+import { loadStreamEngine, StreamEngine, stretchAvailable, type EngineStem } from '../engine/StreamEngine';
 import { findZeroCrossing } from '../engine/zeroCrossing';
 import { BufferLoader, checkClipLimits, type ClipLimits } from '../loader/BufferLoader';
 import type { StretchService } from '../stretch/StretchService';
@@ -65,6 +65,10 @@ export interface BufferSourceSettings {
 /** A stream engine playing the current clip. */
 interface EnginePath {
     engine: StreamEngine;
+    /** Where the engine's output goes (the core's output chain). */
+    output: AudioNode;
+    /** The engine's channels: the wider of the two stems (fixed when it is made). */
+    channels: number;
     /** The clip's rate (the engine runs at it). */
     rate: number;
     /** Segment starts and the total (length n + 1). */
@@ -89,6 +93,8 @@ export class BufferSource implements PlaybackSource {
     private readonly _loaderB: BufferLoader;
     private _eng: EnginePath | null = null;
     private _pumpTimer: ReturnType<typeof setInterval> | null = null;
+    /** False once a stretcher failed (until one starts again): see _preservesPitch. */
+    private _stretchWorks = true;
 
     private _generation = 0;
     private _loadRequestId = 0;
@@ -132,13 +138,26 @@ export class BufferSource implements PlaybackSource {
     get capabilities(): SourceCapabilities {
         return {
             kind: 'buffer',
-            canPreservePitch: this._eng ? this._eng.engine.stretch.ready : !!this._stretch?.available,
+            canPreservePitch: this._preservesPitch(),
             canMixStemB: true,
             stems: [],
             exactWaveformPreview: true,
             spectrogram: true,
             loopSnapping: true,
         };
+    }
+
+    /**
+     * Whether speed changes keep the pitch. On the engine path, a new engine's
+     * stretcher takes a moment to start (the direct path plays meanwhile): the
+     * flag stays as the stretchers before it went, rather than flickering with
+     * each clip. A clip left on the tracks (no engine) follows the speed.
+     */
+    private _preservesPitch(): boolean {
+        const mode = this._engineMode;
+        if (!mode) return !!this._stretch?.available;
+        if (!mode.stretch || !this._stretchWorks) return false;
+        return !!this._eng || this._loading || !this._clip;
     }
 
     private get _state() {
@@ -255,7 +274,7 @@ export class BufferSource implements PlaybackSource {
                 eng.pausedFrame = this._frameOf(eng, target);
                 eng.engine.seek(eng.pausedFrame);
             }
-            this._update({ currentTime: target, playbackStartPoint: target, startedAt: eng.playing ? eng.startedAt : null, ended: false });
+            this._update({ currentTime: target, playbackStartPoint: target, startedAt: this._startedAt(), ended: false });
             return;
         }
         const trackA = this._trackA;
@@ -340,9 +359,10 @@ export class BufferSource implements PlaybackSource {
             && transportId === this._playRequestId && generation === this._generation
             && !this._disposed && trackA === this._trackA && buffer === trackA?.buffer;
 
-        if (this._eng) {
+        if (this._eng || this._loading) {
             // Realtime in the engine: the stretch keeps the pitch; the change is smoothed.
-            this._eng.engine.setRate(normalized);
+            // While a clip loads, only noted: its engine (or its tracks) start at this speed.
+            this._eng?.engine.setRate(normalized);
             trackA?.setPlaybackRate(normalized);
             trackB?.setPlaybackRate(normalized);
             this._update({ processing: { ...this._state.processing, speed: normalized }, pendingSpeed: null });
@@ -657,6 +677,10 @@ export class BufferSource implements PlaybackSource {
             readyA.settle(false);
             return false;
         }
+        // A loop set while the clip loaded: the track's load let go of it, the engine
+        // was made without it, and its edges snap to this clip's zero crossings now.
+        const loopWhileLoading = this._state.loop;
+        if (loopWhileLoading) this.setLoop(loopWhileLoading);
 
         // What the transport asked for while the clip loaded: a seek moved the
         // start, a pause, stop or resume set the intent (see seek, pause, resume).
@@ -671,6 +695,8 @@ export class BufferSource implements PlaybackSource {
             progress: 1,
             duration: trackA.duration,
             buffer: trackA.buffer,
+            // On an engine or on the tracks now (see _preservesPitch).
+            capabilities: this.capabilities,
             currentTime: transportCurrent ? startPoint : trackA.currentTime,
             playbackStartPoint: transportCurrent ? startPoint : this._state.playbackStartPoint,
         });
@@ -724,6 +750,16 @@ export class BufferSource implements PlaybackSource {
         const trackA = this._trackA;
         const trackB = this._trackB;
         if (!trackA?.buffer || this._disposed) return false;
+        if (this._loading) {
+            // Its buffer is in, its engine still being made: the load starts it, from here.
+            this._playIntent = true;
+            const start = clampTime(startAt, trackA.duration);
+            this._pendingStart = start;
+            trackA.setLoopRange(null);
+            trackB?.setLoopRange(null);
+            this._update({ currentTime: start, playbackStartPoint: start, loop: null, ended: false });
+            return true;
+        }
         this._playIntent = true;
 
         const target = clampTime(startAt, trackA.duration);
@@ -811,38 +847,117 @@ export class BufferSource implements PlaybackSource {
         const output = await this._host.ensureOutput();
         if (!mode || !output || !isCurrent()) return;
         const loaded = await loadStreamEngine(ctx, mode.stretch);
-        if (!loaded || !isCurrent()) return;
+        if (!isCurrent()) return;
+        if (!loaded) {
+            this._stretchWorks = false;
+            return;
+        }
+        if (mode.stretch) {
+            // The stretcher's module is added beside the engine's; without it the pitch follows the speed.
+            void stretchAvailable(ctx).then((ok) => {
+                if (ok || !this._stretchWorks) return;
+                this._stretchWorks = false;
+                if (!this._disposed) this._update({ capabilities: this.capabilities });
+            });
+        }
         const rate = buffer.sampleRate;
         const step = Math.max(1, Math.round(SEGMENT_SECONDS * rate));
         const starts: number[] = [];
         for (let f = 0; f < buffer.length; f += step) starts.push(f);
         starts.push(buffer.length);
+        // A stem B handed in (setSourceB) while A was loading. Converted before the engine is
+        // made: its channels count (the engine is as wide as the wider stem).
+        let b: AudioBuffer | null = null;
+        let from = this._trackB?.buffer ?? null;
+        while (from) {
+            let converted: AudioBuffer | null = null;
+            try {
+                converted = await BufferSource._atRate(from, rate);
+            } catch (error) {
+                if (isCurrent() && this._clip && this._trackB?.buffer === from) this._onErrorB(this._clip.id, error);
+            }
+            if (!isCurrent()) return;
+            // Replaced or dropped meanwhile: the stem B there now.
+            const now = this._trackB?.buffer ?? null;
+            if (now === from) {
+                b = converted;
+                break;
+            }
+            from = now;
+        }
+        const channels = Math.max(buffer.numberOfChannels, b?.numberOfChannels ?? 0);
+        const eng = this._makeEngine(ctx, output.input, buffer, rate, starts, channels, mode.stretch);
+        if (!eng) {
+            this._stretchWorks = false;
+            return;
+        }
+        eng.b = b;
+        this._eng = eng;
+        this._applyMix(this._state.processing.mix);
+        this._update({ capabilities: this.capabilities });
+    }
+
+    /** An engine for the clip, wired to this source (null where one cannot be made: the tracks play). */
+    private _makeEngine(
+        ctx: BaseAudioContext,
+        output: AudioNode,
+        a: AudioBuffer,
+        rate: number,
+        starts: number[],
+        channels: number,
+        stretch: boolean,
+    ): EnginePath | null {
         let engine: StreamEngine;
         try {
             // At the clip's rate: the engine resamples to the context's when they differ.
-            engine = new StreamEngine(ctx, { channels: buffer.numberOfChannels, starts, stretch: mode.stretch, sampleRate: rate });
+            engine = new StreamEngine(ctx, { channels, starts, stretch, sampleRate: rate });
         } catch (error) {
             console.warn('[AudioPlayer] stream engine unavailable; the clip plays on tracks', error);
-            return;
+            return null;
         }
-        engine.node.connect(output.input);
+        engine.node.connect(output);
         engine.setRate(this._state.processing.speed);
         engine.setMix(1, 0);
-        const eng: EnginePath = { engine, rate, starts, a: buffer, b: null, playing: false, pausedFrame: 0, startedAt: 0, loop: null };
-        this._eng = eng;
+        const eng: EnginePath = { engine, output, channels, rate, starts, a, b: null, playing: false, pausedFrame: 0, startedAt: 0, loop: null };
         engine.onEnded = () => this._onEngineEnded(eng);
-        engine.onStretch = () => {
+        engine.onStretch = (state) => {
+            if (state.ready) this._stretchWorks = true;
+            else if (state.error) this._stretchWorks = false;
             if (this._eng === eng) this._update({ capabilities: this.capabilities });
         };
         engine.onError = (error) => this._onEngineError(eng, error);
-        // A stem B handed in (setSourceB) while A was loading.
-        const bufferB = this._trackB?.buffer;
-        if (bufferB) {
-            const atRate = await BufferSource._atRate(bufferB, rate);
-            if (this._eng === eng && this._trackB?.buffer === bufferB) eng.b = atRate;
+        return eng;
+    }
+
+    /**
+     * Stem B has more channels than the engine (a stereo B beside a mono A): the
+     * clip moves to an engine that wide (an engine's channels are fixed when it is
+     * made). The old one fades out as the new one starts from the same place.
+     */
+    private _widen(eng: EnginePath, b: AudioBuffer): EnginePath {
+        const mode = this._engineMode;
+        const next = mode && this._makeEngine(eng.engine.node.context, eng.output, eng.a, eng.rate, eng.starts, b.numberOfChannels, mode.stretch);
+        // None to be had: B plays in the channels there are.
+        if (!next) return eng;
+        const playing = eng.playing;
+        const frame = Math.floor(playing ? eng.engine.position() : eng.pausedFrame);
+        this._halt(eng);
+        eng.engine.pause();
+        eng.engine.dispose();
+        next.loop = eng.loop;
+        if (next.loop) next.engine.setLoop(next.loop);
+        next.pausedFrame = frame;
+        next.startedAt = eng.startedAt;
+        this._eng = next;
+        if (playing) {
+            next.engine.play(frame);
+            next.playing = true;
+            this._pumpTimer ??= setInterval(() => this._pump(next), PUMP_MS);
+        } else {
+            next.engine.seek(frame);
         }
-        this._applyMix(this._state.processing.mix);
         this._update({ capabilities: this.capabilities });
+        return next;
     }
 
     private _disposeEngine(): void {
@@ -865,7 +980,9 @@ export class BufferSource implements PlaybackSource {
     private async _engStart(eng: EnginePath, offset: number): Promise<boolean> {
         const requestId = this._playRequestId;
         const generation = this._generation;
-        const isCurrent = () => !this._disposed && generation === this._generation && requestId === this._playRequestId && this._eng === eng;
+        // The clip's engine while the request stands: `eng`, or the wider one that took over from it
+        // (another clip's load, or the engine failing, ends the request or leaves none).
+        const current = () => (!this._disposed && generation === this._generation && requestId === this._playRequestId ? this._eng : null);
         let frame = this._frameOf(eng, offset);
         if (eng.loop && frame >= eng.loop.end) frame = eng.loop.start;
         if (frame >= eng.a.length) frame = 0;
@@ -873,17 +990,21 @@ export class BufferSource implements PlaybackSource {
         if (!await this._engine!.resume()) {
             // The output would not start (no user activation, an interruption): the
             // request is over, or a later seek or speed change would start it unasked.
-            if (isCurrent() && !eng.playing) this._playIntent = false;
+            const now = current();
+            if (now && !now.playing) this._playIntent = false;
             return false;
         }
-        if (!isCurrent()) return false;
+        const now = current();
+        if (!now) return false;
         // Transport goes at once; the engine holds the playhead until the audio is there.
-        if (eng.playing) eng.engine.seek(frame);
-        else eng.engine.play(frame);
-        eng.playing = true;
-        eng.startedAt = this._engine!.context!.currentTime;
-        this._feed(eng, frame);
-        this._pumpTimer ??= setInterval(() => this._pump(eng), PUMP_MS);
+        // Always a play: the processor may have stopped at the clip's end before its
+        // 'ended' arrived here, and a seek would leave it stopped (a play while it plays
+        // jumps, as a seek does).
+        now.engine.play(frame);
+        now.playing = true;
+        now.startedAt = this._engine!.context!.currentTime;
+        this._feed(now, frame);
+        this._pumpTimer ??= setInterval(() => this._pump(now), PUMP_MS);
         return true;
     }
 
@@ -937,8 +1058,10 @@ export class BufferSource implements PlaybackSource {
     private _onEngineError(eng: EnginePath, error: Error): void {
         if (eng !== this._eng) return;
         console.warn('[AudioPlayer] stream engine failed; the clip plays on tracks', error);
-        const wasPlaying = eng.playing;
-        const at = (wasPlaying ? eng.engine.position() : eng.pausedFrame) / eng.rate;
+        // A start in flight (the output resuming) counts as playing; one the load
+        // will make (the clip still loading) is left to the load.
+        const wasPlaying = eng.playing || (this._playIntent && !this._loading);
+        const at = (eng.playing ? eng.engine.position() : eng.pausedFrame) / eng.rate;
         this._disposeEngine();
         const speed = this._state.processing.speed;
         this._trackA?.setPlaybackRate(speed);
@@ -1236,9 +1359,10 @@ export class BufferSource implements PlaybackSource {
             // The engine reads B beside A from the same position: nothing to synchronise.
             const atRate = await BufferSource._atRate(decoded, eng.rate);
             if (this._disposed || requestId !== this._requestIdB || this._clip?.id !== clipId || eng !== this._eng) return false;
-            if (eng.b) eng.engine.resetB();
-            eng.b = atRate;
-            this._feed(eng);
+            const target = atRate.numberOfChannels > eng.channels ? this._widen(eng, atRate) : eng;
+            if (target.b) target.engine.resetB();
+            target.b = atRate;
+            this._feed(target);
         } else {
             await this._syncBToA();
         }

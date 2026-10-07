@@ -1,5 +1,5 @@
-// Test the npm artifacts outside the workspace: pack the player and prepare,
-// install both tarballs in a throwaway consumer, run the installed `rtd-prepare`
+// Test the npm artifact's prepare side outside the workspace: pack the package,
+// install the tarball in a throwaway consumer, run the installed `rtd-prepare`
 // CLI on a small WAV (with a named stem), check the output against the shipped
 // schema and assertManifest(), run the installed API with worker threads, and
 // play the CLI's output in the browser through the player's test harness
@@ -13,7 +13,6 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const player = path.resolve(root, '..', 'rt-dspplr');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'rt-dspplr-prepare-consumer-'));
 const npmCli = process.env.npm_execpath;
 assert.ok(npmCli, 'Run through npm run test:package');
@@ -43,24 +42,25 @@ function wav16(file, seconds, rate, channels, { gain = 1, delayFrames = 0 } = {}
 
 try {
     // ---- the artifacts --------------------------------------------------------------------
-    const [packMain] = JSON.parse(npm(['pack', '--ignore-scripts', '--json', '--pack-destination', temp], player));
     const [pack] = JSON.parse(npm(['pack', '--ignore-scripts', '--json', '--pack-destination', temp], root));
     const files = pack.files.map((f) => f.path);
-    for (const file of ['dist/index.js', 'dist/cli.js', 'dist/prepare-worker.mjs', 'dist/types/index.d.ts', 'bin/rtd-prepare.mjs', 'README.md', 'LICENSE.md', 'package.json']) {
-        assert.ok(files.includes(file), `${file} is missing from the prepare tarball`);
+    for (const file of ['dist/prepare/index.js', 'dist/prepare/cli.js', 'dist/prepare/prepare-worker.mjs', 'dist/prepare/types/index.d.ts', 'bin/rtd-prepare.mjs', 'PREPARE.md', 'LICENSE.md', 'package.json']) {
+        assert.ok(files.includes(file), `${file} is missing from the tarball`);
     }
     assert.ok(!files.some((f) => f.startsWith('src/') || f.startsWith('test/') || f.includes('node_modules/')), 'sources, tests or dependencies in the tarball');
 
     // ---- an isolated consumer --------------------------------------------------------------
     fs.writeFileSync(path.join(temp, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
-    npm(['install', '--ignore-scripts', '--no-audit', '--no-fund', path.join(temp, packMain.filename), path.join(temp, pack.filename)], temp);
-    const installed = path.join(temp, 'node_modules', '@saitdigital', 'rt-dspplr-prepare');
+    npm(['install', '--ignore-scripts', '--no-audit', '--no-fund', path.join(temp, pack.filename)], temp);
+    const installed = path.join(temp, 'node_modules', '@saitdigital', 'rt-dspplr');
     const pkg = JSON.parse(fs.readFileSync(path.join(installed, 'package.json'), 'utf8'));
-    assert.equal(pkg.engines.node, '>=20.19');
-    assert.ok(pkg.dependencies['@saitdigital/rt-dspplr'], 'depends on the player package for the formats');
-    for (const value of Object.values(pkg.exports['.'])) assert.ok(fs.existsSync(path.join(installed, value)), value);
-    // One implementation of the formats: the installed bundles import them.
-    assert.match(fs.readFileSync(path.join(installed, 'dist/index.js'), 'utf8'), /from ["']@saitdigital\/rt-dspplr\/format["']/);
+    assert.equal(pkg.engines.node, '>=20.3');
+    assert.ok(!pkg.dependencies, 'one package: no dependencies');
+    for (const value of Object.values(pkg.exports['./prepare'])) assert.ok(fs.existsSync(path.join(installed, value)), value);
+    // One implementation of the formats: the installed prepare bundles import the package's own, by name.
+    for (const file of ['dist/prepare/index.js', 'dist/prepare/prepare-worker.mjs']) {
+        assert.match(fs.readFileSync(path.join(installed, file), 'utf8'), /from ["']@saitdigital\/rt-dspplr\/format["']/, file);
+    }
 
     // ---- the CLI on a small WAV, with a named stem -----------------------------------------
     const rate = 48000;
@@ -87,7 +87,7 @@ try {
     const check = `import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { assertManifest } from '@saitdigital/rt-dspplr/format';
-import { prepareAudio } from '@saitdigital/rt-dspplr-prepare';
+import { prepareAudio } from '@saitdigital/rt-dspplr/prepare';
 const require = createRequire(import.meta.url);
 const schema = require('@saitdigital/rt-dspplr/manifest.schema.json');
 const { default: Ajv2020 } = await import(process.argv[2]);
@@ -113,18 +113,18 @@ console.log('installed CLI output: schema and assertManifest agree; installed AP
     if (process.env.RTD_SKIP_BROWSER) {
         console.log('browser step skipped (RTD_SKIP_BROWSER)');
     } else {
-        const fixture = path.join(player, 'node_modules', '.cache', 'rtd-long', 'pkgCli');
+        const fixture = path.join(root, 'node_modules', '.cache', 'rtd-long', 'pkgCli');
         fs.rmSync(fixture, { recursive: true, force: true });
         fs.cpSync(out, fixture, { recursive: true });
         const playwright = path.join(root, '..', '..', 'node_modules', '@playwright', 'test', 'cli.js');
         const run = execFileSync(process.execPath, [playwright, 'test', 'prepared-package', '--reporter=line'], {
-            cwd: player, encoding: 'utf8', env: { ...process.env, RTD_PACKAGE_FIXTURE: 'pkgCli' }, stdio: ['ignore', 'pipe', 'pipe'],
+            cwd: root, encoding: 'utf8', env: { ...process.env, RTD_PACKAGE_FIXTURE: 'pkgCli' }, stdio: ['ignore', 'pipe', 'pipe'],
         });
         const line = run.split('\n').find((l) => /passed|failed/.test(l)) ?? run;
         console.log(`browser: the packed CLI's output plays in the player (${line.trim()})`);
         fs.rmSync(fixture, { recursive: true, force: true });
     }
-    console.log(`Isolated install of ${pack.filename} + ${packMain.filename} passed.`);
+    console.log(`Isolated install of ${pack.filename}: the CLI and ./prepare passed.`);
 } finally {
     fs.rmSync(temp, { recursive: true, force: true });
 }

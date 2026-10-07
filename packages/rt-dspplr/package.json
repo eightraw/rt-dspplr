@@ -11,10 +11,10 @@
   "bugs": {
     "url": "https://github.com/eightraw/rt-dspplr/issues"
   },
-  "description": "Web audio player with real-time DSP: pitch-preserving speed, loop, DSP chain, two-track A/B mixer, waveform. Headless engine + React component.",
+  "description": "Web audio player with real-time DSP: pitch-preserving speed, loop, DSP chain, two-track A/B mixer, waveform and spectrogram, and long recordings prepared on the server (./prepare, rtd-prepare CLI). Headless engine + React component.",
   "type": "module",
   "engines": {
-    "node": ">=18"
+    "node": ">=20.3"
   },
   "license": "SEE LICENSE IN LICENSE.md",
   "keywords": [
@@ -25,15 +25,21 @@
     "web-audio-player",
     "time-stretch",
     "waveform",
-    "react"
+    "react",
+    "spectrogram",
+    "long-audio",
+    "manifest",
+    "segments"
   ],
   "sideEffects": [
     "**/*.css"
   ],
   "files": [
     "dist",
+    "bin",
     "schema",
     "README.md",
+    "PREPARE.md",
     "CHANGELOG.md",
     "LICENSE.md",
     "THIRD_PARTY_NOTICES.md"
@@ -69,6 +75,11 @@
       "import": "./dist/format.js",
       "default": "./dist/format.js"
     },
+    "./prepare": {
+      "types": "./dist/prepare/types/index.d.ts",
+      "import": "./dist/prepare/index.js",
+      "default": "./dist/prepare/index.js"
+    },
     "./manifest.schema.json": "./schema/manifest.schema.json"
   },
   "typesVersions": {
@@ -84,16 +95,24 @@
       ],
       "format": [
         "./dist/types/format.d.ts"
+      ],
+      "prepare": [
+        "./dist/prepare/types/index.d.ts"
       ]
     }
   },
+  "bin": {
+    "rtd-prepare": "bin/rtd-prepare.mjs"
+  },
   "scripts": {
-    "build": "node build/clean.mjs && vite build && node build/build-rubberband.mjs && tsc -p tsconfig.build.json && node build/fix-dts-extensions.mjs && node build/copy-assets.mjs && node build/check-dist.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
-    "test": "node build/test-node.mjs",
+    "build": "node build/clean.mjs && vite build && node build/build-rubberband.mjs && tsc -p tsconfig.build.json && node build/fix-dts-extensions.mjs && node build/copy-assets.mjs && node build/build-prepare.mjs && node build/check-dist.mjs",
+    "build:wasm": "node build/build-prepare-wasm.mjs",
+    "build:decoders": "node build/build-decoders.mjs && node build/build-prepare-wasm.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.prepare.json",
+    "test": "node build/test-node.mjs && node build/test-prepare.mjs",
     "prepack": "npm run build && node -e \"require('fs').copyFileSync('../../CHANGELOG.md', 'CHANGELOG.md')\"",
     "test:browser": "playwright test",
-    "test:package": "node build/test-package.mjs"
+    "test:package": "node build/test-package.mjs && node build/test-package-prepare.mjs"
   },
   "peerDependencies": {
     "react": ">=18",
@@ -118,6 +137,7 @@
     "rubberband-wasm": "^3.3.0",
     "signalsmith-stretch": "^1.3.2",
     "typescript": "~5.6.2",
-    "vite": "~6.4.1"
+    "vite": "~6.4.1",
+    "wabt": "^1.0.39"
   }
 }

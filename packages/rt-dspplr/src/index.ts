@@ -93,7 +93,7 @@ export {
 export type { LoopRange } from './core/engine/Track';
 
 // Prepared long recordings: `play({ manifest })` on any player. Prepare them with
-// `@saitdigital/rt-dspplr-prepare` (Node) or its `rtd-prepare` CLI. The formats
+// `@saitdigital/rt-dspplr/prepare` (Node) or the `rtd-prepare` CLI. The formats
 // themselves (validation, binary files) are in `@saitdigital/rt-dspplr/format`.
 export type { SourceKind, SourceCapabilities, StemSummary } from './core/sources/types';
 export type { PreparedOverview, WindowAudio, StreamStats, SegmentedOptions } from './core/sources/SegmentedSource';

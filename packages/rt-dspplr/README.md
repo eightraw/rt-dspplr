@@ -403,8 +403,8 @@ createAudioPlayer({
 
 A whole file is decoded before it plays, which is instant for a voice note and
 heavy for an hour. For long recordings, prepare them once on the server with
-**[@saitdigital/rt-dspplr-prepare](https://github.com/eightraw/rt-dspplr/tree/main/packages/rt-dspplr-prepare#readme)** (Node, CLI and
-API). It writes a folder: the original file as it is, a manifest with an index of
+this package's Node side: the `rtd-prepare` CLI or `@saitdigital/rt-dspplr/prepare`
+(see **[PREPARE.md](./PREPARE.md)**). It writes a folder: the original file as it is, a manifest with an index of
 it (the byte range of every segment) and overview files (peaks, high-pass bands,
 spectrogram). The player opens it in milliseconds and fetches audio around the
 playhead only, as HTTP Range requests of the original (decoded audio stays near 60 s):

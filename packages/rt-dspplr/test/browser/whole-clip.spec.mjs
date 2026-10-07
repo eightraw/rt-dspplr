@@ -1,9 +1,10 @@
 // Whole clips (decoded in full) and the output stage: the high-pass heard as
 // the preview draws it; the transport while a clip is still loading (seek,
-// play, pause, toggle); an output the system takes away or will not start;
-// size limits for files too large; a caller's abort signal; stem B after stem
-// A fails; stretch renders nobody waits for any more; the native compressor
-// fallback levelled to the worklet; a failed effect kept out.
+// play, pause, toggle, a loop); an output the system takes away or will not
+// start; size limits for files too large; a caller's abort signal; a stereo
+// stem B beside a mono A; stem B after stem A fails; stretch renders nobody
+// waits for any more; the native compressor fallback levelled to the worklet;
+// a failed effect kept out.
 import { test, expect } from '@playwright/test';
 
 test.beforeEach(async ({ page }) => {
@@ -278,6 +279,87 @@ test('an abort through fetchOptions.signal fails the load instead of leaving it 
         return { ok, status: s.status, error: !!s.error };
     });
     expect(r).toEqual({ ok: false, status: 'error', error: true });
+});
+
+test('a loop set while a whole clip loads is in place once it plays', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        serve('/loop-while-loading.wav', { delay: 250, seconds: 4 });
+        const p = h.make();
+        const playing = p.play('/loop-while-loading.wav');
+        await h.sleep(50);
+        p.setLoop({ start: 0.5, end: 1 });
+        const started = await playing;
+        // Into the loop from 0 and round it: still inside it 1.6 s on.
+        await h.sleep(1600);
+        const r = { started, loop: p.getState().loop, time: p.getCurrentTime(), playing: p.getState().isPlaying, rms: h.rms(p) };
+        p.dispose();
+        return r;
+    });
+    expect(r.started).toBe(true);
+    expect(r.playing).toBe(true);
+    expect(r.loop.start).toBeCloseTo(0.5, 2);
+    expect(r.loop.end).toBeCloseTo(1, 2);
+    expect(r.time).toBeGreaterThanOrEqual(0.49);
+    expect(r.time).toBeLessThan(1.01);
+    expect(r.rms).toBeGreaterThan(0.02);
+});
+
+test('a stereo stem B beside a mono stem A plays in stereo: given with the clip, or handed in while it plays', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const sr = 48000;
+        // Stem B: silent on the left, a tone on the right.
+        const rightOnly = (seconds) => {
+            const b = new AudioBuffer({ length: seconds * sr, sampleRate: sr, numberOfChannels: 2 });
+            const d = b.getChannelData(1);
+            for (let i = 0; i < d.length; i += 1) d[i] = 0.2 * Math.sin(2 * Math.PI * 660 * i / sr);
+            return b;
+        };
+        const p = h.make();
+        let taps = null;
+        // Each channel of the output, after the analyser (split as is: a mono output is heard on the left only here).
+        const ears = () => {
+            if (!taps) {
+                const ctx = p.analyser.context;
+                const split = ctx.createChannelSplitter(2);
+                p.analyser.connect(split);
+                taps = [ctx.createAnalyser(), ctx.createAnalyser()];
+                split.connect(taps[0], 0);
+                split.connect(taps[1], 1);
+                // Pulled by the destination (silently), or they would not be processed.
+                const mute = ctx.createGain();
+                mute.gain.value = 0;
+                taps.forEach((tap) => tap.connect(mute));
+                mute.connect(ctx.destination);
+            }
+            const level = (an) => { const d = new Float32Array(an.fftSize); an.getFloatTimeDomainData(d); return Math.sqrt(d.reduce((s, v) => s + v * v, 0) / d.length); };
+            return { left: level(taps[0]), right: level(taps[1]), channels: p._source._eng?.channels ?? null, time: p.getCurrentTime() };
+        };
+        p.setMix(1);
+        await p.play({ id: 'with-the-clip', src: h.buffer(4), srcB: rightOnly(4) });
+        ears(); // the taps, once the output is there
+        await h.sleep(300);
+        const withClip = ears();
+        await p.play({ id: 'handed-in', src: h.buffer(4), srcB: h.buffer(4) });
+        await h.sleep(300);
+        const before = ears();
+        const installed = await p.setSourceB(rightOnly(4));
+        await h.sleep(300);
+        const after = { ...ears(), installed, playing: p.getState().isPlaying };
+        p.dispose();
+        return { withClip, before, after };
+    });
+    expect(r.withClip.channels).toBe(2);
+    expect(r.withClip.right).toBeGreaterThan(0.05);
+    expect(r.withClip.left).toBeLessThan(0.01);
+    // A mono pair plays on a mono engine; a stereo B moves the clip to a stereo one, from where it was.
+    expect(r.before.channels).toBe(1);
+    expect(r.before.left).toBeGreaterThan(0.02);
+    expect(r.after.installed).toBe(true);
+    expect(r.after.channels).toBe(2);
+    expect(r.after.playing).toBe(true);
+    expect(r.after.right).toBeGreaterThan(0.05);
+    expect(r.after.left).toBeLessThan(0.01);
+    expect(r.after.time).toBeGreaterThan(r.before.time + 0.2);
 });
 
 test('stem B is not left loading when stem A fails', async ({ page }) => {

@@ -67,7 +67,7 @@ export interface ClipSource {
     id?: string;
 }
 
-/** A prepared long recording (made with `@saitdigital/rt-dspplr-prepare`). */
+/** A prepared long recording (made with `@saitdigital/rt-dspplr/prepare` or `rtd-prepare`). */
 export interface ManifestClip {
     /** URL of manifest.json; segment, peaks, bands and spectrogram URLs are relative to it. */
     manifest: string;

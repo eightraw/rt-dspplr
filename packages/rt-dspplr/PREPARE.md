@@ -1,18 +1,18 @@
-# RT-DSPPLR prepare
+# RT-DSPPLR: preparing long recordings
 
-**Server-side preparation of long recordings for the [RT-DSPPLR](https://github.com/eightraw/rt-dspplr) web audio player.**
+**Server-side preparation of long recordings for the [RT-DSPPLR](https://github.com/eightraw/rt-dspplr) web audio player: the package's `./prepare` entry and its `rtd-prepare` CLI.**
 
 Documentation and API reference: [sait.digital/research/rt-dspplr](https://sait.digital/research/rt-dspplr).
 
 The player decodes ordinary files in full. That is instant for a voice note and
 heavy for an hour-long recording: the whole file is downloaded and decoded
-before anything plays. This package does the heavy part once, at ingest time,
+before anything plays. The prepare step does the heavy part once, at ingest time,
 in Node. It reads a recording as a stream and writes a folder the player opens
 in milliseconds and plays segment by segment:
 
 ```text
 <out>/manifest.json      what the player reads first (format: docs/manifest.md), with the index
-<out>/source.mp3         the original, byte for byte (.wav, .mp3, .opus; other formats: a 16-bit .wav)
+<out>/source.mp3         the original, byte for byte (.wav, .mp3, .opus, .flac; other formats: a 16-bit .wav)
 <out>/peaks.bin          waveform overview, min/max/RMS, 256 frames per peak, x8 per level
 <out>/bands.bin          energies for the high-pass preview (2048 frames per bin)
 <out>/spectrogram.bin    overview spectrogram, 128 log rows, 85 ms columns
@@ -22,8 +22,8 @@ in milliseconds and plays segment by segment:
 Nothing is cut up or encoded again. The manifest holds an index of the original:
 for each segment (10 s by default), the byte range that holds it. The player
 fetches those bytes with an HTTP Range request and decodes them (WAV itself,
-MP3 and Opus in WebAssembly, in a worker), and gets the samples prepare decoded:
-WAV and MP3 exactly, Opus within float rounding. An hour of MP3 stays the size of
+MP3, Opus and FLAC in WebAssembly, in a worker), and gets the samples prepare decoded:
+WAV, MP3 and FLAC exactly, Opus within float rounding. An hour of MP3 stays the size of
 the MP3 (about 1 MB a minute at 128 kbit/s) instead of 600 MB of WAV segments.
 
 The manifest is written last, atomically: when it exists, everything it lists
@@ -35,17 +35,18 @@ const player = createAudioPlayer({ element });
 await player.play({ manifest: '/media/talk/manifest.json' });
 ```
 
-Node only, ESM only, Node 20.19 or later. Free to use under a one-page
-[license](./LICENSE.md), the same as the player's.
+Node only, ESM only, Node 20.3 or later. It comes with the player, under the same
+one-page [license](./LICENSE.md).
 
 ```bash
-npm install @saitdigital/rt-dspplr-prepare
+npm install @saitdigital/rt-dspplr
 ```
 
-It depends on `@saitdigital/rt-dspplr` for the file formats (its
-`@saitdigital/rt-dspplr/format` entry): the code that writes a manifest, a peaks
-file or a spectrogram is the code the player reads them with, not a copy. Keep
-the two on the same minor version (`0.4.x` with this `0.1.x`).
+The prepare step and the player are one package at one version, and share the
+file formats (`@saitdigital/rt-dspplr/format`): the code that writes a manifest,
+a peaks file or a spectrogram is the code the player reads them with, not a copy.
+What a version prepares, the same version plays. Browser bundles never include
+the Node side: `@saitdigital/rt-dspplr/prepare` is only loaded where it is imported.
 
 ## CLI
 
@@ -74,7 +75,7 @@ before anything is read.
 ## API
 
 ```ts
-import { prepareAudio } from '@saitdigital/rt-dspplr-prepare';
+import { prepareAudio } from '@saitdigital/rt-dspplr/prepare';
 
 const job = prepareAudio('talk.wav', { outDir: 'prepared/talk' });
 job.on('progress', (p) => console.log(p.stage, p.fraction, p.segments));
@@ -100,7 +101,7 @@ The input is a path, a `ReadableStream<Uint8Array>` or an
 | `sizeHint`, `name` | | Progress for streams; the name recorded in the manifest (its last path part only: no file is ever named after it). |
 | `stems` | | Named stems in the same manifest. See below. |
 | `tmpDir` | OS temp | Scratch folder: a stream input's copy, a WAV being written, processors' output. |
-| `workerUrl` | `dist/prepare-worker.mjs` | Where the worker file is, if you move it. |
+| `workerUrl` | `dist/prepare/prepare-worker.mjs` | Where the worker file is, if you move it (it imports `@saitdigital/rt-dspplr/format`, so the package must be installed where it runs). |
 | `signal`, `onProgress` | | Cancellation; progress callback. |
 
 Without a `decoder`, prepare reads WAV, MP3, Opus and FLAC itself, in
@@ -159,7 +160,7 @@ for MP3 and for FLAC (4096-sample frames), 10–20 % for Opus with 1 s pages at
 Opus in WebM, WMA, AIFF...) by piping the source through ffmpeg. Experimental.
 
 ```ts
-import { AUDIO_DEMUXERS, ffmpegDecoder, prepareAudio } from '@saitdigital/rt-dspplr-prepare';
+import { AUDIO_DEMUXERS, ffmpegDecoder, prepareAudio } from '@saitdigital/rt-dspplr/prepare';
 
 prepareAudio(upload, { outDir, decoder: ffmpegDecoder({ demuxers: AUDIO_DEMUXERS }) });
 // ffmpeg in a container without network:
@@ -346,7 +347,7 @@ workers stay warm (no start-up per call, code already optimised), idle ones do
 not keep the process alive, and calls may share it.
 
 ```js
-import { createPreparePool, prepareAudio } from '@saitdigital/rt-dspplr-prepare';
+import { createPreparePool, prepareAudio } from '@saitdigital/rt-dspplr/prepare';
 
 const pool = createPreparePool(); // every core but one, at least two
 // for each upload:
@@ -367,7 +368,7 @@ a kept pool of 11 threads (desktop); 1.2–1.5 s and 0.9–1.3 s on a 2-vCPU VPS
 - Measured on 11 threads: 60 min mono 48 kHz in about 4 s; a 30 min stereo MP3
   in 3.7 s; a stem adds 2–6 s (decoding it twice, its analyses, reading A back
   for the pairing).
-- The worker file is `dist/prepare-worker.mjs`, next to the bundle. If it cannot
+- The worker file is `dist/prepare/prepare-worker.mjs`, next to the bundle. If it cannot
   start (another bundler, a sandbox), the jobs run inline; pass `workerUrl` when
   you move it.
 

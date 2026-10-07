@@ -1,0 +1,29 @@
+// The prepare step (./prepare): Node code, kept apart from the browser player's DOM-typed sources.
+// Its imports of the formats ("@saitdigital/rt-dspplr/format") are the package's own entry:
+// checked against its built declarations (dist/types: build first), imported by name at run time.
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "lib": [
+            "ES2023"
+        ],
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "allowImportingTsExtensions": true,
+        "isolatedModules": true,
+        "moduleDetection": "force",
+        "noEmit": true,
+        "strict": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
+        "skipLibCheck": true,
+        "resolveJsonModule": true,
+        "types": [
+            "node"
+        ]
+    },
+    "include": [
+        "src/prepare",
+        "test/prepare.test.ts"
+    ]
+}

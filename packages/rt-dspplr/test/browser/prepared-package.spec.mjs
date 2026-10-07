@@ -1,6 +1,6 @@
 // A prepared folder plays in the player: segments, overview, and its named stems.
-// By default the folder is the pairNamed fixture (made by the workspace's prepare
-// package). `npm run test:package -w packages/rt-dspplr-prepare` runs this spec
+// By default the folder is the pairNamed fixture (made by the package's built
+// "./prepare" entry). `npm run test:package -w packages/rt-dspplr` runs this spec
 // again with RTD_PACKAGE_FIXTURE set to the output of the packed CLI installed
 // in an isolated consumer (copied under node_modules/.cache/rtd-long/).
 import { test, expect } from '@playwright/test';

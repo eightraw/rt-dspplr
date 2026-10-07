@@ -475,6 +475,14 @@ interface FlacTable {
     channels: number;
 }
 
+/** A FLAC stream as its frame headers must match it. */
+interface FlacStream {
+    variable: boolean;
+    sampleRate: number;
+    channels: number;
+    bits: number;
+}
+
 const CRC8 = (() => {
     const t = new Uint8Array(256);
     for (let i = 0; i < 256; i += 1) {
@@ -488,24 +496,8 @@ const CRC8 = (() => {
 const FLAC_RATES = [0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000];
 const FLAC_BITS = [0, 8, 12, 0, 16, 20, 24, 32];
 
-/**
- * A frame header at `i` of `b` that belongs to the stream (the STREAMINFO's rate, channels and
- * sample size where it states them, its blocking strategy, a good CRC-8) and carries the coded
- * number `expect` (the frame's number, or its first sample's with variable block sizes): its block
- * size; 0 when there is none there. Needs 16 bytes from `i`.
- */
-function flacFrameAt(b: Uint8Array, i: number, s: { variable: boolean; sampleRate: number; channels: number; bits: number }, expect: number): number {
-    if (b[i] !== 0xff || b[i + 1] !== (s.variable ? 0xf9 : 0xf8)) return 0;
-    const sizeCode = b[i + 2] >> 4;
-    const rateCode = b[i + 2] & 15;
-    const assignment = b[i + 3] >> 4;
-    const bitsCode = (b[i + 3] >> 1) & 7;
-    if (sizeCode === 0 || rateCode === 15 || (b[i + 3] & 1) !== 0 || bitsCode === 3 || assignment > 10) return 0;
-    if ((assignment < 8 ? assignment + 1 : 2) !== s.channels) return 0;
-    if (bitsCode !== 0 && FLAC_BITS[bitsCode] !== s.bits) return 0;
-    if (rateCode >= 1 && rateCode <= 11 && FLAC_RATES[rateCode] !== s.sampleRate) return 0;
-    // The coded number, UTF-8 style (up to 7 bytes, 36 bits).
-    let p = i + 4;
+/** A frame header's coded number at `p` (UTF-8 style, up to 7 bytes, 36 bits) and where it ends; null if malformed. */
+function flacNumber(b: Uint8Array, p: number): { value: number; end: number } | null {
     const lead = b[p];
     let extra = 0;
     let value = 0;
@@ -516,13 +508,34 @@ function flacFrameAt(b: Uint8Array, i: number, s: { variable: boolean; sampleRat
     else if (lead >= 0xf8 && lead < 0xfc) { extra = 4; value = lead & 0x03; }
     else if (lead >= 0xfc && lead < 0xfe) { extra = 5; value = lead & 0x01; }
     else if (lead === 0xfe) extra = 6;
-    else return 0;
+    else return null;
     p += 1;
     for (let k = 0; k < extra; k += 1, p += 1) {
-        if ((b[p] & 0xc0) !== 0x80) return 0;
+        if ((b[p] & 0xc0) !== 0x80) return null;
         value = value * 64 + (b[p] & 0x3f);
     }
-    if (value !== expect) return 0;
+    return { value, end: p };
+}
+
+/**
+ * A frame header at `i` of `b` that belongs to the stream (the STREAMINFO's rate, channels and
+ * sample size where it states them, its blocking strategy, a good CRC-8) and carries the coded
+ * number `expect` (the frame's number, or its first sample's with variable block sizes): its block
+ * size; 0 when there is none there. Needs 16 bytes from `i`.
+ */
+function flacFrameAt(b: Uint8Array, i: number, s: FlacStream, expect: number): number {
+    if (b[i] !== 0xff || b[i + 1] !== (s.variable ? 0xf9 : 0xf8)) return 0;
+    const sizeCode = b[i + 2] >> 4;
+    const rateCode = b[i + 2] & 15;
+    const assignment = b[i + 3] >> 4;
+    const bitsCode = (b[i + 3] >> 1) & 7;
+    if (sizeCode === 0 || rateCode === 15 || (b[i + 3] & 1) !== 0 || bitsCode === 3 || assignment > 10) return 0;
+    if ((assignment < 8 ? assignment + 1 : 2) !== s.channels) return 0;
+    if (bitsCode !== 0 && FLAC_BITS[bitsCode] !== s.bits) return 0;
+    if (rateCode >= 1 && rateCode <= 11 && FLAC_RATES[rateCode] !== s.sampleRate) return 0;
+    const number = flacNumber(b, i + 4);
+    if (!number || number.value !== expect) return 0;
+    let p = number.end;
     let size = sizeCode === 1 ? 192 : sizeCode <= 5 ? 576 << (sizeCode - 2) : sizeCode >= 8 ? 256 << (sizeCode - 8) : 0;
     if (sizeCode === 6) { size = b[p] + 1; p += 1; }
     else if (sizeCode === 7) { size = ((b[p] << 8) | b[p + 1]) + 1; p += 2; }
@@ -539,14 +552,70 @@ function flacFrameAt(b: Uint8Array, i: number, s: { variable: boolean; sampleRat
 }
 
 /**
+ * The metadata at the start of a FLAC file (after an ID3v2 tag, if any), read up to the first
+ * frame's header: what a run is decoded after, the stream, the first frame's coded number (a
+ * stream cut out of a longer one need not start at 0) and where that frame starts. Null while
+ * more bytes are needed (it is small, but a picture block can take a few chunks); `final`:
+ * there are no more.
+ */
+function flacMetadata(bytes: Uint8Array, final: boolean): { header: Uint8Array; stream: FlacStream; firstNumber: number; first: number } | null {
+    let o = 0;
+    if (bytes.length >= 10 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+        o = 10 + (((bytes[6] & 0x7f) << 21) | ((bytes[7] & 0x7f) << 14) | ((bytes[8] & 0x7f) << 7) | (bytes[9] & 0x7f)) + (bytes[5] & 0x10 ? 10 : 0);
+    }
+    if (o + 4 > bytes.length) {
+        if (final) throw new Error('not a FLAC file');
+        return null;
+    }
+    if (String.fromCharCode(bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]) !== 'fLaC') throw new Error('not a FLAC file');
+    let m = o + 4;
+    let info: Uint8Array | null = null;
+    let complete = false;
+    while (m + 4 <= bytes.length) {
+        const last = (bytes[m] & 0x80) !== 0;
+        const type = bytes[m] & 0x7f;
+        const length = (bytes[m + 1] << 16) | (bytes[m + 2] << 8) | bytes[m + 3];
+        if (m + 4 + length > bytes.length) break;
+        if (type === 0) info = bytes.slice(m + 4, m + 4 + length);
+        m += 4 + length;
+        if (last) { complete = true; break; }
+    }
+    if (!complete) {
+        if (final) throw new Error('the FLAC\'s metadata is cut short');
+        return null;
+    }
+    if (!info || info.length < 34) throw new Error('the FLAC has no STREAMINFO');
+    // The first frame's header (up to 16 bytes), whole: the metadata may end at a chunk's end.
+    if (m + 16 > bytes.length && !final) return null;
+    if (m + 2 > bytes.length) throw new Error('the FLAC has no frames');
+    if (bytes[m] !== 0xff || (bytes[m + 1] & 0xfe) !== 0xf8) throw new Error('the FLAC\'s first frame does not follow its metadata');
+    const number = flacNumber(bytes, m + 4);
+    if (!number) throw new Error('the FLAC\'s first frame header is damaged');
+    const header = new Uint8Array(4 + 4 + 34);
+    header.set([0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34]);
+    header.set(info.subarray(0, 34), 8);
+    // A run is not the whole stream: its total samples and MD5 are unknown (0), or the
+    // decoder would take the run's end for a broken frame.
+    header[8 + 13] &= 0xf0;
+    header.fill(0, 8 + 14, 8 + 34);
+    const stream = {
+        // The sync code: fixed block sizes count frames, variable ones samples.
+        variable: bytes[m + 1] === 0xf9,
+        sampleRate: (info[10] << 12) | (info[11] << 4) | (info[12] >> 4),
+        channels: ((info[12] >> 1) & 7) + 1,
+        bits: (((info[12] & 1) << 4) | (info[13] >> 4)) + 1,
+    };
+    return { header, stream, firstNumber: number.value, first: m };
+}
+
+/**
  * The frames of a native FLAC file (after an ID3v2 tag, if any), read in chunks: where each starts
  * and its first sample. A frame does not say how long it is: the next one is the next frame header
  * of the stream with the next coded number and a good CRC-8.
  */
 export async function flacFrames(file: string): Promise<FlacTable> {
     const table = columns(2); // offset, firstSample
-    let header: Uint8Array | null = null;
-    let stream: { variable: boolean; sampleRate: number; channels: number; bits: number } | null = null;
+    let meta: ReturnType<typeof flacMetadata> = null;
     let samples = 0;
     let frameNumber = 0;
     let carry = new Uint8Array(0);
@@ -555,9 +624,10 @@ export async function flacFrames(file: string): Promise<FlacTable> {
     let size = 0;
     /** Frame headers in `bytes` from `i` (file offset base + i) up to `limit`: where the scan stopped. */
     const scan = (bytes: Uint8Array, i: number, limit: number): number => {
-        const s = stream!;
+        const s = meta!.stream;
+        const firstNumber = meta!.firstNumber;
         while (i < limit) {
-            const block = flacFrameAt(bytes, i, s, s.variable ? samples : frameNumber);
+            const block = flacFrameAt(bytes, i, s, firstNumber + (s.variable ? samples : frameNumber));
             if (block > 0) {
                 table.push(base + i, samples);
                 samples += block;
@@ -575,45 +645,14 @@ export async function flacFrames(file: string): Promise<FlacTable> {
         bytes.set(carry);
         bytes.set(chunk as Buffer, carry.length);
         size = base + bytes.length;
-        if (!header) {
-            // The metadata, read once it is all in (it is small; a picture block can take a few chunks).
-            let o = pos - base;
-            if (o === 0 && bytes.length >= 10 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
-                o = 10 + (((bytes[6] & 0x7f) << 21) | ((bytes[7] & 0x7f) << 14) | ((bytes[8] & 0x7f) << 7) | (bytes[9] & 0x7f)) + (bytes[5] & 0x10 ? 10 : 0);
+        if (!meta) {
+            meta = flacMetadata(bytes, false);
+            if (!meta) {
+                carry = bytes;
+                continue;
             }
-            if (o + 4 > bytes.length) { carry = bytes; continue; }
-            if (String.fromCharCode(bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]) !== 'fLaC') throw new Error('not a FLAC file');
-            let m = o + 4;
-            let info: Uint8Array | null = null;
-            let complete = false;
-            while (m + 4 <= bytes.length) {
-                const last = (bytes[m] & 0x80) !== 0;
-                const type = bytes[m] & 0x7f;
-                const length = (bytes[m + 1] << 16) | (bytes[m + 2] << 8) | bytes[m + 3];
-                if (m + 4 + length > bytes.length) break;
-                if (type === 0) info = bytes.slice(m + 4, m + 4 + length);
-                m += 4 + length;
-                if (last) { complete = true; break; }
-            }
-            if (!complete) { carry = bytes; continue; }
-            if (!info || info.length < 34) throw new Error('the FLAC has no STREAMINFO');
-            if (m + 2 > bytes.length) throw new Error('the FLAC has no frames');
-            if (bytes[m] !== 0xff || (bytes[m + 1] & 0xfe) !== 0xf8) throw new Error('the FLAC\'s first frame does not follow its metadata');
-            header = new Uint8Array(4 + 4 + 34);
-            header.set([0x66, 0x4c, 0x61, 0x43, 0x80, 0, 0, 34]);
-            header.set(info.subarray(0, 34), 8);
-            // A run is not the whole stream: its total samples and MD5 are unknown (0), or the
-            // decoder would take the run's end for a broken frame.
-            header[8 + 13] &= 0xf0;
-            header.fill(0, 8 + 14, 8 + 34);
-            stream = {
-                // The sync code: fixed block sizes count frames, variable ones samples.
-                variable: bytes[m + 1] === 0xf9,
-                sampleRate: (info[10] << 12) | (info[11] << 4) | (info[12] >> 4),
-                channels: ((info[12] >> 1) & 7) + 1,
-                bits: (((info[12] & 1) << 4) | (info[13] >> 4)) + 1,
-            };
-            pos = base + m;
+            // `bytes` starts the file while the metadata is read (base 0).
+            pos = meta.first;
         }
         // A header needs up to 16 bytes: what is closer to the chunk's end waits for the next one.
         const stop = scan(bytes, pos - base, bytes.length - 15);
@@ -621,12 +660,16 @@ export async function flacFrames(file: string): Promise<FlacTable> {
         carry = bytes.slice(stop);
         base = pos;
     }
-    if (!header || !stream) throw new Error('not a FLAC file');
-    if (carry.length) {
+    if (!meta) {
+        meta = flacMetadata(carry, true);
+        if (!meta) throw new Error('not a FLAC file');
+        pos = meta.first;
+    }
+    if (pos - base < carry.length) {
         // The file's last bytes (a last frame of a few samples can be shorter than 16 bytes).
         const padded = new Uint8Array(carry.length + 16);
         padded.set(carry);
-        scan(padded, 0, carry.length);
+        scan(padded, pos - base, carry.length);
     }
     // The last frame runs to the end of the file, or up to an ID3v1 tag.
     let end = size;
@@ -641,9 +684,9 @@ export async function flacFrames(file: string): Promise<FlacTable> {
         firstSample: table.column(1),
         totalSamples: samples,
         end,
-        header,
-        sampleRate: stream.sampleRate,
-        channels: stream.channels,
+        header: meta.header,
+        sampleRate: meta.stream.sampleRate,
+        channels: meta.stream.channels,
     };
 }
 

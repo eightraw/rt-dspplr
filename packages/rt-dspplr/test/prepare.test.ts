@@ -28,16 +28,16 @@ import {
     checkDockerImage,
     AUDIO_DEMUXERS,
     type AudioManifest,
-} from '../src/index';
-import { storedRanges } from '../src/prepareAudio';
-import { readSegment } from '../src/sourceReader';
-import { deepestRun, indexSegments, mapSource } from '../src/sourceIndex';
-import { main } from '../src/cli';
-import { multipartHead, redactUrl } from '../src/processors';
-import { designResampler, StreamingResampler } from '../src/resampler';
-import { resampleInParallel } from '../src/parallelResample';
-import { createPreparePool, JobPool } from '../src/pool';
-import { markStem } from '../src/attachStem';
+} from '../src/prepare/index';
+import { storedRanges } from '../src/prepare/prepareAudio';
+import { readSegment } from '../src/prepare/sourceReader';
+import { deepestRun, indexSegments, mapSource } from '../src/prepare/sourceIndex';
+import { main } from '../src/prepare/cli';
+import { multipartHead, redactUrl } from '../src/prepare/processors';
+import { designResampler, StreamingResampler } from '../src/prepare/resampler';
+import { resampleInParallel } from '../src/prepare/parallelResample';
+import { createPreparePool, JobPool } from '../src/prepare/pool';
+import { markStem } from '../src/prepare/attachStem';
 import Ajv2020 from 'ajv/dist/2020';
 import manifestSchema from '@saitdigital/rt-dspplr/manifest.schema.json';
 // The formats come from the player package (one implementation for both).
@@ -209,9 +209,10 @@ const sameSamples = (a: Float32Array[], b: Float32Array[]) => maxDiff(a, b) === 
  * A FLAC stream of the channels quantized as encodeWav() does: verbatim subframes (FLAC's
  * uncompressed form, every decoder reads it), fixed block size, or with `variable` block sizes
  * that cycle through those given (frames then carry sample numbers); optionally an ID3v2 tag in
- * front and a padding block of `padding` bytes among the metadata.
+ * front, a padding block of `padding` bytes among the metadata, and coded numbers that start at
+ * `first` (a stream cut out of a longer one) instead of 0.
  */
-function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, blockSize: number, extra: { id3?: number; padding?: number; variable?: number[] } = {}): Uint8Array {
+function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, blockSize: number, extra: { id3?: number; padding?: number; variable?: number[]; first?: number } = {}): Uint8Array {
     const C = channels.length;
     const frames = channels[0].length;
     const full = 2 ** (bits - 1);
@@ -250,7 +251,7 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
     };
     for (let f = 0, start = 0; start < frames; f += 1) {
         const n = Math.min(sizes[f % sizes.length], frames - start);
-        const frame: number[] = [0xff, extra.variable ? 0xf9 : 0xf8, 0x70, (C - 1) << 4, ...utf8(extra.variable ? start : f)];
+        const frame: number[] = [0xff, extra.variable ? 0xf9 : 0xf8, 0x70, (C - 1) << 4, ...utf8((extra.first ?? 0) + (extra.variable ? start : f))];
         frame.push((n - 1) >> 8, (n - 1) & 255);
         frame.push(crc8(frame));
         for (let c = 0; c < C; c += 1) {
@@ -299,6 +300,9 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
     const kept: Array<[string, Uint8Array]> = [
         ['fixed block size', flac],
         ['variable block sizes, 24-bit, ID3 tag', encodeFlac(src, rate, 24, 0, { id3: 300, variable: [4096, 1152, 576, 4608, 192] })],
+        // The index reads the file in 1 MiB chunks: here the metadata ends where the first one does.
+        ['metadata ending where a read ends, frames numbered from 1000', encodeFlac(src, rate, 16, 4096, { padding: (1 << 20) - 46, first: 1000 })],
+        ['variable block sizes from sample 123456', encodeFlac(src, rate, 16, 0, { variable: [4096, 1152], first: 123456 })],
     ];
     for (const [name, bytes] of kept) {
         const { manifest: m, storage, job } = bytes === flac ? viaFlac : await prepareMemory(bytes, { segmentSeconds: 0.3 });
@@ -330,9 +334,9 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
 
 {
     // MP3 and Opus: lossy fixtures made by ffmpeg from speechLike(…, seed 31) as 16-bit WAV
-    // (test/fixtures/make-sources.mjs says how). Gapless - as many frames as the source, at no
+    // (test/fixtures/sources/make-sources.mjs says how). Gapless - as many frames as the source, at no
     // lag - and as close to it as the codec gets.
-    const fixtures = new URL('../../../test/fixtures/', import.meta.url); // from node_modules/.cache/rtd-prepare-test
+    const fixtures = new URL('../../../test/fixtures/sources/', import.meta.url); // from node_modules/.cache/rtd-prepare-test
     const lossy = [
         { file: 'sine-speech.mp3', rate: 44100, encoding: 'mp3' },
         { file: 'sine-speech.opus', rate: 48000, encoding: 'opus' },
@@ -391,12 +395,12 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
 }
 
 {
-    // Low-bitrate MP3s (test/fixtures/make-sources.mjs), where the bit reservoir reaches back more
+    // Low-bitrate MP3s (test/fixtures/sources/make-sources.mjs), where the bit reservoir reaches back more
     // than 6 frames: 32 kbit/s at 48 kHz, 8 kbit/s at 16 kHz, VBR -V9 over 1.5 s of silence. With
     // 6 frames of warm-up the first published segments that read back wrong, the second fell back
     // to a WAV and a run of the third could not be decoded at all. Each run now starts once the
     // reservoir is full.
-    const fixtures = new URL('../../../test/fixtures/', import.meta.url);
+    const fixtures = new URL('../../../test/fixtures/sources/', import.meta.url);
     const notes: string[] = [];
     for (const file of ['low-32k-48k.mp3', 'low-8k-16k.mp3', 'low-v9-22k.mp3']) {
         const bytes = new Uint8Array(fs.readFileSync(new URL(file, fixtures)));
@@ -608,7 +612,7 @@ async function prepareMemory(wav: Uint8Array, options: Parameters<typeof prepare
 
     // An index that does not read back what was decoded (here: a decoder that says MP3 and gives
     // other samples) is not published: the source is kept as a 16-bit WAV, with a warning.
-    const mp3Bytes = new Uint8Array(fs.readFileSync(new URL('../../../test/fixtures/sine-speech.mp3', import.meta.url)));
+    const mp3Bytes = new Uint8Array(fs.readFileSync(new URL('../../../test/fixtures/sources/sine-speech.mp3', import.meta.url)));
     const louder: AudioDecoder = (bytes, options) => {
         const inner = builtinDecoder(bytes, options);
         return { format: inner.format, blocks: (async function* () { for await (const b of inner.blocks) yield b.map((c) => c.map((x) => x * 0.5)); })() };
@@ -1107,7 +1111,7 @@ function checkManifest(m: unknown, name: string): void {
     // A stem the player reads as it is (an MP3 or a FLAC at A's rate, as a byte stream: spooled) is
     // kept byte for byte, its index shifted by the offset: every segment reads back the decoder's
     // samples, shifted, with silence where the stem has none (lead at the start, trail at the end).
-    const fixtures = new URL('../../../test/fixtures/', import.meta.url);
+    const fixtures = new URL('../../../test/fixtures/sources/', import.meta.url);
     const mp3 = new Uint8Array(fs.readFileSync(new URL('sine-speech.mp3', fixtures)));
     const rate = 44100;
     const flacB = encodeFlac((await decodeAll(builtinDecoder, chunks(mp3))).channels.map((c) => Float64Array.from(c)), rate, 16, 4096);

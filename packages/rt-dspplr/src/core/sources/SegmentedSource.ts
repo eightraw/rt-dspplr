@@ -17,7 +17,7 @@ import { decodeSpectrogramFile, toSpectralPyramid, type SpectrogramFile } from '
 import type { PlaybackSource, SourceCapabilities, SourceHost, StemSummary } from './types';
 
 // ---------------------------------------------------------------------------
-// SegmentedSource — a prepared long recording (@saitdigital/rt-dspplr-prepare): manifest,
+// SegmentedSource — a prepared long recording (made by ./prepare): manifest,
 // peaks, bands and spectrogram first (KBs to a few MB), so the timeline is
 // whole at once; segments are fetched and decoded around the playhead and
 // handed to the stream engine (an AudioWorklet: sample-exact joins, stems in
@@ -250,8 +250,8 @@ export class SegmentedSource implements PlaybackSource {
         this._abort = abort;
         this._halt();
         // The previous clip goes silent now (not when the new manifest is in), and
-        // nothing of its stem carries over to the new one.
-        this._disposeEngine();
+        // nothing of its stem carries over to the new one. (Its engine is replaced by the new clip's.)
+        this._disposeEngine(true);
         this._clearStem();
         this._store?.dispose();
         this._store = null;
@@ -314,6 +314,9 @@ export class SegmentedSource implements PlaybackSource {
             this._scheduler.setRate(this._state.processing.speed);
             await this._createEngine(out.ctx, out.input, manifest, loadId);
             if (loadId !== this._loadId) return false;
+            // A loop set while the clip was set up is in the state only: the scheduler and the engine get it now.
+            const loopWhileLoading = this._state.loop;
+            if (loopWhileLoading) this.setLoop(loopWhileLoading);
             this._applyStems(manifest);
             settle();
             this._host.emit('load', { clipId: clip.id, duration: manifest.duration });
@@ -1111,21 +1114,31 @@ export class SegmentedSource implements PlaybackSource {
     // ---- engine path ------------------------------------------------------------------------
 
     private async _createEngine(ctx: AudioContext, output: AudioNode, manifest: AudioManifest, loadId: number): Promise<void> {
-        this._disposeEngine();
-        if (this._options.engine === false) return;
+        this._disposeEngine(true);
+        // The scheduler plays at the native rate: the pitch follows the speed.
+        if (this._options.engine === false) {
+            this._setPitchCapability(false);
+            return;
+        }
         // The engine runs at the clip's rate (the stretcher too) and resamples its output
         // to the context's when they differ: a 44.1 or 16 kHz clip keeps realtime speed.
         // The player's `stretcher`: 'native' turns the stretch off (an offline strategy is for whole clips).
         const stretch = this._host.options.stretcher !== 'native';
+        if (!stretch) this._setPitchCapability(false);
         const loaded = await loadStreamEngine(ctx, stretch);
         // Another clip was asked for while the module loaded: that load makes its own engine.
-        if (!loaded || loadId !== this._loadId) return;
+        if (loadId !== this._loadId) return;
+        if (!loaded) {
+            this._setPitchCapability(false);
+            return;
+        }
         const starts = [...manifest.segments.list.map((s) => s.startFrame), manifest.frames];
         let engine: StreamEngine;
         try {
             engine = new StreamEngine(ctx, { channels: manifest.channels, starts, stretch, sampleRate: manifest.sampleRate });
         } catch (error) {
             console.warn('[AudioPlayer] stream engine unavailable; using the scheduler', error);
+            this._setPitchCapability(false);
             return;
         }
         engine.node.connect(output);
@@ -1147,8 +1160,9 @@ export class SegmentedSource implements PlaybackSource {
         if (this._eng !== engine) return;
         console.warn('[AudioPlayer] stream engine failed; playing on with the scheduler', error);
         const m = this._manifest;
-        const wasPlaying = this._engPlaying;
-        const frame = Math.floor(wasPlaying ? engine.position() : this._pausedFrame);
+        // A start in flight (the output resuming: _startEngine set isPlaying) counts as playing.
+        const wasPlaying = this._engPlaying || this._state.isPlaying;
+        const frame = Math.floor(this._engPlaying ? engine.position() : this._pausedFrame);
         this._disposeEngine();
         this._pausedFrame = frame;
         const loop = this._state.loop;
@@ -1157,17 +1171,25 @@ export class SegmentedSource implements PlaybackSource {
         if (m && wasPlaying) void this._startAt(frame, 'play');
     }
 
-    private _disposeEngine(): void {
+    /**
+     * `replaced`: another clip's engine follows. Its stretcher takes a moment to
+     * start, so the pitch flag stays as this one left it until the new one reports
+     * (rather than flickering with each clip).
+     */
+    private _disposeEngine(replaced = false): void {
         if (!this._eng) return;
         this._eng.pause();
         this._eng.dispose();
         this._eng = null;
         this._engPlaying = false;
         this._lastReport = null;
-        if (this.capabilities.canPreservePitch) {
-            this.capabilities = SegmentedSource._caps(false, this.capabilities.canMixStemB, this.capabilities.stems);
-            this._update({ capabilities: this.capabilities });
-        }
+        if (!replaced) this._setPitchCapability(false);
+    }
+
+    private _setPitchCapability(pitch: boolean): void {
+        if (this.capabilities.canPreservePitch === pitch) return;
+        this.capabilities = SegmentedSource._caps(pitch, this.capabilities.canMixStemB, this.capabilities.stems);
+        this._update({ capabilities: this.capabilities });
     }
 
 
@@ -1192,9 +1214,13 @@ export class SegmentedSource implements PlaybackSource {
             if (playId === this._playId) this._update({ isPlaying: false, buffering: false });
             return false;
         }
+        // The engine failed meanwhile: _onEngineError started the scheduler in its place.
+        if (this._eng !== engine) return false;
         // Transport goes at once; the engine holds the playhead until the audio is there.
-        if (this._engPlaying) engine.seek(frame);
-        else engine.play(frame);
+        // Always a play: the processor may have stopped at the clip's end before its
+        // 'ended' arrived here, and a seek would leave it stopped (a play while it plays
+        // jumps, as a seek does).
+        engine.play(frame);
         this._engPlaying = true;
         this._pendingLatency = { t0: reason === 'seek' && this._seekStartedAt !== null ? this._seekStartedAt : this._playStartedAt, reason };
         this._seekStartedAt = null;

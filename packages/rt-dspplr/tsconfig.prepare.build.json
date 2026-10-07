@@ -1,0 +1,19 @@
+// Declarations of ./prepare: "@saitdigital/rt-dspplr/format" resolves to the package's own built types (dist/types).
+{
+    "extends": "./tsconfig.prepare.json",
+    "compilerOptions": {
+        "noEmit": false,
+        "declaration": true,
+        "emitDeclarationOnly": true,
+        "outDir": "dist/prepare/types",
+        "rootDir": "src/prepare",
+        "stripInternal": true
+    },
+    "include": [
+        "src/prepare"
+    ],
+    "exclude": [
+        "src/prepare/worker.ts",
+        "src/prepare/cli.ts"
+    ]
+}

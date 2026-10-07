@@ -15,11 +15,10 @@ try {
     const [pack] = JSON.parse(npm(['pack', '--ignore-scripts', '--json', '--pack-destination', temp], root));
     assert.ok(pack.files.every(file => !file.path.endsWith('.wasm') && !file.path.includes('node_modules/')));
     assert.ok(pack.files.some(file => file.path === 'dist/bundle-sizes.json'));
-    // Browser package: no Node-only prepare code, no CLI; the notices and the schema ship.
-    for (const file of ['THIRD_PARTY_NOTICES.md', 'schema/manifest.schema.json', 'dist/format.js', 'LICENSE.md', 'README.md', 'CHANGELOG.md']) {
+    // The player and its Node-side "./prepare" entry with the rtd-prepare CLI; the notices and the schema ship.
+    for (const file of ['THIRD_PARTY_NOTICES.md', 'schema/manifest.schema.json', 'dist/format.js', 'dist/prepare/index.js', 'bin/rtd-prepare.mjs', 'LICENSE.md', 'README.md', 'PREPARE.md', 'CHANGELOG.md']) {
         assert.ok(pack.files.some(f => f.path === file), `${file} is missing from the tarball`);
     }
-    assert.ok(!pack.files.some(f => /(^|\/)(rtd-)?prepare([-./]|$)|^bin\//.test(f.path)), 'prepare code or a bin in the browser package');
     assert.ok(!pack.files.some(f => f.path.startsWith('test/') || f.path.startsWith('src/')), 'tests or sources in the tarball');
     fs.writeFileSync(path.join(temp, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
     npm(['install', '--ignore-scripts', '--no-audit', '--no-fund', path.join(temp, pack.filename)], temp);
@@ -28,8 +27,8 @@ try {
     assert.equal(manifest.peerDependenciesMeta['rubberband-wasm'].optional, true);
     assert.ok(!manifest.dependencies?.['rubberband-wasm']);
     assert.ok(!manifest.optionalDependencies?.['rubberband-wasm']);
-    assert.equal(manifest.bin, undefined, 'the CLI lives in @saitdigital/rt-dspplr-prepare');
-    assert.equal(manifest.exports['./prepare'], undefined);
+    assert.equal(manifest.bin['rtd-prepare'], 'bin/rtd-prepare.mjs');
+    assert.ok(manifest.exports['./prepare'], 'the ./prepare entry');
     for (const [name, entry] of Object.entries(manifest.exports)) {
         if (typeof entry === 'string') continue;
         for (const value of Object.values(entry)) assert.ok(fs.existsSync(path.join(temp, 'node_modules/@saitdigital/rt-dspplr', value)), `${name}: ${value}`);

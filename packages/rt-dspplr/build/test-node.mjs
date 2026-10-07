@@ -1,5 +1,5 @@
 // Bundles the Node tests in test/*.test.ts with esbuild and runs them in turn.
-// (The prepare step's tests live in packages/rt-dspplr-prepare.)
+// (The "./prepare" entry's tests run from build/test-prepare.mjs.)
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';

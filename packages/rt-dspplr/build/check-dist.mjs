@@ -1,7 +1,7 @@
 // Post-build checks + size report.
 //  - "." and "./react" (and every chunk they load) must not reference rubberband-wasm.
-//  - No file in dist/ may reference Node-only modules (the package is for browsers;
-//    Node-only code lives in @saitdigital/rt-dspplr-prepare).
+//  - No file in dist/ but the "./prepare" entry (dist/prepare/, Node) may reference
+//    Node-only modules, and no browser file may reach into dist/prepare/.
 //  - "./format" loads only the pure format chunk: no engine, DOM, worker or Node code.
 //  - Vendored third-party code ships with its notice (in the chunk and in
 //    THIRD_PARTY_NOTICES.md, which package.json "files" must list).
@@ -69,11 +69,13 @@ function walkDist(dir = dist) {
     });
 }
 const nodeOnly = /\bfrom\s*["'](?:node:[\w/]+|fs|fs\/promises|path|os|child_process|worker_threads|crypto|stream|http|https|net|url|module)["']|\brequire\(\s*["'](?:node:|fs|path|os|child_process|worker_threads)|\bimport\(\s*["']node:|\bworker_threads\b|\bnode:fs\b|\bprocess\.(?:argv|exit|cwd)\b/;
-for (const file of walkDist().filter((f) => /\.(m?js|d\.ts)$/.test(f))) {
+const browserFiles = walkDist().filter((f) => /\.(m?js|d\.ts)$/.test(f) && !f.startsWith('prepare/'));
+for (const file of browserFiles) {
     if (nodeOnly.test(read(file))) errors.push(`${file} references a Node-only module (worker_threads, node:fs, ...)`);
+    if (/\b(?:from|import)\s*\(?\s*["'](?:[^"']*\/prepare\/[^"']*|@saitdigital\/rt-dspplr\/prepare)["']/.test(read(file))) errors.push(`${file} reaches into the Node-only "./prepare" entry`);
 }
-for (const file of walkDist()) {
-    if (/(^|\/)(rtd-)?prepare([-./]|$)/i.test(file)) errors.push(`${file}: prepare code belongs to @saitdigital/rt-dspplr-prepare`);
+for (const file of ['prepare/index.js', 'prepare/cli.js', 'prepare/prepare-worker.mjs', 'prepare/types/index.d.ts']) {
+    if (!fs.existsSync(path.join(dist, file))) errors.push(`dist/${file} is missing (build/build-prepare.mjs)`);
 }
 
 // ---- "./format" is the pure format chunk only ------------------------------------------
@@ -112,6 +114,11 @@ for (const file of walkDist()) {
     ];
     if (!/## dr_mp3 and dr_flac/.test(notices) || !/ALTERNATIVE 1 - Public Domain/.test(notices)) errors.push('THIRD_PARTY_NOTICES.md lacks the dr_mp3/dr_flac notice');
     if (!/## libopus/.test(notices) || !/Redistribution and use in source and binary forms/.test(notices)) errors.push('THIRD_PARTY_NOTICES.md lacks the libopus notice');
+    // The WebAssembly embedded in "./prepare": pffft, and libogg and opusfile beside libopus.
+    for (const [name, text] of [['pffft', /## pffft[\s\S]*?Redistribution and use/], ['libogg', /## libogg[\s\S]*?Redistribution and use/], ['opusfile', /## opusfile[\s\S]*?Redistribution and use/]]) {
+        if (!text.test(notices)) errors.push(`THIRD_PARTY_NOTICES.md lacks the ${name} notice`);
+    }
+    if (!/PFFFT_WASM/.test(read('prepare/index.js')) || !/DECODERS_WASM/.test(read('prepare/index.js'))) errors.push('dist/prepare/index.js lost the embedded WebAssembly the notices describe');
     for (const d of decoders) {
         const chunks = walkDist().filter((f) => f.startsWith(`chunks/${d.name}-`) && f.endsWith('.js'));
         if (chunks.length !== 1) errors.push(`expected one ${d.name} chunk, found ${chunks.length}`);
@@ -184,4 +191,4 @@ if (errors.length > 0) {
     console.error('\ncheck-dist FAILED:\n  ' + errors.join('\n  '));
     process.exit(1);
 }
-console.log('\ncheck-dist OK: no Node-only code, ./format is pure, notices and schema in place; core/react are free of rubberband-wasm, the optional entry keeps it external.\n');
+console.log('\ncheck-dist OK: no Node-only code outside ./prepare, which no browser file loads; ./format is pure; notices and schema in place; core/react are free of rubberband-wasm, the optional entry keeps it external.\n');
