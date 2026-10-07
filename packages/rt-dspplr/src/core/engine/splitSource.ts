@@ -83,14 +83,16 @@ export class SplitSource {
      */
     prepare(count: number, frames: (i: number) => number, budget: { left: number }): SplitState {
         let last = NaN;
-        for (let i = 0; i <= count; i += SPLIT_HOP >> 2) {
-            const q = Math.floor(frames(Math.min(i, count)) / SPLIT_HOP);
-            if (q === last) continue;
-            last = q;
-            const state = this._chunk(q, budget);
-            if (state !== 'ready') return state;
+        // Every quarter chunk (a loop wrap can start a new chunk anywhere), and the last frame.
+        for (let i = 0; ; i = Math.min(i + (SPLIT_HOP >> 2), count)) {
+            const q = Math.floor(frames(i) / SPLIT_HOP);
+            if (q !== last) {
+                last = q;
+                const state = this._chunk(q, budget);
+                if (state !== 'ready') return state;
+            }
+            if (i >= count) return 'ready';
         }
-        return 'ready';
     }
 
     /** The tonal part at a timeline frame (its chunk must be prepared; 0 otherwise). */

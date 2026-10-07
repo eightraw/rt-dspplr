@@ -36,8 +36,8 @@ const wav = (seconds = 1) => {
 const slowBlob = (seconds, delay = 200) => new class extends Blob {
     async arrayBuffer() { await sleep(delay); return super.arrayBuffer(); }
 }([wav(seconds)], { type: 'audio/wav' });
-// A deterministic delayed worker for transport race tests. AudioContext and
-// playback nodes are real; the built-in vocoder is tested separately.
+// A deterministic delayed offline strategy (whole clips then play on tracks) for
+// transport race tests. AudioContext and playback nodes are real.
 const delayedStrategy = (delay = 350) => ({
     id: `test-delay-${crypto.randomUUID()}`, poolSize: 1,
     createWorker() {

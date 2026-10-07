@@ -3,25 +3,42 @@ import { mixGains } from '../controls';
 import { Mixer, Track, type LoopRange, type TrackState } from '../engine';
 import type { PlaybackTarget } from '../engine/Track';
 import type AudioEngine from '../engine/AudioEngine';
+import { engineWindow } from '../engine/engineWindow';
+import { loadStreamEngine, StreamEngine, type EngineStem } from '../engine/StreamEngine';
+import { findZeroCrossing } from '../engine/zeroCrossing';
 import { BufferLoader, checkClipLimits, type ClipLimits } from '../loader/BufferLoader';
 import type { StretchService } from '../stretch/StretchService';
 import type { PlaybackSource, SourceCapabilities, SourceHost } from './types';
 
 // ---------------------------------------------------------------------------
-// BufferSource — the whole clip decoded into an AudioBuffer (the player's
-// original behaviour, moved out of AudioPlayerCore unchanged):
+// BufferSource — the whole clip decoded into an AudioBuffer.
+//
+// It plays through the stream engine, as prepared clips do: the decoded
+// buffers are cut into segments and handed to the engine around the playhead,
+// stem B beside stem A, and speed changes at once in the engine's realtime
+// stretch (pitch kept).
+//
+//   decoded A ──┐ segments around the playhead
+//   decoded B ──┴──────────────────────────────▶ stream engine ─▶ the core's output chain
+//
+// With an offline stretch strategy (Rubber Band), or where the engine cannot
+// run (no AudioWorklet), it plays on two tracks instead, the player's
+// original path: speed variants rendered off the main thread and switched at
+// the live position.
 //
 //   Track "A" ──┐
 //               ├─ Mixer sum ─▶ the core's output chain
 //   Track "B" ──┘
 //
-// Stem B is any second recording, sample-aligned with A and started on the
-// same AudioContext clock. Speed variants are rendered off the main thread
-// (pitch preserved) and switched at the live position.
+// The tracks hold the decoded buffers on either path.
 // ---------------------------------------------------------------------------
 
 const SYNC_LOOKAHEAD_SECONDS = 0.015;
 const RETRY_B_MS = 3000;
+/** The engine path: segment length, segments held ahead of the playhead, and how often the window moves on. */
+const SEGMENT_SECONDS = 5;
+const AHEAD_SEGMENTS = 2;
+const PUMP_MS = 40;
 
 function clampTime(time: number, duration: number): number {
     const normalized = Number.isFinite(time) ? Math.max(0, time) : 0;
@@ -38,8 +55,28 @@ function isAbort(error: unknown): boolean {
 }
 
 export interface BufferSourceSettings {
+    /** An offline stretch strategy: the clip plays on tracks, its speeds rendered by it. */
     stretch: StretchService | null;
     prewarmSpeeds: readonly number[];
+    /** The stream engine (when there is no offline strategy); `stretch` false: the pitch follows the speed. */
+    engine: { stretch: boolean } | null;
+}
+
+/** A stream engine playing the current clip. */
+interface EnginePath {
+    engine: StreamEngine;
+    /** The clip's rate (the engine runs at it). */
+    rate: number;
+    /** Segment starts and the total (length n + 1). */
+    starts: number[];
+    a: AudioBuffer;
+    /** Stem B at the clip's rate, once installed. */
+    b: AudioBuffer | null;
+    playing: boolean;
+    /** Where playback rests while not playing (frames). */
+    pausedFrame: number;
+    startedAt: number;
+    loop: { start: number; end: number } | null;
 }
 
 export class BufferSource implements PlaybackSource {
@@ -47,8 +84,11 @@ export class BufferSource implements PlaybackSource {
     private readonly _host: SourceHost;
     private readonly _stretch: StretchService | null;
     private readonly _prewarmSpeeds: readonly number[];
+    private readonly _engineMode: { stretch: boolean } | null;
     private readonly _limits: ClipLimits;
     private readonly _loaderB: BufferLoader;
+    private _eng: EnginePath | null = null;
+    private _pumpTimer: ReturnType<typeof setInterval> | null = null;
 
     private _generation = 0;
     private _loadRequestId = 0;
@@ -84,6 +124,7 @@ export class BufferSource implements PlaybackSource {
         this._host = host;
         this._stretch = settings.stretch;
         this._prewarmSpeeds = settings.prewarmSpeeds;
+        this._engineMode = settings.engine;
         this._limits = { maxBytes: host.options.maxClipBytes, maxSeconds: host.options.maxClipSeconds };
         this._loaderB = new BufferLoader({ fetchOptions: host.options.fetchOptions, ...this._limits });
     }
@@ -91,7 +132,7 @@ export class BufferSource implements PlaybackSource {
     get capabilities(): SourceCapabilities {
         return {
             kind: 'buffer',
-            canPreservePitch: !!this._stretch?.available,
+            canPreservePitch: this._eng ? this._eng.engine.stretch.ready : !!this._stretch?.available,
             canMixStemB: true,
             stems: [],
             exactWaveformPreview: true,
@@ -109,6 +150,8 @@ export class BufferSource implements PlaybackSource {
     }
 
     getCurrentTime(): number | null {
+        const eng = this._eng;
+        if (eng) return (eng.playing ? eng.engine.position() : eng.pausedFrame) / eng.rate;
         return this._trackA ? this._trackA.currentTime : null;
     }
 
@@ -128,6 +171,17 @@ export class BufferSource implements PlaybackSource {
         this._playRequestId += 1;
         this._speedRequestId += 1;
         this._update({ pendingSpeed: null });
+        const eng = this._eng;
+        if (eng) {
+            let frame = Math.floor(eng.playing ? eng.engine.position() : eng.pausedFrame);
+            if (this._state.pauseMode === 'reset') frame = this._frameOf(eng, this._state.playbackStartPoint);
+            this._halt(eng);
+            eng.engine.pause();
+            if (this._state.pauseMode === 'reset') eng.engine.seek(frame);
+            eng.pausedFrame = frame;
+            this._update({ isPlaying: false, currentTime: frame / eng.rate, startedAt: null, ended: false });
+            return;
+        }
         const trackA = this._trackA;
         const trackB = this._trackB;
         if (!trackA) return;
@@ -162,6 +216,15 @@ export class BufferSource implements PlaybackSource {
         }
         this._playRequestId += 1;
         this._speedRequestId += 1;
+        const eng = this._eng;
+        if (eng) {
+            this._halt(eng);
+            eng.engine.pause();
+            eng.engine.seek(0);
+            eng.pausedFrame = 0;
+            this._update({ isPlaying: false, currentTime: 0, startedAt: null, pendingSpeed: null, ended: false });
+            return;
+        }
         this._trackA?.setPlaybackRate(this._state.processing.speed);
         this._trackB?.setPlaybackRate(this._state.processing.speed);
         this._trackA?.stop();
@@ -181,6 +244,20 @@ export class BufferSource implements PlaybackSource {
         const requestId = ++this._playRequestId;
         this._speedRequestId += 1;
         this._update({ pendingSpeed: null });
+        const eng = this._eng;
+        if (eng) {
+            const target = clampTime(time, eng.a.duration);
+            // Playing, or a start in flight: it plays on from the new point.
+            if (eng.playing || this._playIntent) {
+                await this._engStart(eng, target);
+                if (requestId !== this._playRequestId) return;
+            } else {
+                eng.pausedFrame = this._frameOf(eng, target);
+                eng.engine.seek(eng.pausedFrame);
+            }
+            this._update({ currentTime: target, playbackStartPoint: target, startedAt: eng.playing ? eng.startedAt : null, ended: false });
+            return;
+        }
         const trackA = this._trackA;
         const trackB = this._trackB;
         if (!trackA?.buffer) return;
@@ -214,6 +291,18 @@ export class BufferSource implements PlaybackSource {
     };
 
     setLoop = (range: LoopRange | null): void => {
+        const eng = this._eng;
+        if (eng) {
+            const snapped = range ? BufferSource._snap(eng.a, range) : null;
+            eng.loop = snapped ? { start: this._frameOf(eng, snapped.start), end: this._frameOf(eng, snapped.end) } : null;
+            const position = this.getCurrentTime() ?? 0;
+            eng.engine.setLoop(eng.loop);
+            this._update({ loop: snapped });
+            // A loop set behind the playhead: jump to its start (one ahead plays up to its end).
+            if (snapped && eng.playing && position >= snapped.end) void this.seek(snapped.start);
+            else this._feed(eng);
+            return;
+        }
         const trackA = this._trackA;
         const trackB = this._trackB;
         if (!trackA) {
@@ -251,6 +340,14 @@ export class BufferSource implements PlaybackSource {
             && transportId === this._playRequestId && generation === this._generation
             && !this._disposed && trackA === this._trackA && buffer === trackA?.buffer;
 
+        if (this._eng) {
+            // Realtime in the engine: the stretch keeps the pitch; the change is smoothed.
+            this._eng.engine.setRate(normalized);
+            trackA?.setPlaybackRate(normalized);
+            trackB?.setPlaybackRate(normalized);
+            this._update({ processing: { ...this._state.processing, speed: normalized }, pendingSpeed: null });
+            return;
+        }
         if (!trackA || !buffer) {
             trackA?.setPlaybackRate(normalized);
             trackB?.setPlaybackRate(normalized);
@@ -306,6 +403,7 @@ export class BufferSource implements PlaybackSource {
 
         if (input === null) {
             this._trackB?.unload();
+            this._dropEngineB();
             this._loadedBFor = clip.id;
             this._applyMix(this._state.processing.mix);
             this._update({ bufferB: null, statusB: 'unavailable' });
@@ -343,6 +441,7 @@ export class BufferSource implements PlaybackSource {
         this._requestIdB += 1;
         this._abortB();
         this._readyA?.settle(false);
+        this._disposeEngine();
         this._trackA?.unload();
         this._trackB?.unload();
         this._clip = null;
@@ -362,6 +461,7 @@ export class BufferSource implements PlaybackSource {
         this._playRequestId += 1;
         this._abortB();
         this._loaderB.abort();
+        this._disposeEngine();
 
         this._unsubscribeTrack?.();
         this._unsubscribeTrack = null;
@@ -429,7 +529,8 @@ export class BufferSource implements PlaybackSource {
 
     private _onTrackA(track: Track, trackState: TrackState): void {
         // While a clip loads the track is empty: the state shows the load (a seek's target, say).
-        if (track !== this._trackA || !this._clip || this._loading) return;
+        // On the engine path the track only holds the buffer: the engine's reports move the state.
+        if (track !== this._trackA || !this._clip || this._loading || this._eng) return;
 
         if (trackState.ended) {
             this._playIntent = false;
@@ -480,6 +581,7 @@ export class BufferSource implements PlaybackSource {
             }
             return false;
         }
+        this._disposeEngine();
         trackA.unload();
         // A seek made while the engine was starting is where the clip starts.
         const requestedStart = this._pendingStart ?? Math.max(0, startAt ?? 0);
@@ -549,6 +651,13 @@ export class BufferSource implements PlaybackSource {
             return false;
         }
 
+        // The engine for this clip (it plays it, unless there is an offline strategy or no AudioWorklet).
+        await this._createEngine(ctx, trackA.buffer!, isCurrent);
+        if (!isCurrent()) {
+            readyA.settle(false);
+            return false;
+        }
+
         // What the transport asked for while the clip loaded: a seek moved the
         // start, a pause, stop or resume set the intent (see seek, pause, resume).
         const startPoint = clampTime(this._pendingStart ?? requestedStart, trackA.duration);
@@ -572,11 +681,17 @@ export class BufferSource implements PlaybackSource {
 
         if (requestId !== this._playRequestId) return true;
         if (!this._playIntent) {
-            if (startPoint > 0) await trackA.seek(startPoint);
+            const eng = this._eng;
+            if (eng) {
+                eng.pausedFrame = this._frameOf(eng, startPoint);
+                eng.engine.seek(eng.pausedFrame);
+            } else if (startPoint > 0) {
+                await trackA.seek(startPoint);
+            }
             return true;
         }
 
-        const started = await this._startSynchronized(startPoint);
+        const started = await this._play(startPoint);
         if (!started || !isCurrent() || requestId !== this._playRequestId) return false;
 
         this._applyMix(this._state.processing.mix);
@@ -584,7 +699,7 @@ export class BufferSource implements PlaybackSource {
             isPlaying: true,
             currentTime: startPoint,
             playbackStartPoint: startPoint,
-            startedAt: trackA.startedAt,
+            startedAt: this._startedAt(),
             ended: false,
         });
         return true;
@@ -615,9 +730,14 @@ export class BufferSource implements PlaybackSource {
         const requestId = ++this._playRequestId;
         this._speedRequestId += 1;
         this._update({ pendingSpeed: null });
-        trackA.setLoopRange(null);
-        trackB?.setLoopRange(null);
-        const started = await this._startSynchronized(target);
+        if (this._eng) {
+            this._eng.loop = null;
+            this._eng.engine.setLoop(null);
+        } else {
+            trackA.setLoopRange(null);
+            trackB?.setLoopRange(null);
+        }
+        const started = await this._play(target);
         if (!started || requestId !== this._playRequestId) return false;
         this._update({
             isPlaying: true,
@@ -625,7 +745,7 @@ export class BufferSource implements PlaybackSource {
             loop: null,
             playbackStartPoint: target,
             playRequestId: this._playRequestId,
-            startedAt: trackA.startedAt,
+            startedAt: this._startedAt(),
             ended: false,
         });
         return true;
@@ -642,17 +762,217 @@ export class BufferSource implements PlaybackSource {
         if (!trackA?.buffer || this._disposed) return;
         this._playIntent = true;
 
-        const startPoint = clampTime(trackA.currentTime, trackA.duration);
-        const started = await this._startSynchronized(startPoint);
+        const startPoint = clampTime(this.getCurrentTime() ?? 0, trackA.duration);
+        const started = await this._play(startPoint);
         if (!started || requestId !== this._playRequestId) return;
 
         this._update({
             isPlaying: true,
             currentTime: startPoint,
             playbackStartPoint: startPoint,
-            startedAt: trackA.startedAt,
+            startedAt: this._startedAt(),
             ended: false,
         });
+    }
+
+    /** Start playing at `offset` (seconds), on the engine or on the tracks. */
+    private _play(offset: number): Promise<boolean> {
+        return this._eng ? this._engStart(this._eng, offset) : this._startSynchronized(offset);
+    }
+
+    private _startedAt(): number | null {
+        if (this._eng) return this._eng.playing ? this._eng.startedAt : null;
+        return this._trackA?.startedAt ?? null;
+    }
+
+    // -----------------------------------------------------------------------
+    // Engine path
+    // -----------------------------------------------------------------------
+
+    private _frameOf(eng: EnginePath, seconds: number): number {
+        return Math.max(0, Math.min(eng.a.length, Math.round(seconds * eng.rate)));
+    }
+
+    /** A loop's edges on zero crossings of stem A (as the tracks snap them). */
+    private static _snap(buffer: AudioBuffer, range: LoopRange): LoopRange {
+        const start = findZeroCrossing(buffer, range.start);
+        const end = findZeroCrossing(buffer, range.end);
+        return start < end ? { start, end } : range;
+    }
+
+    /**
+     * Make the clip's engine: its segments cut from the decoded buffer. Nothing
+     * is made with an offline strategy, or where the engine cannot run (the
+     * tracks play the clip then).
+     */
+    private async _createEngine(ctx: AudioContext, buffer: AudioBuffer, isCurrent: () => boolean): Promise<void> {
+        this._disposeEngine();
+        const mode = this._engineMode;
+        const output = await this._host.ensureOutput();
+        if (!mode || !output || !isCurrent()) return;
+        const loaded = await loadStreamEngine(ctx, mode.stretch);
+        if (!loaded || !isCurrent()) return;
+        const rate = buffer.sampleRate;
+        const step = Math.max(1, Math.round(SEGMENT_SECONDS * rate));
+        const starts: number[] = [];
+        for (let f = 0; f < buffer.length; f += step) starts.push(f);
+        starts.push(buffer.length);
+        let engine: StreamEngine;
+        try {
+            // At the clip's rate: the engine resamples to the context's when they differ.
+            engine = new StreamEngine(ctx, { channels: buffer.numberOfChannels, starts, stretch: mode.stretch, sampleRate: rate });
+        } catch (error) {
+            console.warn('[AudioPlayer] stream engine unavailable; the clip plays on tracks', error);
+            return;
+        }
+        engine.node.connect(output.input);
+        engine.setRate(this._state.processing.speed);
+        engine.setMix(1, 0);
+        const eng: EnginePath = { engine, rate, starts, a: buffer, b: null, playing: false, pausedFrame: 0, startedAt: 0, loop: null };
+        this._eng = eng;
+        engine.onEnded = () => this._onEngineEnded(eng);
+        engine.onStretch = () => {
+            if (this._eng === eng) this._update({ capabilities: this.capabilities });
+        };
+        engine.onError = (error) => this._onEngineError(eng, error);
+        // A stem B handed in (setSourceB) while A was loading.
+        const bufferB = this._trackB?.buffer;
+        if (bufferB) {
+            const atRate = await BufferSource._atRate(bufferB, rate);
+            if (this._eng === eng && this._trackB?.buffer === bufferB) eng.b = atRate;
+        }
+        this._applyMix(this._state.processing.mix);
+        this._update({ capabilities: this.capabilities });
+    }
+
+    private _disposeEngine(): void {
+        const eng = this._eng;
+        if (!eng) return;
+        this._halt(eng);
+        this._eng = null;
+        eng.engine.pause();
+        eng.engine.dispose();
+        this._update({ capabilities: this.capabilities });
+    }
+
+    /** Stop moving the window and the position (the engine keeps the audio it holds). */
+    private _halt(eng: EnginePath): void {
+        eng.playing = false;
+        if (this._pumpTimer) clearInterval(this._pumpTimer);
+        this._pumpTimer = null;
+    }
+
+    private async _engStart(eng: EnginePath, offset: number): Promise<boolean> {
+        const requestId = this._playRequestId;
+        const generation = this._generation;
+        const isCurrent = () => !this._disposed && generation === this._generation && requestId === this._playRequestId && this._eng === eng;
+        let frame = this._frameOf(eng, offset);
+        if (eng.loop && frame >= eng.loop.end) frame = eng.loop.start;
+        if (frame >= eng.a.length) frame = 0;
+        if (!eng.playing) eng.pausedFrame = frame;
+        if (!await this._engine!.resume()) {
+            // The output would not start (no user activation, an interruption): the
+            // request is over, or a later seek or speed change would start it unasked.
+            if (isCurrent() && !eng.playing) this._playIntent = false;
+            return false;
+        }
+        if (!isCurrent()) return false;
+        // Transport goes at once; the engine holds the playhead until the audio is there.
+        if (eng.playing) eng.engine.seek(frame);
+        else eng.engine.play(frame);
+        eng.playing = true;
+        eng.startedAt = this._engine!.context!.currentTime;
+        this._feed(eng, frame);
+        this._pumpTimer ??= setInterval(() => this._pump(eng), PUMP_MS);
+        return true;
+    }
+
+    /** Hand the engine the segments around `frame` (the playhead by default) and let go of the others. */
+    private _feed(eng: EnginePath | null = this._eng, frame?: number): void {
+        if (!eng || eng !== this._eng) return;
+        const at = frame ?? (eng.playing ? eng.engine.position() : eng.pausedFrame);
+        const wanted = engineWindow(eng.starts, at, {
+            loop: eng.loop,
+            ahead: AHEAD_SEGMENTS,
+            historyFrames: Math.max(eng.engine.stretch.latencyFrames, 0.25 * eng.rate),
+            speed: this._state.processing.speed,
+        });
+        const give = (stem: EngineStem, buffer: AudioBuffer | null) => {
+            for (const i of eng.engine.held(stem)) if (!buffer || !wanted.includes(i)) eng.engine.drop(stem, i);
+            if (!buffer) return;
+            for (const i of wanted) {
+                if (eng.engine.holds(stem, i)) continue;
+                // A shorter stem B reads as silence past its end (the engine reads a missing sample as 0).
+                const from = Math.min(eng.starts[i], buffer.length);
+                const to = Math.min(eng.starts[i + 1], buffer.length);
+                const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c).slice(from, to));
+                eng.engine.feed(stem, i, channels);
+            }
+        };
+        give('a', eng.a);
+        give('b', eng.b);
+    }
+
+    private _pump(eng: EnginePath): void {
+        if (eng !== this._eng || !eng.playing) return;
+        const frame = eng.engine.position();
+        this._feed(eng, frame);
+        const t = frame / eng.rate;
+        this._update({ currentTime: t });
+        this._host.emit('timeupdate', t);
+    }
+
+    private _onEngineEnded(eng: EnginePath): void {
+        if (eng !== this._eng || !eng.playing) return;
+        this._halt(eng);
+        this._playIntent = false;
+        eng.pausedFrame = 0;
+        eng.engine.seek(0);
+        this._update({ isPlaying: false, ended: true, currentTime: eng.a.duration, startedAt: null });
+        this._host.emit('timeupdate', eng.a.duration);
+        this._host.emit('ended', { clipId: this._state.clipId });
+    }
+
+    /** The processor died (it is silent for good): the tracks play on from the same place. */
+    private _onEngineError(eng: EnginePath, error: Error): void {
+        if (eng !== this._eng) return;
+        console.warn('[AudioPlayer] stream engine failed; the clip plays on tracks', error);
+        const wasPlaying = eng.playing;
+        const at = (wasPlaying ? eng.engine.position() : eng.pausedFrame) / eng.rate;
+        this._disposeEngine();
+        const speed = this._state.processing.speed;
+        this._trackA?.setPlaybackRate(speed);
+        this._trackB?.setPlaybackRate(speed);
+        const loop = this._state.loop;
+        this._trackA?.setLoopRange(loop);
+        if (this._trackB?.buffer) this._trackB.setLoopRange(loop);
+        this._applyMix(this._state.processing.mix);
+        if (wasPlaying) {
+            void this._startSynchronized(at);
+        } else {
+            void this._trackA?.seek(at);
+            if (this._trackB?.buffer) void this._trackB.seek(at);
+        }
+    }
+
+    /** Stem B is gone or replaced: the engine plays A alone until the new B's segments arrive. */
+    private _dropEngineB(): void {
+        const eng = this._eng;
+        if (!eng || !eng.b) return;
+        eng.b = null;
+        eng.engine.resetB();
+    }
+
+    /** Stem B at the clip's rate (an AudioBuffer handed in may have another). */
+    private static async _atRate(buffer: AudioBuffer, rate: number): Promise<AudioBuffer> {
+        if (buffer.sampleRate === rate) return buffer;
+        const length = Math.max(1, Math.round(buffer.duration * rate));
+        const offline = new OfflineAudioContext(buffer.numberOfChannels, length, rate);
+        const node = offline.createBufferSource();
+        node.buffer = buffer;
+        node.connect(offline.destination);
+        node.start();
+        return offline.startRendering();
     }
 
     /**
@@ -761,6 +1081,13 @@ export class BufferSource implements PlaybackSource {
     }
 
     private _applyMix(mix: number): void {
+        const eng = this._eng;
+        if (eng) {
+            // Smoothed in the engine.
+            const [gainA, gainB] = eng.b ? mixGains(mix, this._host.options.mixLaw) : [1, 0];
+            eng.engine.setMix(gainA, gainB);
+            return;
+        }
         const trackA = this._trackA;
         const trackB = this._trackB;
         if (!trackA || !trackB) {
@@ -854,6 +1181,7 @@ export class BufferSource implements PlaybackSource {
         this._loadedBFor = null;
         this._retryBAt = Date.now() + RETRY_B_MS;
         this._trackB?.unload();
+        this._dropEngineB();
         this._applyMix(this._state.processing.mix);
         this._update({ statusB: 'error', bufferB: null });
         this._host.emit('berror', err);
@@ -903,7 +1231,17 @@ export class BufferSource implements PlaybackSource {
         this._update({ bufferB: decoded, statusB: 'ready' });
         this._prewarm(trackB);
 
-        await this._syncBToA();
+        const eng = this._eng;
+        if (eng) {
+            // The engine reads B beside A from the same position: nothing to synchronise.
+            const atRate = await BufferSource._atRate(decoded, eng.rate);
+            if (this._disposed || requestId !== this._requestIdB || this._clip?.id !== clipId || eng !== this._eng) return false;
+            if (eng.b) eng.engine.resetB();
+            eng.b = atRate;
+            this._feed(eng);
+        } else {
+            await this._syncBToA();
+        }
         if (this._disposed || requestId !== this._requestIdB || this._clip?.id !== clipId) return false;
         this._applyMix(this._state.processing.mix);
         this._host.emit('bload', { clipId });

@@ -52,14 +52,7 @@ export {
     type ProcessingState,
 } from './core/controls';
 
-export {
-    vocoderStretcher,
-    nativeStretcher,
-    type StretchStrategy,
-    type VocoderStretcher,
-    type VocoderStretcherOptions,
-} from './core/stretch/strategies';
-export type { VocoderMemory } from './core/stretch/OfflineStretchCore';
+export type { StretchStrategy } from './core/stretch/strategies';
 export {
     serveStretchWorker,
     type StretchImplementation,
@@ -70,7 +63,6 @@ export {
     type StretchWorkerScope,
 } from './core/stretch/protocol';
 export { StretchService, StretchUnavailableError, type StretchPriority } from './core/stretch/StretchService';
-export { stretchChannel, stretchMultichannel, type StretchOptions } from './core/stretch/OfflineStretchCore';
 
 export {
     setAudioCacheBudget,

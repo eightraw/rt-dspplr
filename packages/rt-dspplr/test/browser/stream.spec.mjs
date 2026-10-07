@@ -261,12 +261,12 @@ test('decoded audio stays within the cache cap while seeking around', async ({ p
 for (const kind of ['buffer', 'segmented']) {
     test(`${kind} source: play, seek, loop across a boundary, pause/resume, FX, stop`, async ({ page }) => {
         const result = await page.evaluate(async (kind) => {
-            const { player } = mk();
+            const { player } = mk({ stretcher: undefined });
             const clip = kind === 'buffer' ? { src: `${longBase}/mono30.wav` } : { manifest: `${longBase}/mono30/manifest.json` };
             const t0 = performance.now();
             await player.play(clip);
             const audioMs = (await until(() => h.rms(player) > 0.02 && performance.now())) - t0;
-            if (kind === 'segmented') await until(() => player.getState().capabilities.canPreservePitch);
+            await until(() => player.getState().capabilities.canPreservePitch);
             const s0 = player.getState();
             await player.seek(20.4);
             await h.sleep(300);
@@ -299,8 +299,8 @@ for (const kind of ['buffer', 'segmented']) {
             return r;
         }, kind);
         expect(result.kind).toBe(kind);
-        // 'native' strategy for whole clips here; prepared clips stretch in realtime in the engine.
-        expect(result.preserve).toBe(kind === 'segmented');
+        // Both kinds stretch in realtime in the engine.
+        expect(result.preserve).toBe(true);
         expect(result.audioMs).toBeLessThan(3000);
         expect(result.afterSeek).toBeGreaterThan(20.4);
         expect(result.afterSeek).toBeLessThan(21.2);
@@ -352,7 +352,7 @@ test('one player switches between a whole clip and a prepared clip; realtime spe
 
 for (const realtime of [true, false]) {
     test(`React <AudioPlayer> card plays a manifest; at 1.5x the pitch note shows only without realtime stretch (${realtime})`, async ({ page }) => {
-        await page.evaluate((args) => h.mountCard({ manifest: `${args.base}/stereo70/manifest.json` }, { segmented: { realtimeStretch: args.realtime } }), { base: BASE, realtime });
+        await page.evaluate((args) => h.mountCard({ manifest: `${args.base}/stereo70/manifest.json` }, { stretcher: args.realtime ? 'realtime' : 'native' }), { base: BASE, realtime });
         await page.waitForFunction(() => window.cardPlayer?.getState().duration > 0);
         await expect.poll(() => page.evaluate(() => ink(document.querySelector('.rtd'), '.rtd-wave'))).toBeGreaterThan(0);
         await page.locator('.rtd-play').first().click();

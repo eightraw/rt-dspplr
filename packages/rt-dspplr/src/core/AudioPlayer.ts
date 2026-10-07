@@ -20,7 +20,7 @@ import {
     type ProcessingState,
 } from './controls';
 import { StretchService } from './stretch/StretchService';
-import { vocoderStretcher, type StretchStrategy } from './stretch/strategies';
+import type { StretchStrategy } from './stretch/strategies';
 import { setAudioCacheBudget } from './cache/pcmCache';
 import { bindAttribution, type InfoButtonMode } from '../attribution';
 import { BufferSource } from './sources/BufferSource';
@@ -112,17 +112,19 @@ export type PauseMode = 'pause' | 'reset';
 
 export interface AudioPlayerOptions {
     /**
-     * Time-stretch backend. Default: the built-in phase vocoder in a worker.
-     * 'native' (or `nativeStretcher`) uses playbackRate, which changes pitch.
-     * For Rubber Band, pass `rubberbandStretcher()` from the optional `./stretch-rubberband` entry.
+     * How speed keeps the pitch. Default 'realtime': the stream engine's realtime
+     * stretch, for whole and prepared clips alike (a speed change is heard at once).
+     * 'native': no stretch, the pitch follows the speed. An offline strategy such as
+     * `rubberbandStretcher()` (the optional `./stretch-rubberband` entry) renders each
+     * speed of a whole clip in a worker instead; prepared clips keep the realtime stretch.
      */
-    stretcher?: StretchStrategy | 'native';
+    stretcher?: 'realtime' | 'native' | StretchStrategy;
     /** Speeds offered by UIs; also the default prewarm set. Default [1, 1.25, 1.5, 2]. */
     speeds?: readonly number[];
     /**
-     * Render speed variants in the background right after a clip loads, so a
-     * speed changes usually avoid preparation waits. true = `speeds` except 1.
-     * The selected speed is always rendered first. Default true.
+     * With an offline `stretcher`: render speed variants in the background right
+     * after a clip loads, so speed changes usually avoid preparation waits.
+     * true = `speeds` except 1. The selected speed is always rendered first. Default true.
      */
     prewarmSpeeds?: boolean | readonly number[];
     /** Initial processing values. */
@@ -498,7 +500,7 @@ export class AudioPlayerCore {
             : prewarm === false ? [] : prewarm.map(normalizeSpeed);
         this._prewarmSpeeds = this._prewarmSpeeds.filter((speed) => Math.abs(speed - 1) >= 0.001);
 
-        const strategy = options.stretcher === 'native' ? null : options.stretcher ?? vocoderStretcher;
+        const strategy = typeof options.stretcher === 'object' && options.stretcher ? options.stretcher : null;
         this._stretch = strategy ? StretchService.forStrategy(strategy) : null;
 
         if (typeof options.cacheBudgetBytes === 'number') {
@@ -513,7 +515,11 @@ export class AudioPlayerCore {
             emit: (event, payload) => this._emit(event, payload),
             ensureOutput: () => this._ensureOutput(),
         };
-        this._bufferSource = new BufferSource(this._host, { stretch: this._stretch, prewarmSpeeds: this._prewarmSpeeds });
+        this._bufferSource = new BufferSource(this._host, {
+            stretch: this._stretch,
+            prewarmSpeeds: this._prewarmSpeeds,
+            engine: strategy ? null : { stretch: options.stretcher !== 'native' },
+        });
         this._source = this._bufferSource;
         if (options.element) this.mount(options.element);
     }
@@ -587,13 +593,13 @@ export class AudioPlayerCore {
     }
 
     /**
-     * Whether speed changes keep the pitch for the current clip: false for the
-     * native strategy and when workers are blocked; for prepared (segmented)
-     * clips, whether the engine's realtime stretcher is running. See also
+     * Whether speed changes keep the pitch for the current clip: whether the
+     * engine's realtime stretch is running (or, with an offline strategy, its
+     * worker is available). False with `stretcher: 'native'`. See also
      * `state.capabilities`.
      */
     get stretchAvailable(): boolean {
-        return this._source.kind === 'buffer' ? !!this._stretch?.available : this._source.capabilities.canPreservePitch;
+        return this._source.capabilities.canPreservePitch;
     }
 
     /** Live playback position in seconds, computed from the AudioContext clock. */
@@ -761,11 +767,11 @@ export class AudioPlayerCore {
     };
 
     /**
-     * Change the speed, keeping the position. A whole clip prepares a
-     * pitch-preserving variant in the background and switches at the live
-     * position (latest request wins); a prepared clip changes at once in the
-     * engine's realtime stretcher, keeping the pitch (where the stretcher is not
-     * available, `state.capabilities.canPreservePitch` is false and the pitch follows).
+     * Change the speed, keeping the position. It changes at once in the engine's
+     * realtime stretch, keeping the pitch (where the stretch is not available,
+     * `state.capabilities.canPreservePitch` is false and the pitch follows). With
+     * an offline strategy a whole clip prepares the variant in the background and
+     * switches at the live position (latest request wins).
      */
     setSpeed = async (speed: number): Promise<void> => this._source.setSpeed(normalizeSpeed(speed));
 
