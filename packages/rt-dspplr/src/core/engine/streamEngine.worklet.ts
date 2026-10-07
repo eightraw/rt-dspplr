@@ -1,6 +1,6 @@
 /// <reference path="../dsp/audioworklet-env.d.ts" />
 
-import { SplitSource, type SplitExports, type SplitState } from './splitSource';
+import { SplitSource, type SplitExports, type SplitMode, type SplitState } from './splitSource';
 
 // ---------------------------------------------------------------------------
 // The stream engine: block-based playback of segmented audio in the audio
@@ -85,6 +85,7 @@ interface Options {
 
 interface WasmStretch {
     _main(): void;
+    _reset(): void;
     _presetDefault(channels: number, sampleRate: number): void;
     _setBuffers(channels: number, length: number): number;
     _inputLatency(): number;
@@ -93,6 +94,19 @@ interface WasmStretch {
     _process(inputs: number, outputs: number): void;
     HEAP8?: Int8Array;
     exports?: { memory: WebAssembly.Memory };
+}
+
+/**
+ * Module instances of engines that are gone, for the next ones (the engines of a context share
+ * this scope): a page that loads clip after clip would otherwise pile them up, since an
+ * instance's memory goes only with a garbage collection, and the browser refuses new instances
+ * long before that. The split module is compiled once.
+ */
+const pool: { stretch: WasmStretch[]; split: SplitExports[]; splitModule: Promise<WebAssembly.Module> | null } = { stretch: [], split: [], splitModule: null };
+const POOL_MAX = 4;
+
+function giveBack<T>(list: T[], item: T): void {
+    if (list.length < POOL_MAX) list.push(item);
 }
 
 const RAMP_SECONDS = 0.02;
@@ -308,6 +322,8 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     private readonly stretched: Float32Array[];
     /** Each stem's tonal and atonal parts, once the split module is in (null: the mix is stretched whole). */
     private split: Record<Stem, SplitSource> | null = null;
+    /** The split module's instance (both stems', every way of reading through a loop: its contexts). */
+    private splitInstance: SplitExports | null = null;
     private splitLoading = false;
     private splitError = '';
     private readonly splitBudget = { left: 0 };
@@ -316,6 +332,8 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     private readonly olaWindow: Float32Array;
     private olaOut = 0;
     private readonly olaStarts = new Map<number, number>();
+    /** How each overlap-add window reads the split (its centre's mode). */
+    private readonly olaModes = new Map<number, SplitMode>();
     /** Whether the last block used the split (else the overlap-add restarts). */
     private olaRunning = false;
     /** The clip's rate: the timeline, the ramps and the stretcher all run at it. */
@@ -373,8 +391,12 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         this.split?.b.clear();
         if (!dispose) return;
         this.disposing = true;
+        // The instances go to the next engine.
+        if (this.stretch) giveBack(pool.stretch, this.stretch.mod);
+        if (this.splitInstance) giveBack(pool.split, this.splitInstance);
         this.stretch = null;
         this.split = null;
+        this.splitInstance = null;
     }
 
     // ---- segments ------------------------------------------------------------------------
@@ -487,65 +509,118 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         return f;
     }
 
+    /**
+     * How the split reads timeline frame `frame` (as mapFrame() gets it) from a playhead at `from`
+     * (see splitSource.ts): as the clip lies (0), in the loop before its first wrap (1), or past a
+     * wrap, one that came or one this read looks across (2).
+     */
+    private splitMode(from: number, frame: number): SplitMode {
+        const loop = this.loop;
+        if (!loop || loop.end <= loop.start || from < loop.start || from >= loop.end) return 0;
+        return this.wrapped || frame >= loop.end ? 2 : 1;
+    }
+
+    /** A frame of the loop's audio all round: past its end its start, before its start its end. */
+    private wrapLoop(frame: number): number {
+        const loop = this.loop!;
+        const len = loop.end - loop.start;
+        if (frame >= loop.end) return loop.start + ((frame - loop.start) % len);
+        if (frame < loop.start) return loop.end - ((loop.start - frame) % len || len);
+        return frame;
+    }
+
     // ---- stretcher -------------------------------------------------------------------------
 
     private ensureStretch(): void {
         if (this.stretch || this.stretchLoading || this.stretchError) return;
         const factory = (globalThis as unknown as { __rtdSignalsmithFactory?: () => Promise<WasmStretch> }).__rtdSignalsmithFactory;
         if (!factory) return; // the module is still being added; try again next block
-        this.stretchLoading = true;
-        factory().then((mod) => {
-            // Disposed while it loaded: its heap is not kept.
-            if (this.disposing) {
-                this.stretchLoading = false;
-                return;
-            }
-            mod._main();
-            mod._presetDefault(this.channels, this.clipRate);
-            const inLat = mod._inputLatency();
-            const outLat = mod._outputLatency();
-            const len = inLat + outLat;
-            const pointer = mod._setBuffers(this.channels, len);
-            const bytes = len * 4;
-            this.stretch = {
-                mod,
-                len,
-                inLat,
-                outLat,
-                inPtr: Array.from({ length: this.channels }, (_, c) => pointer + bytes * c),
-                outPtr: Array.from({ length: this.channels }, (_, c) => pointer + bytes * (c + this.channels)),
-            };
-            this.stretchLoading = false;
-            this.port.postMessage({ type: 'stretch', ready: true, latencyFrames: len, inputLatency: inLat });
-        }, (error: unknown) => {
+        const failed = (error: unknown) => {
             this.stretchLoading = false;
             this.stretchError = String(error);
             this.port.postMessage({ type: 'stretch', ready: false, error: this.stretchError });
-        });
+        };
+        const pooled = pool.stretch.pop();
+        if (pooled) {
+            try {
+                this.configureStretch(pooled);
+            } catch (error) {
+                failed(error);
+            }
+            return;
+        }
+        this.stretchLoading = true;
+        factory().then((mod) => {
+            mod._main();
+            this.stretchLoading = false;
+            // Disposed while it loaded: it goes to the next engine.
+            if (this.disposing) {
+                giveBack(pool.stretch, mod);
+                return;
+            }
+            this.configureStretch(mod);
+        }).catch(failed);
     }
 
-    /** The split module (added to the scope with the stretcher), one instance per stem. */
+    /** A stretcher instance (new, or another engine's) set up for this clip's channels and rate. */
+    private configureStretch(mod: WasmStretch): void {
+        // Configured first (a stretcher that never was divides by zero in reset()), then cleared of another clip's audio.
+        mod._presetDefault(this.channels, this.clipRate);
+        mod._reset();
+        const inLat = mod._inputLatency();
+        const outLat = mod._outputLatency();
+        const len = inLat + outLat;
+        const pointer = mod._setBuffers(this.channels, len);
+        const bytes = len * 4;
+        this.stretch = {
+            mod,
+            len,
+            inLat,
+            outLat,
+            inPtr: Array.from({ length: this.channels }, (_, c) => pointer + bytes * c),
+            outPtr: Array.from({ length: this.channels }, (_, c) => pointer + bytes * (c + this.channels)),
+        };
+        this.port.postMessage({ type: 'stretch', ready: true, latencyFrames: len, inputLatency: inLat });
+    }
+
+    /**
+     * The split module (added to the scope with the stretcher): one instance for both stems, each
+     * stem's three ways of splitting (SplitMode) in contexts of their own (a: 0–2, b: 3–5).
+     */
     private ensureSplit(): void {
         if (this.split || this.splitLoading || this.splitError || this.channels > 2) return;
         const bytes = (globalThis as unknown as { __rtdSplitWasm?: Uint8Array }).__rtdSplitWasm;
         if (!bytes) return; // not added (yet): the mix is stretched whole
+        const pooled = pool.split.pop();
+        if (pooled) {
+            this.splitSources(pooled);
+            return;
+        }
         this.splitLoading = true;
         const imports = { wasi_snapshot_preview1: { random_get: () => 0 } };
-        const make = async (module: WebAssembly.Module, stem: Stem) => {
-            const instance = await WebAssembly.instantiate(module, imports);
-            const x = instance.exports as unknown as SplitExports;
-            x._initialize?.();
-            return new SplitSource(x, this.channels, (frame, channel) => this.sample(stem, frame, channel), (from, to) => this.hasRange(stem, from, to));
-        };
-        WebAssembly.compile(bytes)
-            .then(async (module) => ({ a: await make(module, 'a'), b: await make(module, 'b') }))
-            .then((split) => {
+        pool.splitModule ??= WebAssembly.compile(bytes);
+        pool.splitModule
+            .then((module) => WebAssembly.instantiate(module, imports))
+            .then((instance) => {
+                const x = instance.exports as unknown as SplitExports;
+                x._initialize?.();
                 this.splitLoading = false;
-                if (!this.disposing) this.split = split;
+                // Disposed while it loaded: it goes to the next engine.
+                if (this.disposing) giveBack(pool.split, x);
+                else this.splitSources(x);
             }, (error: unknown) => {
                 this.splitLoading = false;
                 this.splitError = String(error);
             });
+    }
+
+    private splitSources(x: SplitExports): void {
+        const source = (stem: Stem, ctx: number) => new SplitSource(x, ctx, this.channels, (frame, channel) => this.sample(stem, frame, channel), (from, to) => this.hasRange(stem, from, to));
+        const split = { a: source('a', 0), b: source('b', 3) };
+        split.a.setLoop(this.loop);
+        split.b.setLoop(this.loop);
+        this.splitInstance = x;
+        this.split = split;
     }
 
     /**
@@ -559,20 +634,23 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         const lo = Math.min(end - st.len - start, -this.olaHalf - 1);
         const hi = Math.max(end - start, n * rate + this.olaHalf + 1);
         const frames = (i: number) => this.mapFrame(start, Math.round(start + lo + i));
+        const modes = (i: number) => this.splitMode(start, Math.round(start + lo + i));
         const count = Math.ceil(hi - lo);
         this.splitBudget.left = SPLIT_BUDGET + extra;
-        let state = split.a.prepare(count, frames, this.splitBudget);
-        if (state === 'ready' && withB) state = split.b.prepare(count, frames, this.splitBudget);
+        let state = split.a.prepare(count, frames, this.splitBudget, modes);
+        if (state === 'ready' && withB) state = split.b.prepare(count, frames, this.splitBudget, modes);
         if (state !== 'ready') return state;
         // What is left prepares the frames just ahead (through the loop too), a little each block.
         const ahead = (i: number) => this.mapFrame(start, Math.round(start + hi + i));
-        if (split.a.prepare(SPLIT_AHEAD, ahead, this.splitBudget) === 'ready' && withB) split.b.prepare(SPLIT_AHEAD, ahead, this.splitBudget);
+        const aheadModes = (i: number) => this.splitMode(start, Math.round(start + hi + i));
+        if (split.a.prepare(SPLIT_AHEAD, ahead, this.splitBudget, aheadModes) === 'ready' && withB) split.b.prepare(SPLIT_AHEAD, ahead, this.splitBudget, aheadModes);
         return 'ready';
     }
 
     /**
      * The atonal part, stretched by overlap-add (no search) onto stretched[]: 12 ms windows
-     * every 6 ms of output, each read from the source frame its centre maps to.
+     * every 6 ms of output, each read from the source frame its centre maps to, through the loop
+     * as its centre is (a window past a wrap reads the loop all round).
      */
     private addAtonal(start: number, rate: number, n: number, ga: number, gb: number): void {
         const split = this.split!;
@@ -582,6 +660,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         if (!this.olaRunning) {
             this.olaOut = 0;
             this.olaStarts.clear();
+            this.olaModes.clear();
         }
         const o0 = this.olaOut;
         const firstK = Math.floor((o0 - L + 1 + hs) / hs);
@@ -590,22 +669,34 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
             const oStart = k * hs - hs;
             let from = this.olaStarts.get(k);
             if (from === undefined) {
-                from = this.mapFrame(start, Math.round(start + (oStart + hs - o0) * rate)) - hs;
+                const centre = Math.round(start + (oStart + hs - o0) * rate);
+                from = this.mapFrame(start, centre) - hs;
                 this.olaStarts.set(k, from);
+                this.olaModes.set(k, this.splitMode(start, centre));
             }
+            const windowMode = this.loop ? this.olaModes.get(k)! : 0;
             const a = Math.max(o0, oStart);
             const b = Math.min(o0 + n, oStart + L);
-            for (let c = 0; c < this.channels; c += 1) {
-                const dst = this.stretched[c];
-                for (let t = a; t < b; t += 1) {
-                    const i = t - oStart;
-                    const frame = from + i;
-                    const v = split.a.atonal(frame, c) * ga + (gb !== 0 ? split.b.atonal(frame, c) * gb : 0);
-                    dst[t - o0] += v * w[i];
+            for (let t = a; t < b; t += 1) {
+                const i = t - oStart;
+                let frame = from + i;
+                let mode = windowMode;
+                // Past a wrap the loop is all round; before one, a window at the loop's end goes on at its start.
+                if (mode === 2 || (mode === 1 && frame >= this.loop!.end)) {
+                    frame = this.wrapLoop(frame);
+                    mode = 2;
+                }
+                for (let c = 0; c < this.channels; c += 1) {
+                    const v = split.a.atonal(frame, c, mode) * ga + (gb !== 0 ? split.b.atonal(frame, c, mode) * gb : 0);
+                    this.stretched[c][t - o0] += v * w[i];
                 }
             }
         }
-        for (const k of this.olaStarts.keys()) if (k < firstK) this.olaStarts.delete(k);
+        for (const k of this.olaStarts.keys()) {
+            if (k >= firstK) continue;
+            this.olaStarts.delete(k);
+            this.olaModes.delete(k);
+        }
         this.olaOut += n;
     }
 
@@ -671,6 +762,9 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
             case 'loop':
                 this.loop = message.start === null ? null : { start: message.start, end: message.end };
                 if (!this.loop) this.wrapped = false;
+                // The split near the loop's edges is the loop's audio there.
+                this.split?.a.setLoop(this.loop);
+                this.split?.b.setLoop(this.loop);
                 break;
             case 'rate':
                 this.rate = message.rate > 0 ? message.rate : 1;
@@ -886,8 +980,9 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                     if (kept > 0) buf.copyWithin(0, shift);
                     for (let k = kept; k < s.len; k += 1) {
                         const f = this.mapFrame(start, end - s.len + k);
+                        const m = split ? this.splitMode(start, end - s.len + k) : 0;
                         buf[k] = split
-                            ? split.a.tonal(f, c) * gaStart + (gbStart !== 0 ? split.b.tonal(f, c) * gbStart : 0)
+                            ? split.a.tonal(f, c, m) * gaStart + (gbStart !== 0 ? split.b.tonal(f, c, m) * gbStart : 0)
                             : this.sample('a', f, c) * gaStart + (gbStart !== 0 ? this.sample('b', f, c) * gbStart : 0);
                     }
                 }

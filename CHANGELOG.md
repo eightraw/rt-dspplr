@@ -34,10 +34,12 @@ player) and `@saitdigital/rt-dspplr-prepare` (the Node prepare step, from 0.1.0)
   loop wraps, a held playhead on underruns (silence, then the same sample), smoothed
   volume and A/B mix. Speed keeps the pitch through a realtime stretch: each stem
   is split into a tonal and an atonal part (median filtering of its spectrum, our
-  own WebAssembly, 18 KB), Signalsmith Stretch (MIT, a lazy chunk of about 100 KB,
+  own WebAssembly, 20 KB), Signalsmith Stretch (MIT, a lazy chunk of about 100 KB,
   44 KB gzipped) stretches the tonal part and a short overlap-add the atonal one,
   so held notes stay smooth and attacks single and sharp (in blind listening on
-  guitar it could not be told from Rubber Band's offline render). The
+  guitar it could not be told from Rubber Band's offline render). In a loop
+  the split looks at the audio as it plays, so nothing from past the loop's end
+  (or, once it has wrapped, from before its start) reaches the seam. The
   engine runs at the clip's own rate and converts its output to the context's
   with a streaming windowed-sinc resampler when they differ, so a 44.1 or 16 kHz
   recording keeps realtime speed too. Without the stretcher the pitch follows

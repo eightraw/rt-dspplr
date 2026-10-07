@@ -274,3 +274,64 @@ test('the stretch keeps an attack single: clicks over a held tone at 0.75x, spli
     expect(r.peaks).toBe(r.expected);
     expect(r.minGap).toBeGreaterThan(0.35);
 });
+
+test('a split stretch through a loop wrap: nothing from past the loop end, no gap at the seam', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const sr = 48000;
+        const n = sr * 6;
+        // A held tone (whole periods in the loop, so the seam itself is seamless) up to the loop's
+        // end at 4.5 s, loud noise after it. The loop is longer than the split keeps chunks for (~2 s).
+        const loop = { start: 1.5 * sr, end: 4.5 * sr };
+        let seed = 5;
+        const x = Float32Array.from({ length: n }, (_, i) => {
+            if (i < loop.end) return 0.15 * Math.sin(2 * Math.PI * 220 * i / sr);
+            seed = (seed * 16807) % 2147483647;
+            return (seed / 2147483647 - 0.5) * 1.8;
+        });
+        const speed = 1.5;
+        const ctx = new OfflineAudioContext(1, sr * 7, sr);
+        await h.internals.loadStreamEngine(ctx, true);
+        await h.internals.stretchAvailable(ctx);
+        const starts = [];
+        for (let f = 0; f < n; f += sr) starts.push(f);
+        starts.push(n);
+        const engine = new h.internals.StreamEngine(ctx, { channels: 1, starts, stretch: true });
+        engine.node.connect(ctx.destination);
+        for (let i = 0; i + 1 < starts.length; i += 1) engine.feed('a', i, [x.slice(starts[i], starts[i + 1])]);
+        engine.setRate(speed);
+        engine.setLoop(loop);
+        let splitting = 0;
+        engine.onReport = (report) => { if (report.splitting) splitting += 1; };
+        ctx.suspend(256 / sr).then(async () => {
+            const t = performance.now();
+            while (!engine.stretch.ready && performance.now() - t < 20000) await h.sleep(5);
+            await h.sleep(300);
+            engine.play(loop.start + 0.5 * sr);
+            await settle();
+            ctx.resume();
+        });
+        const out = (await ctx.startRendering()).getChannelData(0);
+        // From 0.3 s on: 2 ms windows. Wraps come every 2 s of output (3 s of loop at 1.5x).
+        const W = 96;
+        const rms = [];
+        let peak = 0;
+        for (let i = Math.round(0.3 * sr); i + W < out.length; i += W) {
+            let s = 0;
+            for (let k = 0; k < W; k += 1) {
+                s += out[i + k] * out[i + k];
+                peak = Math.max(peak, Math.abs(out[i + k]));
+            }
+            rms.push(Math.sqrt(s / W));
+        }
+        const sorted = [...rms].sort((a, b) => a - b);
+        return { splitting, peak, min: sorted[0], median: sorted[sorted.length >> 1] };
+    });
+    console.log(`loop wraps at 1.5x: peak ${r.peak.toFixed(3)} (tone 0.15, noise past the loop 0.9), 2 ms RMS from ${r.min.toFixed(3)} to a median of ${r.median.toFixed(3)}; split on in ${r.splitting} reports`);
+    expect(r.splitting).toBeGreaterThan(0);
+    // Nothing of the noise past the loop's end: the overlap-add reads its windows through the loop
+    // (0.58 when it read straight on), and the split near the edges is that of the loop as it
+    // plays (0.33 when its 43 ms analysis saw the noise past the end).
+    expect(r.peak).toBeLessThan(0.2);
+    // No gap at the seam (a part missing there was read as silence).
+    expect(r.min).toBeGreaterThan(0.85 * r.median);
+});
