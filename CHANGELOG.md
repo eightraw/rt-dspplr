@@ -28,9 +28,17 @@ player and, from 0.4.0, the Node prepare step for long recordings (its
 - The manifest, the peaks and the coarse spectrogram (a few hundred KB to about
   1.5 MB) make the timeline, ruler, zoom, pan, waveform, DSP preview and
   spectrogram usable over the whole duration at once. Audio is fetched around the
-  playhead; decoded audio stays near 60 s (`segmented.cacheSeconds`). A 60-minute
-  file: UI and first audio in about 130 ms locally, 360 MB of browser memory
-  (whole-file mode: 3.9 s and 2.8 GB).
+  playhead, before anything else: the overview files follow it, coarse to fine, at
+  full speed while no segment is waited for, and break off within one network chunk
+  when a start or a seek asks for one (they carry on from there once it is in).
+  A WAV source plays as its bytes arrive: the segment at the playhead is handed to the
+  engine in parts, which starts once half a second ahead is in (a seek no longer waits
+  for the whole segment). The first picture is the coarsest level of the waveform and
+  of both spectrograms (the stem's too, so a blend is never drawn from A alone),
+  fetched together; the decoded close-up of a short view (up to 20 s, now counted in
+  seconds, not segments) follows it. Decoded audio stays near 60 s (`segmented.cacheSeconds`).
+  A 60-minute file: UI and first audio in about 130 ms locally, 360 MB of browser
+  memory (whole-file mode: 3.9 s and 2.8 GB).
 - Playback runs in an AudioWorklet stream engine: sample-exact across segments and
   loop wraps, a held playhead on underruns (silence, then the same sample), smoothed
   volume and A/B mix. Speed keeps the pitch through a realtime stretch: each stem
@@ -60,8 +68,10 @@ player and, from 0.4.0, the Node prepare step for long recordings (its
   the recording, each with an optional `label`. The knob blends A with one stem at a
   time: `play({ manifest, stem })`, `player.setStem(key)`; `capabilities.stems`
   lists the ready ones (`{ key, label }`). The card shows a stem selector
-  (`label ?? key`) only when there is more than one. A stem's segments are fetched
-  only while the knob is above 0 and let go about 10 s after it is back at 0.
+  (`label ?? key`) only when there is more than one. While the knob is at 0 only
+  the stem's segment at the playhead is fetched, after A's (`segmented.prefetchStem`,
+  default true: the first move of the knob plays at once); its other segments are
+  fetched while the knob is above 0 and let go about 10 s after it is back at 0.
   Manifests with only `stems.b` play as before. The library never interprets keys
   or labels.
 - Stems are read as published: no polling unless `segmented.pollStemsMs` is set;
@@ -147,6 +157,9 @@ player and, from 0.4.0, the Node prepare step for long recordings (its
   opened again, so a new player) could lose stem B from its state: B, installed
   while A's load was finishing, was cleared by A's "ready". The spectrogram then
   drew stem A alone in A's colour and stopped following the mix.
+- A prepared clip ignored a `setMix()` made while a whole clip, or nothing, was
+  loaded: a page that set its knob and then loaded a prepared clip heard and saw A
+  alone until the knob moved. A prepared load now takes the player's mix.
 - **The high-pass was not the one drawn.** Web Audio reads a biquad's Q in dB for
   high-pass and low-pass filters; the player passed the linear Butterworth Q, so
   what played had +1.85 dB at the cutoff and a +3.8 dB bump just above it, where
@@ -232,6 +245,9 @@ New in the same package: the prepare step for long recordings
   manifest (each segment's byte range), multi-level peaks, loudness, bands.bin
   (high-pass preview energies) and spectrogram.bin (overview), and the manifest
   last, atomically. Nothing is resampled: the timeline is the source's rate.
+- A segment holds about 192 KB of the stored file by default (`segmentSeconds`:
+  from 1 s, 2 s for MP3, 3 s for Opus, to 10 s, at most 600 per file), so a start
+  or a seek waits for one small request whatever the format.
 - The index is checked before it is published: the first segment, one past the
   middle and the last are read back the player's way (the same decoders) and
   compared with what was analysed. MP3 runs start 6 frames early (exact), Opus

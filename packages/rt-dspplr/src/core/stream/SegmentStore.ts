@@ -2,6 +2,13 @@ import { SourceError, type FileAccess } from './fileAccess';
 import type { AudioManifest } from './manifest';
 import { decodeRun } from './RunDecoder';
 import { segmentFromRun } from './sourceRuns';
+import { decodeInterleaved } from './wavFormat';
+
+/** A segment's frames, handed out as its bytes arrive: `planes` hold frames from `offset` of `total`. */
+export type PartialListener = (index: number, offset: number, planes: Float32Array[], total: number) => void;
+
+/** Parts of a segment arriving are handed out once at least this many seconds of it are in (or it is whole). */
+const PART_MIN_SECONDS = 0.05;
 
 // ---------------------------------------------------------------------------
 // SegmentStore — fetches segments on demand (byte ranges of the clip's source,
@@ -60,6 +67,8 @@ interface Job {
     promise: Promise<AudioBuffer | null>;
     resolve: (buffer: AudioBuffer | null) => void;
     started: boolean;
+    /** Asked for as urgent (the playhead waits for it): see idle(). */
+    urgent: boolean;
 }
 
 export class SegmentStore {
@@ -81,6 +90,8 @@ export class SegmentStore {
     private _bytes = 0;
     private _disposed = false;
     private _listeners = new Set<(index: number) => void>();
+    private _partialListeners = new Set<PartialListener>();
+    private _idleWaiters: Array<() => void> = [];
     private _errorListeners = new Set<(index: number, error: Error, failures: number) => void>();
     /** Segments that failed: how often in a row, and when the next try may start. */
     private readonly _failures = new Map<number, { count: number; retryAt: number }>();
@@ -117,6 +128,39 @@ export class SegmentStore {
         return this._jobs.has(index);
     }
 
+    /** Whether a segment asked for as urgent is on its way. */
+    get urgentBusy(): boolean {
+        for (const job of this._jobs.values()) if (job.urgent) return true;
+        return false;
+    }
+
+    /**
+     * Resolves once no urgent segment is on its way (at once when none is): what is fetched
+     * besides the audio the playhead waits for (the overview files) waits for this, or it would
+     * share that audio's bandwidth.
+     */
+    idle(): Promise<void> {
+        if (!this.urgentBusy || this._disposed) return Promise.resolve();
+        return new Promise((resolve) => this._idleWaiters.push(resolve));
+    }
+
+    private _wakeIdle(): void {
+        if (this.urgentBusy && !this._disposed) return;
+        const waiters = this._idleWaiters;
+        this._idleWaiters = [];
+        for (const wake of waiters) wake();
+    }
+
+    /**
+     * Called with each segment's frames as its bytes arrive, before it is whole (a WAV source:
+     * its PCM decodes as it comes; other codecs' runs decode once they are whole). The listener
+     * may transfer the arrays.
+     */
+    onPartial(listener: PartialListener): () => void {
+        this._partialListeners.add(listener);
+        return () => this._partialListeners.delete(listener);
+    }
+
     /** Called with the index of every segment that finishes decoding. */
     onLoad(listener: (index: number) => void): () => void {
         this._listeners.add(listener);
@@ -147,6 +191,7 @@ export class SegmentStore {
         if (failed && performance.now() < failed.retryAt && !this._jobs.has(index)) return Promise.resolve(null);
         const existing = this._jobs.get(index);
         if (existing) {
+            if (urgent) existing.urgent = true;
             if (urgent && !existing.started) {
                 this._queue = [existing, ...this._queue.filter((j) => j !== existing)];
             }
@@ -154,7 +199,7 @@ export class SegmentStore {
         }
         let resolve!: (b: AudioBuffer | null) => void;
         const promise = new Promise<AudioBuffer | null>((r) => { resolve = r; });
-        const job: Job = { index, controller: new AbortController(), promise, resolve, started: false };
+        const job: Job = { index, controller: new AbortController(), promise, resolve, started: false, urgent };
         this._jobs.set(index, job);
         if (urgent) this._queue.unshift(job);
         else this._queue.push(job);
@@ -239,8 +284,10 @@ export class SegmentStore {
         this._cache.clear();
         this._bytes = 0;
         this._listeners.clear();
+        this._partialListeners.clear();
         this._errorListeners.clear();
         this._failures.clear();
+        this._wakeIdle();
     }
 
     /** Abort every fetch, the whole-file download included; nothing is fetched after. */
@@ -264,6 +311,7 @@ export class SegmentStore {
         if (this._jobs.get(job.index) === job) this._jobs.delete(job.index);
         this._queue = this._queue.filter((j) => j !== job);
         job.resolve(buffer);
+        this._wakeIdle();
     }
 
     private _drain(): void {
@@ -289,7 +337,7 @@ export class SegmentStore {
             let bytes: ArrayBuffer | null = null;
             let fetched = 0;
             if (seg.range) {
-                ({ bytes, fetched } = await this._fetchRun(seg.range[0], seg.range[1], job.controller.signal));
+                ({ bytes, fetched } = await this._fetchRun(seg.range[0], seg.range[1], job.controller.signal, this._partsOf(job)));
                 if (job.controller.signal.aborted || this._disposed) {
                     this._finish(job, null);
                     return;
@@ -348,7 +396,49 @@ export class SegmentStore {
      * the server answers with the whole file, a slice of that (kept, see
      * WHOLE_SOURCE_MAX_BYTES). `fetched`: the bytes this call downloaded.
      */
-    private async _fetchRun(start: number, end: number, signal: AbortSignal): Promise<{ bytes: ArrayBuffer; fetched: number }> {
+    /**
+     * For a WAV source, what hands a segment's frames out as its bytes arrive (onPartial): the run's
+     * frames as they come, placed as segmentFromRun places them (`lead` silence, the run counted
+     * back from its end, `trail` silence). Other codecs: undefined (their runs decode whole).
+     */
+    private _partsOf(job: Job): ((bytes: Uint8Array, received: number) => void) | undefined {
+        const source = this._manifest.segments.source;
+        const pcm = source.pcm;
+        const seg = this._manifest.segments.list[job.index];
+        if (source.codec !== 'wav' || !pcm || !seg.range || this._partialListeners.size === 0) return undefined;
+        const rangeBytes = seg.range[1] - seg.range[0];
+        const runFrames = Math.floor(rangeBytes / pcm.blockAlign);
+        const from = runFrames - seg.tail;
+        if (from < 0) return undefined;
+        const lead = seg.lead ?? 0;
+        const count = Math.max(0, Math.min(seg.frames - lead - (seg.trail ?? 0), seg.tail));
+        const channels = this._manifest.channels;
+        const minPart = Math.max(1, Math.round(PART_MIN_SECONDS * this._manifest.sampleRate));
+        let sent = 0;
+        return (bytes, received) => {
+            if (job.controller.signal.aborted || this._disposed) return;
+            const whole = received >= rangeBytes;
+            const runIn = Math.floor(received / pcm.blockAlign);
+            const upto = whole ? seg.frames : Math.min(seg.frames, lead + Math.max(0, Math.min(count, runIn - from)));
+            if (upto <= sent || (!whole && upto - sent < minPart)) return;
+            const n = upto - sent;
+            const planes = Array.from({ length: channels }, () => new Float32Array(n));
+            // The part's frames that carry audio (not lead or trail silence).
+            const audioFrom = Math.max(sent, lead);
+            const audioTo = Math.min(upto, lead + count);
+            if (audioTo > audioFrom) {
+                const r0 = from + audioFrom - lead;
+                const frames = audioTo - audioFrom;
+                const run = decodeInterleaved({ encoding: pcm.encoding, bitsPerSample: pcm.bitsPerSample, channels: source.channels }, bytes.subarray(r0 * pcm.blockAlign, (r0 + frames) * pcm.blockAlign), frames);
+                for (let c = 0; c < channels; c += 1) planes[c].set(run[c % run.length], audioFrom - sent);
+            }
+            const offset = sent;
+            sent = upto;
+            for (const listener of [...this._partialListeners]) listener(job.index, offset, planes, seg.frames);
+        };
+    }
+
+    private async _fetchRun(start: number, end: number, signal: AbortSignal, onBytes?: (bytes: Uint8Array, received: number) => void): Promise<{ bytes: ArrayBuffer; fetched: number }> {
         const kept = this._whole;
         if (kept) return { bytes: (await kept).slice(start, end), fetched: 0 };
         const url = this._sourceUrl;
@@ -363,6 +453,23 @@ export class SegmentStore {
             const whole = start === 0 && end === this._manifest.segments.source.bytes;
             if (response.status === 206 || whole) {
                 if (response.status === 206) this._checkContentRange(response.headers.get('content-range'), start, end);
+                // Read as it comes when its frames are wanted before it is whole.
+                if (onBytes && response.body) {
+                    const length = end - start;
+                    const buf = new Uint8Array(length);
+                    const reader = response.body.getReader();
+                    let received = 0;
+                    for (;;) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        if (received + value.byteLength > length) throw new Error(`more than ${length} bytes for a range of ${length}`);
+                        buf.set(value, received);
+                        received += value.byteLength;
+                        onBytes(buf, received);
+                    }
+                    if (received !== length) throw new Error(`${received} bytes for a range of ${length}`);
+                    return { bytes: buf.buffer, fetched: received };
+                }
                 const bytes = await response.arrayBuffer();
                 if (bytes.byteLength !== end - start) throw new Error(`${bytes.byteLength} bytes for a range of ${end - start}`);
                 return { bytes, fetched: bytes.byteLength };

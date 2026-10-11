@@ -385,7 +385,7 @@ test('refreshManifest() ignores another recording behind the URL, and stems made
 
 // ---- superseded loads --------------------------------------------------------------------
 
-test('a new load and dispose() abort the overview fetches still on the way', async ({ page }) => {
+test('a new load and dispose() abort the overview fetch on its way, and no more of that clip\'s start', async ({ page }) => {
     let open;
     const gate = new Promise((resolve) => { open = resolve; });
     // Overview files of both clips hang until the end of the test.
@@ -401,16 +401,20 @@ test('a new load and dispose() abort the overview fetches still on the way', asy
         const pendingBefore = first.map((e) => !!e.signal && !e.signal.aborted);
         await player.load({ manifest: `${longBase}/stereo70/manifest.json` });
         const afterNewLoad = first.map((e) => e.signal.aborted);
+        await h.sleep(300);
+        const firstLater = overview('mono30').length;
         const second = overview('stereo70');
         const secondPending = second.map((e) => !!e.signal && !e.signal.aborted);
         player.dispose();
-        return { pendingBefore, afterNewLoad, secondPending, afterDispose: second.map((e) => e.signal.aborted) };
+        return { pendingBefore, afterNewLoad, firstBefore: first.length, firstLater, secondPending, afterDispose: second.map((e) => e.signal.aborted) };
     });
     open();
-    expect(r.pendingBefore.length).toBeGreaterThanOrEqual(3);
+    // The overview files go one at a time (each behind the audio): one is on its way.
+    expect(r.pendingBefore.length).toBeGreaterThanOrEqual(1);
     expect(r.pendingBefore.every(Boolean)).toBe(true);
     expect(r.afterNewLoad.every(Boolean)).toBe(true);
-    expect(r.secondPending.length).toBeGreaterThanOrEqual(3);
+    expect(r.firstLater).toBe(r.firstBefore);
+    expect(r.secondPending.length).toBeGreaterThanOrEqual(1);
     expect(r.secondPending.every(Boolean)).toBe(true);
     expect(r.afterDispose.every(Boolean)).toBe(true);
 });

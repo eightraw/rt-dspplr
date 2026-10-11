@@ -70,6 +70,42 @@ test('engine output is sample-exact across segment boundaries and loop wraps', a
     expect(result.loopErr).toBeLessThan(1e-6);
 });
 
+test('a segment fed in parts plays sample-exact, and a start waits for half a second of it', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const sr = 48000;
+        const tone = sine(sr * 3, 437, 0.5);
+        const ctx = new OfflineAudioContext(1, sr * 2, sr);
+        await h.internals.loadStreamEngine(ctx, false);
+        const engine = new h.internals.StreamEngine(ctx, { channels: 1, starts: [0, tone.length], stretch: false });
+        engine.node.connect(ctx.destination);
+        // 0.3 s in, in uneven parts: less than the margin a start waits for.
+        const cuts = [0, 1000, 8191, 14400];
+        for (let k = 0; k + 1 < cuts.length; k += 1) engine.feedPart('a', 0, cuts[k], [tone.slice(cuts[k], cuts[k + 1])], tone.length);
+        const partialBefore = engine.partial('a', 0);
+        engine.play(0);
+        await settle();
+        // The rest at 0.25 s.
+        ctx.suspend(0.25).then(async () => {
+            engine.feedPart('a', 0, 14400, [tone.slice(14400)], tone.length);
+            await settle();
+            ctx.resume();
+        });
+        const out = (await ctx.startRendering()).getChannelData(0);
+        // tone[0] is 0: the start is the sample before the first that sounds.
+        let first = 0;
+        while (first < out.length && out[first] === 0) first += 1;
+        const start = first - 1;
+        let err = 0;
+        for (let k = 192; start + k < out.length; k += 1) err = Math.max(err, Math.abs(out[start + k] - tone[k]));
+        return { partialBefore, partialAfter: engine.partial('a', 0), startMs: (start / sr) * 1000, err };
+    });
+    expect(r.partialBefore).toBe(14400);
+    expect(r.partialAfter).toBe(null);
+    // It waited for the rest (0.3 s in is under the 0.5 s margin), then played from frame 0 on.
+    expect(r.startMs).toBeGreaterThanOrEqual(249);
+    expect(r.err).toBeLessThan(1e-6);
+});
+
 test('volume, A/B mix and seeks never click (smoothed ramps, declicked jumps)', async ({ page }) => {
     const result = await page.evaluate(async () => {
         const sr = 48000;

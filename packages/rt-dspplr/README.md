@@ -1,41 +1,43 @@
 # RT-DSPPLR
 
-**Web audio player by SAIT Digital.**
+**An audio player for web pages that works like a DAW — by SAIT Digital.**
 
 Documentation, live demo and API reference: [sait.digital/research/rt-dspplr](https://sait.digital/research/rt-dspplr).
 Source: [github.com/eightraw/rt-dspplr](https://github.com/eightraw/rt-dspplr).
 Free to use under a one-page [license](./LICENSE.md), see [Licensing](#licensing).
 
-A web audio player with real-time DSP, pitch-preserving speed controls,
-looping and an interactive waveform. Available as a headless engine and a
-ready React component. Audio files are decoded in full; memory use scales
-with their length. Long recordings can instead be prepared once on the server
-and played segment by segment with `play({ manifest })`, see
-[Long recordings](#long-recordings-prepared-files).
+RT-DSPPLR plays a recording together with another version of it and moves
+between the two with one slider while it plays. It changes the speed without
+changing the pitch, loops any section, runs effects in real time, and draws a
+waveform and a spectrogram you can zoom into. Use it as a ready React component
+or as an engine without a UI.
 
-- **Pitch-preserving speed** (0.75x, 1.25x, 2x...), changed at once by a
-  realtime stretch in an AudioWorklet that keeps attacks single and sharp, for
-  whole and prepared clips alike.
-- **Loop** any range, with boundaries snapped to zero crossings (no clicks).
-- **Real-time DSP chain** on the output: input gain, a 24 dB/oct high-pass,
-  a peak compressor, your own effects, output gain, and a -0.01 dBFS ceiling
-  as the last stage. Everything but the ceiling is off by default. It runs in an AudioWorklet, with native nodes
-  as the fallback.
-- **Two-track mixer**: stem B, any second recording on the clip's timeline,
-  plays in sync with stem A under one slider: a unity-sum crossfade, or a
-  separation law for stems that add up to the original (both at full in the
-  middle). Stem B is fetched only when the listener asks for it.
-- **Live spectrogram** of both stems, computed in a worker on a logarithmic
-  frequency axis and repainted as the mix moves, in one colour or with each
-  stem in its own.
-- **Waveform scrubber** that previews the DSP settings: a peak/RMS pyramid
-  computed in a worker, drawn as a peak envelope with an RMS layer at
-  device-pixel resolution. Click or tap to seek, drag to loop, wheel to zoom,
-  with a time ruler and an overview of the zoomed window.
-- **Zero bundler configuration** for the core and React entries. Workers and
-  the worklet ship inside the JavaScript and start from Blob URLs.
-- Optional **Rubber Band** stretcher in a separate entry point, for higher
-  quality at the cost of a GPL dependency (see [Licensing](#licensing)).
+Short files are decoded whole, so memory grows with their length. Long ones, up
+to hours, can be prepared once on your server and streamed with
+`play({ manifest })`: see [Long recordings](#long-recordings-prepared-files).
+
+- **Speed without a pitch change** (0.75x, 1.25x, 2x...), changed instantly
+  while it plays, for whole and prepared files alike. It runs in an
+  AudioWorklet, and drum hits stay single and sharp.
+- **Loop** any section. Its edges snap to zero crossings, so there are no clicks.
+- **Effects in real time** on the output: input gain, a 24 dB/oct high-pass, a
+  peak compressor, your own effects, output gain, and a -0.01 dBFS ceiling at
+  the end. All but the ceiling are off by default. They run in an AudioWorklet,
+  with native nodes as the fallback.
+- **Two tracks, one slider:** track B is any second recording that lines up
+  with A in time. The slider crossfades them or, for parts that add up to the
+  original, keeps both at full level in the middle. B is downloaded only as far
+  as it is needed.
+- **Spectrogram** of both tracks on a logarithmic frequency scale, computed in
+  a worker and redrawn as the slider moves, in one colour or with each track in
+  its own.
+- **Waveform** that shows the effect settings: peaks and RMS computed in a
+  worker and drawn at the screen's full resolution. Click or tap to seek, drag
+  to loop, wheel to zoom, with a time ruler and an overview of the zoomed part.
+- **No bundler setup** for the core and React entries: the workers and the
+  worklet are inside the JavaScript and start from Blob URLs.
+- Optional **Rubber Band** stretcher in a separate entry, for higher quality at
+  the cost of a GPL dependency (see [Licensing](#licensing)).
 
 ## Install
 
@@ -363,10 +365,10 @@ Transitions and animations are switched off under
 
 ## Two-track mixer
 
-Stem B is any second recording on the clip's timeline: a processed version,
-another mix, a stem. What you put there is up to you. The player starts B on
-the same AudioContext tick as A and mixes them with `setMix`. The waveform
-preview and the spectrogram follow the same gains.
+Track B is any second recording that lines up with A in time: the same take
+after processing, another mix, one part of a separation. The player starts B on
+the same AudioContext tick as A and mixes them with `setMix`; the waveform and
+the spectrogram follow the same levels.
 
 - `mixLaw: 'crossfade'` (default): gains `1 - mix` and `mix`, so identical
   aligned tracks keep their level, 50% included. For two versions of one
@@ -401,13 +403,17 @@ createAudioPlayer({
 
 ## Long recordings (prepared files)
 
-A whole file is decoded before it plays, which is instant for a voice note and
-heavy for an hour. For long recordings, prepare them once on the server with
-this package's Node side: the `rtd-prepare` CLI or `@saitdigital/rt-dspplr/prepare`
-(see **[PREPARE.md](./PREPARE.md)**). It writes a folder: the original file as it is, a manifest with an index of
-it (the byte range of every segment) and overview files (peaks, high-pass bands,
-spectrogram). The player opens it in milliseconds and fetches audio around the
-playhead only, as HTTP Range requests of the original (decoded audio stays near 60 s):
+A whole file has to be decoded before it plays: instant for a voice note, heavy
+for an hour. Long recordings can be prepared once on your server with this
+package's Node side, the `rtd-prepare` CLI or `@saitdigital/rt-dspplr/prepare`
+(see **[PREPARE.md](./PREPARE.md)**). It writes a folder with the original file
+unchanged, a manifest that says where each piece (segment) of it starts and ends,
+and overview files (peaks, high-pass bands, spectrogram). The player opens the
+folder in milliseconds and downloads only the audio around the playhead, with
+HTTP Range requests to the original; about 60 s of decoded audio is kept. Audio
+always comes first: the overview files load after it, from coarse to fine, and
+pause whenever a start or a seek is waiting. A segment is about 192 KB of the
+file by default, and a WAV starts playing while it downloads:
 
 ```bash
 npx rtd-prepare talk.wav public/media/talk --stem b=talk.b.wav --label b="Noise reduction"
@@ -435,19 +441,22 @@ useEffect(() => { void p.load({ manifest }); }, [manifest]);
 - Speed keeps the pitch through the realtime stretch of the stream engine, as
   for whole clips (see [Speed](#speed-and-time-stretch)); the engine runs at the
   clip's rate and converts to the context's.
-- Options under `segmented`: `cacheSeconds`, `prefetchSegments`, `engine`,
-  `pollStemsMs`. `player.getStreamStats()` reports cache,
+- Options under `segmented`: `cacheSeconds`, `prefetchSegments`, `prefetchStem`,
+  `engine`, `pollStemsMs`. `player.getStreamStats()` reports cache,
   fetches and latencies.
 
-**Named stems.** A manifest can carry several stems, each a time-aligned derivative
-of A (the same timeline) made on the server: `stems: { b, v1, … }`. Keys are opaque
-ids the host chooses (`b` is the default); a stem may carry a `label` for interfaces.
-The knob blends A with **one stem at a time**: `play({ manifest, stem: 'v1' })`, or
+**Named stems.** A manifest can hold several versions of A, made on the server and
+lined up with it: `stems: { b, v1, … }`. The keys are ids you choose (`b` is the
+default), and each stem can have a `label` for the interface. The slider blends A
+with **one stem at a time**: `play({ manifest, stem: 'v1' })`, or
 `player.setStem('v1')` while playing; `state.stem` is the active one and
 `capabilities.stems` lists the ready ones. The React card shows a stem selector
-(`label ?? key`) only when there is more than one. A stem's segments are fetched only
-while the knob is above 0. Output that changes timing (re-timed or re-synthesised
-audio) is not a stem: publish it as a clip of its own.
+(`label ?? key`) only when there is more than one. While the slider is at 0, only
+the stem's segment at the playhead and its overview are downloaded, after A's
+(`segmented.prefetchStem`, default true), so the first move of the slider is heard
+and drawn at once; the rest loads only while the slider is above 0. Audio whose
+timing differs from A (re-timed or re-synthesised) is not a stem: publish it as a
+clip of its own.
 
 The manifest format, its versions and its compatibility policy are specified in
 [docs/manifest.md](https://github.com/eightraw/rt-dspplr/blob/main/docs/manifest.md).

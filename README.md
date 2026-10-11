@@ -1,34 +1,39 @@
 # RT-DSPPLR
 
-**Web audio player with real-time DSP — by SAIT Digital.**
+**An audio player for web pages that works like a DAW — by SAIT Digital.**
 
 **Documentation, live demo and API reference: [sait.digital/research/rt-dspplr](https://sait.digital/research/rt-dspplr).**
 
-Add playback, pitch-preserving speed, looping and an interactive waveform to
-your application. Use the ready-made React player or build your own interface
-with the framework-independent audio engine. TypeScript types are included.
+RT-DSPPLR plays a recording together with another version of it, such as the
+same take before and after processing, and moves between the two with one
+slider while it plays, with no gap and no drift. The speed changes without
+changing the pitch, any section can be looped, and the waveform and the
+spectrogram show the whole recording. Use the ready-made React player, or build
+your own interface on the engine, which works without React. TypeScript types
+are included.
 
 ## Features
 
-- **Playback and navigation:** seek, step through audio and loop a selected range.
-- **Pitch-preserving speed:** changed at once by a realtime stretch in an
-  AudioWorklet that keeps attacks single and sharp.
-- **Real-time DSP:** high-pass filter, compression, output gain and limiting.
-- **Interactive waveform:** click to seek, drag to loop, zoom and pan.
-- **Live spectrogram:** both stems on a logarithmic axis, repainted as the mix moves.
-- **Two-track mixer:** stems A and B play in sync under one slider. What goes on
-  A and B is up to you: before and after processing, two mixes of a song, or
-  the two parts of a separation, with the original in the middle.
-- **React component:** responsive layouts, light/dark themes and keyboard controls.
-- **Custom interfaces:** a headless engine, and the timeline, the spectrogram and the
-  author menu without React, for any framework.
+- **Playback:** seek, step through the audio, loop any section.
+- **Speed without a pitch change:** changed instantly while it plays; held notes
+  stay smooth and drum hits do not double.
+- **Effects in real time:** high-pass filter, compressor, output gain and a
+  limiter, and your own plugins.
+- **Waveform:** click to seek, drag to loop, zoom and scroll.
+- **Spectrogram:** of both tracks, on a logarithmic frequency scale, redrawn as
+  the slider moves.
+- **Two tracks, one slider:** A and B play in sync. What goes on them is up to
+  you: before and after processing, two mixes of a song, or the two parts of a
+  separation, with the original in the middle.
+- **React component:** fits any width, light and dark themes, keyboard control.
+- **Your own interface:** an engine without a UI, and the timeline, the
+  spectrogram and the author menu without React, for any framework.
 
-Ordinary files are decoded into memory in full; DSP controls and speed operate
-during playback. Long recordings can instead be **prepared once on the server**
-(the same package, in Node) and played segment by
-segment: the whole timeline (waveform, DSP preview, spectrogram) is there at once,
-audio is fetched around the playhead, speed keeps the pitch in realtime, and the
-A⇄B knob blends the recording with one of its named, server-made stems.
+Short files are decoded whole in the browser. Long ones, up to hours, can be
+**prepared once on your server** with the same package (in Node) and then
+streamed: the whole waveform and spectrogram appear at once, only the audio
+around the playhead is downloaded (a WAV starts playing while it downloads),
+and the first move of the slider to the other version is heard at once.
 
 ## The package
 

@@ -136,22 +136,53 @@ test('a B at -6 dB plays at its own level (loudness delta is information only)',
     expect(Math.abs(r.half + 2.5)).toBeLessThan(0.5);
 });
 
-test('B segments are fetched only when the mix asks for them', async ({ page }) => {
+test('a mix set before the first prepared clip is the mix it plays and draws at', async ({ page }) => {
+    const r = await page.evaluate(async () => {
+        const { player, seek } = mk({}, { display: 'spectrogram' });
+        // Set while no prepared clip was ever loaded (a page sets its knob, then loads).
+        player.setMix(1);
+        await player.play({ manifest: `${longBase}/pairQuiet/manifest.json` });
+        await until(() => player.getState().prepared?.spectrogram);
+        await h.sleep(800);
+        const atB = await levelDb(player);
+        const pictureB = snap(seek, '.rtd-spectrogram');
+        player.setMix(0);
+        await h.sleep(800);
+        const atA = await levelDb(player);
+        player.setMix(1);
+        await h.sleep(400);
+        const pictureAgain = snap(seek, '.rtd-spectrogram');
+        player.dispose();
+        return { delta: atB - atA, pictureDiff: diff(pictureB, pictureAgain) };
+    });
+    console.log('mix before load:', JSON.stringify(r));
+    expect(Math.abs(r.delta + 6.02)).toBeLessThan(0.5);
+    expect(r.pictureDiff).toBeLessThan(0.01);
+});
+
+test('before the knob moves only the stem\'s segment at the playhead is fetched (prefetchStem), the rest once the mix asks; none with prefetchStem: false', async ({ page }) => {
     const requests = [];
     page.on('request', (req) => { if (/\/pairEq\/b\//.test(req.url())) requests.push(req.url()); });
     const r = await page.evaluate(async () => {
-        const { player } = mk();
-        await player.play({ manifest: `${longBase}/pairEq/manifest.json` });
-        await h.sleep(1500);
-        const atZero = player.getStreamStats().fetchesB;
-        player.setMix(0.3);
-        await until(() => player.getStreamStats().fetchesB > 0, 4000);
-        const after = player.getStreamStats().fetchesB;
-        player.dispose();
-        return { atZero, after };
+        const run = async (segmented) => {
+            const { player } = mk(segmented ? { segmented } : {});
+            await player.play({ manifest: `${longBase}/pairEq/manifest.json` });
+            await h.sleep(1500);
+            const atZero = player.getStreamStats().fetchesB;
+            player.setMix(0.3);
+            await until(() => player.getStreamStats().fetchesB > atZero, 4000);
+            const after = player.getStreamStats().fetchesB;
+            player.dispose();
+            return { atZero, after };
+        };
+        return { ahead: await run(null), lazy: await run({ prefetchStem: false }) };
     });
-    expect(r.atZero).toBe(0);
-    expect(r.after).toBeGreaterThan(0);
+    // The segment under the playhead (the next too, if it crossed a boundary in those 1.5 s).
+    expect(r.ahead.atZero).toBeGreaterThanOrEqual(1);
+    expect(r.ahead.atZero).toBeLessThanOrEqual(2);
+    expect(r.ahead.after).toBeGreaterThan(r.ahead.atZero);
+    expect(r.lazy.atZero).toBe(0);
+    expect(r.lazy.after).toBeGreaterThan(0);
     expect(requests.some((u) => /\/b\/r\d+\/source\./.test(u))).toBe(true);
 });
 
@@ -313,4 +344,16 @@ test('the card shows a stem selector (labels) only when the manifest has more th
         return { stem: window.cardPlayer.getState().stem, value: document.querySelector('.rtd-mixer select.rtd-mixer-stem').value };
     });
     expect(after).toEqual({ stem: 'v1', value: 'v1' });
+    // A page's own select styles do not reach it: an arrow drawn as a background image on hover
+    // (as sait.digital has it) tiled across the selector as a zigzag. It keeps its own box and
+    // chevron, and the slider beside it does not cut its label short.
+    await page.addStyleTag({ content: "select, select:hover { background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' stroke='red'/%3E%3C/svg%3E\"); padding: 12px; height: 60px; border: 3px solid red; }" });
+    await page.hover('.rtd-mixer select.rtd-mixer-stem');
+    const look = await page.evaluate(() => {
+        const select = document.querySelector('.rtd-mixer select.rtd-mixer-stem');
+        const s = getComputedStyle(select);
+        const chevron = getComputedStyle(select.parentElement, '::after');
+        return { image: s.backgroundImage, height: s.height, border: s.borderTopWidth, chevron: chevron.content !== 'none' && chevron.borderRightStyle === 'solid', cut: select.scrollWidth > select.clientWidth };
+    });
+    expect(look).toEqual({ image: 'none', height: '32px', border: '1px', chevron: true, cut: false });
 });

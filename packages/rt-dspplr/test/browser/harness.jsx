@@ -4,6 +4,8 @@ import * as format from '../../dist/format.js';
 // Internals (not public API) for the engine tests, straight from the source.
 import { StreamEngine, loadStreamEngine, stretchAvailable } from '../../src/core/engine/StreamEngine.ts';
 import { SegmentScheduler } from '../../src/core/stream/SegmentScheduler.ts';
+import { SegmentStore } from '../../src/core/stream/SegmentStore.ts';
+import { FileAccess } from '../../src/core/stream/fileAccess.ts';
 import { applyDspToSpectrogram } from '../../src/core/spectrogram/dspPaint.ts';
 import { AudioPlayer, Timeline, useAudioPlayer } from '../../dist/react.js';
 import { StrictMode, useEffect } from 'react';
@@ -89,7 +91,7 @@ function CardPage({ clip, options }) {
     useEffect(() => { window.cardPlayer = player.player; void player.load(clip); }, [player.player, clip]);
     return <div style={{ width: 720 }}><AudioPlayer player={player} title="Card" /></div>;
 }
-window.h = { ...api, advanced, format, internals: { StreamEngine, loadStreamEngine, stretchAvailable, SegmentScheduler, applyDspToSpectrogram }, preparedSegments, sleep, buffer, wav, slowBlob, delayedStrategy, make, rms,
+window.h = { ...api, advanced, format, internals: { StreamEngine, loadStreamEngine, stretchAvailable, SegmentScheduler, SegmentStore, FileAccess, applyDspToSpectrogram }, preparedSegments, sleep, buffer, wav, slowBlob, delayedStrategy, make, rms,
     mountMenu(layout, options) { const root = createRoot(document.getElementById('root')); root.render(<AudioPlayer layout={layout} title="Example" options={options} />); return root; },
     renderMenu(root, layout) { root.render(<AudioPlayer layout={layout} title="Example" />); },
     mountCustom() { const root = createRoot(document.getElementById('root')); root.render(<StrictMode><CustomPlayer /></StrictMode>); return root; },

@@ -29,7 +29,7 @@ import {
     AUDIO_DEMUXERS,
     type AudioManifest,
 } from '../src/prepare/index';
-import { storedRanges } from '../src/prepare/prepareAudio';
+import { autoSegmentSeconds, storedRanges } from '../src/prepare/prepareAudio';
 import { readSegment } from '../src/prepare/sourceReader';
 import { deepestRun, indexSegments, mapSource } from '../src/prepare/sourceIndex';
 import { main } from '../src/prepare/cli';
@@ -201,6 +201,27 @@ const sameSamples = (a: Float32Array[], b: Float32Array[]) => maxDiff(a, b) === 
     // Not a WAV: a clear error that names ffmpeg and the decoder hook.
     await assert.rejects(decodeAll(wavDecoder, chunks(new TextEncoder().encode('ID3\u0004 this is an mp3, honest'))), /ffmpeg.*decoder/s);
     results.push(`WAV reader: ${cases.map((c) => c[0]).join(', ')}; odd LIST chunk, 1-byte..4 KB chunks; non-WAV names ffmpeg`);
+}
+
+// ---- the default segment length ----------------------------------------------------------
+
+{
+    // About 192 KB of the stored file per segment (a start or a seek waits for one), 1 s (2 s MP3,
+    // 3 s Opus) to 10 s, at most 600 segments per file.
+    const wav = (rate: number, channels: number, seconds: number) => ({ sampleRate: rate, channels, encoding: 'pcm-int', bitsPerSample: 16, frames: rate * seconds, layout: { kind: 'wav' as const, dataOffset: 44, blockAlign: channels * 2, encoding: 'int' as const, bitsPerSample: 16 } });
+    const coded = (kind: 'mp3' | 'opus' | 'flac', rate: number, channels: number, seconds: number) => ({ sampleRate: rate, channels, encoding: kind, bitsPerSample: 16, frames: rate * seconds, layout: kind === 'mp3' ? { kind, delay: 0 } : { kind } });
+    const cases: Array<[string, number, number]> = [
+        ['16 kHz mono WAV, 30 min', autoSegmentSeconds(wav(16000, 1, 1800), null), 6.2],
+        ['48 kHz stereo WAV, 5 min', autoSegmentSeconds(wav(48000, 2, 300), null), 1.1],
+        ['48 kHz stereo WAV, 60 min (at most 600 segments)', autoSegmentSeconds(wav(48000, 2, 3600), null), 6],
+        ['128 kbps MP3, 60 min', autoSegmentSeconds(coded('mp3', 44100, 2, 3600), 16000 * 3600), 10],
+        ['320 kbps MP3, 10 min', autoSegmentSeconds(coded('mp3', 44100, 2, 600), 40000 * 600), 5],
+        ['96 kbps Opus, 10 min', autoSegmentSeconds(coded('opus', 48000, 2, 600), 12000 * 600), 10],
+        ['FLAC at 100 KB/s, 3 min', autoSegmentSeconds(coded('flac', 44100, 2, 180), 100000 * 180), 2],
+        ['a source not kept (16-bit WAV of it), 44.1 kHz stereo, 1 min', autoSegmentSeconds({ sampleRate: 44100, channels: 2, encoding: 'pcm-float', bitsPerSample: 32, frames: 44100 * 60 }, null), 1.2],
+    ];
+    for (const [name, got, want] of cases) assert.equal(got, want, name);
+    results.push(`default segment length: ${cases.map(([n, g]) => `${n} ${g} s`).join('; ')}`);
 }
 
 // ---- FLAC and MP3 in process -----------------------------------------------------------

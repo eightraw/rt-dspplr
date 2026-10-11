@@ -56,7 +56,8 @@ declare function registerProcessor(name: string, ctor: unknown): void;
 type Stem = 'a' | 'b';
 
 type Message =
-    | { type: 'seg'; stem: Stem; index: number; data: Float32Array[] }
+    /** A segment, whole; or (`offset`, `total`) a part of one whose bytes are still coming, from frame `offset`. */
+    | { type: 'seg'; stem: Stem; index: number; data: Float32Array[]; offset?: number; total?: number }
     | { type: 'drop'; stem: Stem; index: number }
     | { type: 'clear' }
     | { type: 'play'; position: number; frame?: number; seq: number }
@@ -112,6 +113,12 @@ function giveBack<T>(list: T[], item: T): void {
 }
 
 const RAMP_SECONDS = 0.02;
+/**
+ * Audio a start (or a stall) waits for ahead of what its block reads, when a segment arrives in
+ * parts: it starts once that much is in rather than on its first frames, so the next network
+ * chunk running late does not stall it at once.
+ */
+const START_MARGIN_SECONDS = 0.5;
 const DECLICK_SECONDS = 0.004;
 const REPORT_EVERY = 2; // render quanta
 /** Time constant of the crossfade's energy estimates. */
@@ -277,6 +284,8 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     private readonly starts: Float64Array;
     private readonly total: number;
     private readonly stems: Record<Stem, Map<number, Float32Array[]>> = { a: new Map(), b: new Map() };
+    /** Segments still arriving in parts: how many of their frames are in (absent: whole). */
+    private readonly filled: Record<Stem, Map<number, number>> = { a: new Map(), b: new Map() };
     private queue: Array<{ frame: number; message: Message }> = [];
 
     private playing = false;
@@ -423,6 +432,9 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         if (b < a) return true;
         for (let i = this.segmentOf(a); i < this.starts.length - 1 && this.starts[i] <= b; i += 1) {
             if (!this.stems[stem].has(i)) return false;
+            // A segment still arriving: in as far as it has come.
+            const got = this.filled[stem].get(i);
+            if (got !== undefined && this.starts[i] + got <= Math.min(b, this.starts[i + 1] - 1)) return false;
         }
         return true;
     }
@@ -459,7 +471,10 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     }
 
     private hasB(frame: number): boolean {
-        return this.stems.b.has(this.segmentOf(Math.max(0, Math.min(this.total - 1, Math.floor(frame)))));
+        const f = Math.max(0, Math.min(this.total - 1, Math.floor(frame)));
+        const i = this.segmentOf(f);
+        const got = this.filled.b.get(i);
+        return this.stems.b.has(i) && (got === undefined || f < this.starts[i] + got);
     }
 
     /** One channel's sample of a stem at an integer frame (0 outside the clip or when absent). */
@@ -716,17 +731,42 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
 
     private apply(message: Message): void {
         switch (message.type) {
-            case 'seg':
-                this.stems[message.stem].set(message.index, message.data);
-                this.invalidate(message.stem);
+            case 'seg': {
+                const { stem, index, data, offset, total } = message;
+                if (offset === undefined || total === undefined) {
+                    this.stems[stem].set(index, data);
+                    this.filled[stem].delete(index);
+                    this.invalidate(stem);
+                    break;
+                }
+                // A part: the segment is kept at its full length and filled as far as it has come.
+                let planes = this.stems[stem].get(index);
+                if (offset === 0) {
+                    planes = data.map(() => new Float32Array(total));
+                    this.stems[stem].set(index, planes);
+                    this.filled[stem].set(index, 0);
+                    this.invalidate(stem);
+                }
+                const have = this.filled[stem].get(index);
+                // Whole already, let go, or not the part that comes next: left as it is.
+                if (!planes || have === undefined || have !== offset) break;
+                const n = Math.min(data[0]?.length ?? 0, total - have);
+                for (let c = 0; c < planes.length; c += 1) planes[c].set(data[Math.min(c, data.length - 1)].subarray(0, n), have);
+                // The arrays filled in place: what was read before them is unchanged, nothing to invalidate.
+                if (have + n >= total) this.filled[stem].delete(index);
+                else this.filled[stem].set(index, have + n);
                 break;
+            }
             case 'drop':
                 this.stems[message.stem].delete(message.index);
+                this.filled[message.stem].delete(message.index);
                 this.invalidate(message.stem);
                 break;
             case 'clear':
                 this.stems.a.clear();
                 this.stems.b.clear();
+                this.filled.a.clear();
+                this.filled.b.clear();
                 this.invalidate('a');
                 this.invalidate('b');
                 this.split?.a.clear();
@@ -927,8 +967,10 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         }
         const rate = this.rate;
         const needStretch = !!this.stretch && useStretch && (this.blend.value > 0 || !this.blend.settled);
-        // What must be in memory for this block, read through the loop.
-        const ahead = n * rate + 2;
+        // What must be in memory for this block, read through the loop (a start or a stall waits
+        // for a margin ahead of it too, where a segment is still arriving).
+        const margin = (this.starting || this.stalled) && (this.filled.a.size > 0 || this.filled.b.size > 0) ? START_MARGIN_SECONDS * this.clipRate * rate : 0;
+        const ahead = n * rate + 2 + margin;
         const from = needStretch ? this.pos + this.stretch!.outLat * rate + this.stretch!.inLat - this.stretch!.len - 1 : this.pos;
         const to = needStretch ? this.pos + this.stretch!.outLat * rate + this.stretch!.inLat + ahead : this.pos + ahead;
         // Stem B once it is being heard (or at a start with the knob towards B): its gap

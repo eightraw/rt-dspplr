@@ -792,18 +792,82 @@
     white-space: nowrap;
 }
 
-.rtd-mixer-stem {
-    /* Its natural width (the label), up to a limit: the slider gives way, not the label. */
-    flex: 0 0 auto;
-    font: inherit;
-    font-size: 12px;
-    max-width: 14em;
+/* The stem selector: a dropdown in the look of the card's buttons. Its chevron is drawn
+   here, in the text colour, and the select's own box is pinned on hover and focus too,
+   so a page's select styles cannot reach it (a background image on hover tiled across
+   it as a zigzag). Its natural width, up to a limit: the slider gives way, not the label. */
+.rtd-select {
+    position: relative;
+    display: inline-flex;
+    flex: 0 1 auto;
     min-width: 0;
-    padding: 1px 2px;
+    max-width: 16em;
+}
+
+/* The mix slider takes the room the label leaves (a basis of its own would share the
+   shrinking with the label and cut it short with room to spare). */
+.rtd-mixer > .rtd-range {
+    flex: 1 1 64px;
+    width: auto;
+    min-width: 48px;
+}
+
+.rtd-select::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    right: 12px;
+    width: 6px;
+    height: 6px;
+    margin-top: -5px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    color: var(--rtd-text-muted);
+    transform: rotate(45deg);
+    pointer-events: none;
+}
+
+.rtd-select:hover::after {
     color: var(--rtd-text);
-    background: var(--rtd-surface, transparent);
-    border: 1px solid var(--rtd-border, currentColor);
-    border-radius: 4px;
+}
+
+.rtd-select > select.rtd-mixer-stem,
+.rtd-select > select.rtd-mixer-stem:hover,
+.rtd-select > select.rtd-mixer-stem:focus {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    min-width: 0;
+    height: 32px;
+    margin: 0;
+    padding: 0 30px 0 12px;
+    border: 1px solid var(--rtd-border);
+    border-radius: var(--rtd-control-radius);
+    background: transparent none;
+    box-shadow: none;
+    color: var(--rtd-text);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: normal;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 0.15s, border-color 0.15s;
+}
+
+.rtd-select > select.rtd-mixer-stem:hover:not(:disabled) {
+    background-color: var(--rtd-surface);
+}
+
+.rtd-select > select.rtd-mixer-stem:focus-visible {
+    outline: 2px solid var(--rtd-focus);
+    outline-offset: 2px;
+}
+
+.rtd-select option {
+    background-color: var(--rtd-bg);
+    color: var(--rtd-text);
 }
 
 .rtd-mixer[data-disabled] {

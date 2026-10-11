@@ -11,7 +11,7 @@
   "bugs": {
     "url": "https://github.com/eightraw/rt-dspplr/issues"
   },
-  "description": "Web audio player with real-time DSP: pitch-preserving speed, loop, DSP chain, two-track A/B mixer, waveform and spectrogram, and long recordings prepared on the server (./prepare, rtd-prepare CLI). Headless engine + React component.",
+  "description": "An audio player for web pages that works like a DAW: two versions of a recording under one slider, speed without a pitch change, loops, real-time effects, waveform and spectrogram. Long files are prepared once on the server and streamed (./prepare, rtd-prepare CLI). React component and an engine without a UI.",
   "type": "module",
   "engines": {
     "node": ">=20.3"

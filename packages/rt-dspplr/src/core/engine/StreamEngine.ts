@@ -93,6 +93,8 @@ export class StreamEngine {
     private readonly _scale: number;
     private _loop: { start: number; end: number } | null = null;
     private readonly _sent: Record<EngineStem, Set<number>> = { a: new Set(), b: new Set() };
+    /** Segments handed in parts that are not whole yet: frames handed so far. */
+    private readonly _parts: Record<EngineStem, Map<number, number>> = { a: new Map(), b: new Map() };
     private _stretchState: { ready: boolean; latencyFrames: number; error?: string; reused?: boolean } = { ready: false, latencyFrames: 0 };
     onReport: ((report: EngineReport) => void) | null = null;
     onEnded: (() => void) | null = null;
@@ -160,17 +162,38 @@ export class StreamEngine {
     /** Hand a decoded segment to the engine (the arrays are transferred). */
     feed(stem: EngineStem, index: number, channels: Float32Array[]): void {
         this._sent[stem].add(index);
+        this._parts[stem].delete(index);
         this.post({ type: 'seg', stem, index, data: channels }, channels.map((c) => c.buffer as ArrayBuffer));
+    }
+
+    /**
+     * Hand the engine a part of a segment whose bytes are still coming: its frames from `offset`
+     * (0 starts it afresh) of `total` (the arrays are transferred). The engine plays as far as
+     * the parts reach and holds the playhead there.
+     */
+    feedPart(stem: EngineStem, index: number, offset: number, channels: Float32Array[], total: number): void {
+        this._sent[stem].add(index);
+        const now = offset + (channels[0]?.length ?? 0);
+        if (now >= total) this._parts[stem].delete(index);
+        else this._parts[stem].set(index, now);
+        this.post({ type: 'seg', stem, index, data: channels, offset, total }, channels.map((c) => c.buffer as ArrayBuffer));
+    }
+
+    /** Frames of a segment handed in parts so far, while it is not whole (null: whole, or not held). */
+    partial(stem: EngineStem, index: number): number | null {
+        return this._parts[stem].get(index) ?? null;
     }
 
     /** Stem B is another stem now (or none): A plays on until the new B's segments arrive. */
     resetB(): void {
         for (const i of this._sent.b) this.post({ type: 'drop', stem: 'b', index: i });
         this._sent.b.clear();
+        this._parts.b.clear();
         this.post({ type: 'resetB' });
     }
 
     drop(stem: EngineStem, index: number): void {
+        this._parts[stem].delete(index);
         if (!this._sent[stem].delete(index)) return;
         this.post({ type: 'drop', stem, index });
     }

@@ -20,7 +20,7 @@ in milliseconds and plays segment by segment:
 ```
 
 Nothing is cut up or encoded again. The manifest holds an index of the original:
-for each segment (10 s by default), the byte range that holds it. The player
+for each segment (about 192 KB of the file by default, see `segmentSeconds`), the byte range that holds it. The player
 fetches those bytes with an HTTP Range request and decodes them (WAV itself,
 MP3, Opus and FLAC in WebAssembly, in a worker), and gets the samples prepare decoded:
 WAV, MP3 and FLAC exactly, Opus within float rounding. An hour of MP3 stays the size of
@@ -91,7 +91,7 @@ The input is a path, a `ReadableStream<Uint8Array>` or an
 |---|---|---|
 | `outDir` | | Write into this folder. Either this or `storage`. |
 | `storage` | | `{ putObject(key, bytes, contentType), putFile?, getObject?, getRange? }`: see [Storage](#storage). |
-| `segmentSeconds` | `10` | What the player fetches at a time: 0.1 to 60 (the player refuses longer segments). |
+| `segmentSeconds` | about 192 KB of the stored file | What the player fetches at a time: 0.1 to 60 (the player refuses longer segments). By default a length that holds about 192 KB of the stored file (a start or a seek waits for one such request), from 1 s (2 s for MP3, 3 s for Opus) to 10 s and at most 600 segments per file: a 16 kHz mono WAV gets about 6 s, a 128 kbps MP3 10 s. |
 | `framesPerPeak` | `256` | A power of two from 16 to 65536. |
 | `bands`, `spectrogram` | `true` | Write bands.bin / spectrogram.bin. |
 | `resampler` | | The converter of a stem at another rate than A. |

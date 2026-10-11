@@ -177,6 +177,58 @@ test('spectrogram draws before any segment arrives and refines from decoded segm
     expect(refined.change).toBeGreaterThan(0.02);
 });
 
+test('a WAV segment handed out as its bytes arrive: the parts, laid end to end, are the whole segment', async ({ page }) => {
+    const r = await page.evaluate(async (base) => {
+        const url = new URL(`${base}/pairEq/manifest.json`, location.href).href;
+        const m = await (await fetch(url)).json();
+        const src = m.segments.source;
+        const block = src.pcm.blockAlign;
+        // Segments shaped as stems and warm-ups shape them: a run longer than the segment's audio
+        // (`tail` counted back from its end), lead silence before it, trail silence after it.
+        const at = 96000;
+        const shapes = [
+            { lead: 0, trail: 0, warm: 0 },
+            { lead: 1777, trail: 0, warm: 0 },
+            { lead: 0, trail: 3001, warm: 0 },
+            { lead: 1234, trail: 567, warm: 4321 },
+        ];
+        const out = [];
+        for (const shape of shapes) {
+            const frames = 150000;
+            const tail = frames - shape.lead - shape.trail;
+            const first = 44 + (at - shape.warm) * block;
+            const seg = { index: 0, startFrame: 0, frames, lead: shape.lead || undefined, trail: shape.trail || undefined, tail, range: [first, first + (shape.warm + tail) * block] };
+            const manifest = { ...m, frames, duration: frames / m.sampleRate, segments: { ...m.segments, framesPerSegment: frames, list: [seg] } };
+            const store = new h.internals.SegmentStore(new h.internals.FileAccess(url), manifest, { maxBytes: 1e9 });
+            const parts = [];
+            store.onPartial((index, offset, planes, total) => parts.push({ index, offset, frames: planes[0].length, total, data: planes[0] }));
+            const whole = await store.load(0, true);
+            const joined = new Float32Array(frames);
+            let next = 0;
+            let contiguous = true;
+            for (const p of parts) {
+                if (p.offset !== next || p.total !== frames) contiguous = false;
+                joined.set(p.data, p.offset);
+                next = p.offset + p.frames;
+            }
+            const data = whole.getChannelData(0);
+            let diff = 0;
+            for (let i = 0; i < frames; i += 1) diff = Math.max(diff, Math.abs(joined[i] - data[i]));
+            store.dispose();
+            out.push({ ...shape, parts: parts.length, contiguous, covered: next, diff, leadSilent: data.subarray(0, shape.lead).every((v) => v === 0) });
+        }
+        return out;
+    }, BASE);
+    for (const x of r) {
+        expect(x.parts, JSON.stringify(x)).toBeGreaterThanOrEqual(1);
+        expect(x.contiguous, JSON.stringify(x)).toBe(true);
+        expect(x.covered, JSON.stringify(x)).toBe(150000);
+        expect(x.diff, JSON.stringify(x)).toBe(0);
+        expect(x.leadSilent, JSON.stringify(x)).toBe(true);
+    }
+    console.log(`parts per segment: ${r.map((x) => x.parts).join(', ')}`);
+});
+
 test('segment boundaries and a loop across one are sample-exact (OfflineAudioContext)', async ({ page }) => {
     const result = await page.evaluate(async () => {
         const base = `${longBase}/mono30`;

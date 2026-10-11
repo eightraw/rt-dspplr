@@ -11,7 +11,7 @@ import { mixGains, type MixLaw } from '../controls';
 import { decodePeaksFile, peaksToPyramid, readLevel, type PeaksFile } from '../stream/peaksFile';
 import { SegmentScheduler } from '../stream/SegmentScheduler';
 import { SegmentStore, type SegmentStoreStats } from '../stream/SegmentStore';
-import { loadStreamEngine, StreamEngine, type EngineReport } from '../engine/StreamEngine';
+import { loadStreamEngine, StreamEngine, type EngineReport, type EngineStem } from '../engine/StreamEngine';
 import { engineWindow } from '../engine/engineWindow';
 import { decodeSpectrogramFile, toSpectralPyramid, type SpectrogramFile } from '../stream/spectrogramFile';
 import type { PlaybackSource, SourceCapabilities, SourceHost, StemSummary } from './types';
@@ -55,8 +55,14 @@ export interface WindowAudio {
 export interface SegmentedOptions {
     /** Decoded audio kept around the playhead and the view, in seconds. Default 60. */
     cacheSeconds?: number;
-    /** Segments fetched ahead of the playhead. Default 2. */
+    /** Segments fetched ahead of the playhead. Default: as many as hold 20 s (at least 2). */
     prefetchSegments?: number;
+    /**
+     * Fetch the blend stem's segment at the playhead while stem A plays, and its overview once
+     * A's is in, so the first move of the knob is heard and drawn at once (default true). false:
+     * a stem's segments and overview are fetched only once the knob moves.
+     */
+    prefetchStem?: boolean;
     /** Sources are created this far ahead of the clock, seconds (scheduler fallback). Default 2. */
     scheduleAheadSeconds?: number;
     /**
@@ -104,9 +110,12 @@ const LOOKAHEAD = 0.025;
 const PUMP_MS = 40;
 /** Views up to this long get their segments decoded for exact previews. */
 export const WINDOW_MAX_SECONDS = 20;
-const WINDOW_MAX_SEGMENTS = 4;
+/** The decoded window covers the view and a quarter of it each side: at most this many seconds of segments. */
+const WINDOW_MAX_COVER_SECONDS = WINDOW_MAX_SECONDS * 1.5;
 /** Failures in a row after which a segment counts as broken (the store keeps retrying, slowly). */
 const SEGMENT_FAILURES_MAX = 4;
+/** Seconds of audio fetched ahead of the playhead by default (see prefetchSegments). */
+const PREFETCH_SECONDS = 20;
 
 function clampTime(time: number, duration: number): number {
     const t = Number.isFinite(time) ? Math.max(0, time) : 0;
@@ -141,6 +150,13 @@ export class SegmentedSource implements PlaybackSource {
     /** B is wanted while the mix is above 0, and for a while after the knob last moved. */
     private _bWantedUntil = 0;
     private _bOverviewAsked = false;
+    /** Settles once A's overview files are all in (or have failed): the stem's overview follows them. */
+    private _overviewA: Promise<void> = Promise.resolve();
+    /** Settles once the overview's first levels (A's and the stem's) are in: the decoded window waits for them. */
+    private _overviewFirst: Promise<void> = Promise.resolve();
+    private _overviewFirstIn = true;
+    /** The segments the engine reads around the playhead, as last worked out (see _onPart). */
+    private _engineWindow: number[] = [];
     private _pollTimer: ReturnType<typeof setInterval> | null = null;
     private _settling: Promise<void> = Promise.resolve();
     private _pendingLatency: { t0: number; reason: 'play' | 'seek' } | null = null;
@@ -166,6 +182,10 @@ export class SegmentedSource implements PlaybackSource {
     private _peaks: (PeaksFile & { headerBytes: number }) | null = null;
     private _merged = new Map<number, WaveformPeakLevel>();
     private _spectro: SpectrogramFile | null = null;
+    /** The active stem's spectrogram (as far as it has come), merged into A's at every publish. */
+    private _spectroB: SpectrogramFile | null = null;
+    /** The stem's spectrogram could not be read: A's is published alone. */
+    private _spectroBFailed = false;
     private _visible: number[] = [];
     private _view: { start: number; end: number } | null = null;
     private _window: WindowAudio | null = null;
@@ -260,6 +280,11 @@ export class SegmentedSource implements PlaybackSource {
         this._files = null;
         this._peaks = null;
         this._spectro = null;
+        this._spectroB = null;
+        this._spectroBFailed = false;
+        // The knob as the player has it: it may have been set while a whole clip was loaded,
+        // which went to the other source.
+        this._mix = this._state.processing.mix;
         this._merged.clear();
         this._window = null;
         this._visible = [];
@@ -292,9 +317,7 @@ export class SegmentedSource implements PlaybackSource {
             if (loadId !== this._loadId) return false;
             this._manifest = manifest;
             this._files = files;
-            void this._loadPeaks(loadId);
-            void this._loadBands(loadId);
-            void this._loadSpectrogram(loadId);
+            this._overviewA = this._loadOverview(loadId);
             const start = clampTime(startAt ?? 0, manifest.duration);
             this._pausedFrame = this._frameOf(start);
             this._update({
@@ -309,6 +332,7 @@ export class SegmentedSource implements PlaybackSource {
                 maxBytes: Math.max(1, cacheSeconds) * manifest.sampleRate * manifest.channels * 4,
             });
             this._store.onLoad((index) => this._onSegment(index));
+            this._store.onPartial((index, offset, planes, total) => this._onPart('a', index, offset, planes, total));
             this._store.onError((index, error, failures) => this._onSegmentError(index, error, failures));
             this._scheduler = new SegmentScheduler(out.ctx, out.input, manifest.segments.list, manifest.sampleRate);
             this._scheduler.setRate(this._state.processing.speed);
@@ -438,7 +462,10 @@ export class SegmentedSource implements PlaybackSource {
 
     /** The knob moved: smoothed gains in the engine; B is fetched only while it is wanted. */
     setMix(mix: number): void {
+        const was = this._mix;
         this._mix = mix;
+        // Towards the stem or back to A alone: the picture's levels change with it.
+        if ((was > 0) !== (mix > 0)) this._publishSpectrogram();
         if (!this._stemB || this._stemB.status !== 'ready') return;
         // Prefetch as soon as the knob moves, keep B for 10 s after it is back at 0.
         this._bWantedUntil = performance.now() + 10000;
@@ -568,13 +595,12 @@ export class SegmentedSource implements PlaybackSource {
         this._stemKey = null;
         this._bOverviewAsked = false;
         this._window = null;
+        this._spectroB = null;
+        this._spectroBFailed = false;
         const prepared = this._state.prepared;
-        if (prepared && (prepared.peaksB || prepared.bandsB || prepared.spectrogram?.levels.some((l) => l.b))) {
-            const spectrogram = prepared.spectrogram
-                ? { ...prepared.spectrogram, referenceSum: prepared.spectrogram.referenceMax, levels: prepared.spectrogram.levels.map((l) => ({ ...l, b: null })) }
-                : null;
-            this._publish({ peaksB: null, bandsB: null, spectrogram }, 'spectrogram');
-        }
+        if (prepared && (prepared.peaksB || prepared.bandsB)) this._publish({ peaksB: null, bandsB: null }, 'spectrogram');
+        // A's levels alone again.
+        this._publishSpectrogram();
     }
 
     private _applyStems(manifest: AudioManifest): void {
@@ -606,12 +632,14 @@ export class SegmentedSource implements PlaybackSource {
                 // A source that cannot be read (SourceError) is let go at once: retries would not help.
                 if (error instanceof SourceError || failures >= SEGMENT_FAILURES_MAX) this._failStemB(index, error);
             });
+            this._storeB.onPartial((index, offset, planes, total) => this._onPart('b', index, offset, planes, total));
             this._storeB.onLoad((index) => {
                 if (this._eng && this._bWanted()) this._feedEngine(this._wantedEngine(this._engPlaying ? this._eng.position() : this._pausedFrame));
                 if (this._visible.includes(index)) this._host.emit('sourceupdate', { clipId: this._clipId, what: 'segment' });
             });
             this._bOverviewAsked = false;
-            if (this._mix > 0) {
+            // Its overview once A's is in: at once when the knob is already towards it, ahead of it by default.
+            if (this._mix > 0 || this._options.prefetchStem !== false) {
                 this._bOverviewAsked = true;
                 void this._loadOverviewB(this._loadId);
             }
@@ -687,33 +715,34 @@ export class SegmentedSource implements PlaybackSource {
         const key = this._stemKey;
         const files = this._files;
         if (!stem || stem.status !== 'ready' || !files) return;
-        const get = async (url?: string) => {
-            if (!url) return null;
-            const href = files.resolve(url);
-            const response = await fetch(href, files.init(href));
-            return response.ok ? response.arrayBuffer() : null;
+        // Behind A's overview (B's spectrogram is merged into A's levels) and, file by file, behind the audio.
+        await this._overviewA;
+        const get = async (file?: { url: string; bytes?: number; levels?: Array<{ byteOffset: number; byteLength: number }> }) => {
+            if (!file) return null;
+            const href = files.resolve(file.url);
+            const bytes = file.bytes ?? Math.max(0, ...(file.levels ?? []).map((l) => l.byteOffset + l.byteLength));
+            if (!(bytes > 0)) {
+                await this._audioIdle();
+                const response = await fetch(href, files.init(href));
+                return response.ok ? response.arrayBuffer() : null;
+            }
+            const got = await this._fetchBehindAudio(loadId, files, href, 0, bytes - 1);
+            return got?.buffer ?? null;
         };
         try {
-            const [peaks, bands, spectro] = await Promise.all([get(stem.peaks?.url), get(stem.bands?.url), get(stem.spectrogram?.url)]);
+            const peaks = await get(stem.peaks);
+            const bands = await get(stem.bands);
+            const spectro = await get(stem.spectrogram);
             if (loadId !== this._loadId || key !== this._stemKey) return;
-            const prepared = this._state.prepared ?? { peaks: null, bands: null, spectrogram: null };
             const patch: Partial<PreparedOverview> = { correlated: (stem.correlation?.global ?? 1) >= 0.5 };
             if (peaks) patch.peaksB = peaksToPyramid(decodePeaksFile(peaks), new Map());
             if (bands) patch.bandsB = decodeBandsFile(bands);
-            if (spectro && prepared.spectrogram) {
-                const fileB = decodeSpectrogramFile(spectro);
-                const a = prepared.spectrogram;
-                const b = toSpectralPyramid(fileB);
-                if (b && b.levels.length === a.levels.length) {
-                    patch.spectrogram = {
-                        ...a,
-                        referenceSum: a.referenceMax + fileB.referenceMax,
-                        referenceMax: Math.max(a.referenceMax, fileB.referenceMax),
-                        levels: a.levels.map((level, i) => ({ ...level, b: b.levels[i].a })),
-                    };
-                }
-            }
             this._publish(patch, 'spectrogram');
+            if (spectro) {
+                this._spectroB = decodeSpectrogramFile(spectro);
+                this._spectroBFailed = false;
+                this._publishSpectrogram();
+            }
         } catch (error) {
             if (loadId === this._loadId) console.warn('[AudioPlayer] stem B overview unavailable', error);
         }
@@ -761,8 +790,10 @@ export class SegmentedSource implements PlaybackSource {
         const to = this._frameOf(Math.min(m.duration, end + span / 4));
         let first = scheduler.segmentAt(from);
         let last = scheduler.segmentAt(Math.max(from, to - 1));
-        // Too many segments for the window: keep those nearest the view's centre.
-        while (last - first + 1 > WINDOW_MAX_SEGMENTS) {
+        // Too many segments for the window (its seconds, whatever the segments' length): keep
+        // those nearest the view's centre.
+        const maxSegments = Math.max(1, Math.ceil((WINDOW_MAX_COVER_SECONDS * m.sampleRate) / Math.max(1, m.segments.framesPerSegment)) + 1);
+        while (last - first + 1 > maxSegments) {
             const centre = this._frameOf((start + end) / 2);
             const segs = m.segments.list;
             if (centre - segs[first].startFrame > segs[last].startFrame + segs[last].frames - centre) first += 1;
@@ -771,7 +802,13 @@ export class SegmentedSource implements PlaybackSource {
         const visible: number[] = [];
         for (let i = first; i <= last; i += 1) visible.push(i);
         this._visible = visible;
-        for (const i of visible) if (!store.has(i)) void store.load(i, true);
+        const fetch = () => {
+            if (this._visible !== visible || this._store !== store) return;
+            for (const i of visible) if (!store.has(i)) void store.load(i, true);
+        };
+        // After the overview's first levels: the whole picture first, then its close-up.
+        if (this._overviewFirstIn) fetch();
+        else void this._overviewFirst.then(fetch);
     }
 
     /** Decoded audio of the window around the view, once all its segments are in; null otherwise. */
@@ -868,31 +905,235 @@ export class SegmentedSource implements PlaybackSource {
         return { buffer: await response.arrayBuffer(), partial: response.status === 206 };
     }
 
-    /** Header + coarse levels in one Range request, then the finest level. */
-    private async _loadPeaks(loadId: number): Promise<void> {
+    /** Resolves once no segment the playhead waits for is on its way (A's, or the stem's). */
+    private async _audioIdle(): Promise<void> {
+        for (;;) {
+            const busy = [this._store, this._storeB].find((store) => store?.urgentBusy);
+            if (!busy) return;
+            await busy.idle();
+        }
+    }
+
+    /** Whether a segment the playhead waits for is on its way (A's, or the stem's). */
+    private _audioWaiting(): boolean {
+        return !!(this._store?.urgentBusy || this._storeB?.urgentBusy);
+    }
+
+    /**
+     * Bytes `from` to `to` (inclusive) of a file, behind the audio: one request at full speed
+     * while no segment the playhead waits for is on its way, broken off within one network chunk
+     * when one is asked for, and carried on from where it stopped once that segment is in. So a
+     * start or a seek has the link to itself, and the overview loses no time to it otherwise.
+     * Null once another clip is loaded. `partial` false: the server sent the whole file (the
+     * bytes sit at their file offsets).
+     */
+    private async _fetchBehindAudio(loadId: number, files: FileAccess, url: string, from: number, to: number): Promise<{ buffer: ArrayBuffer; partial: boolean } | null> {
+        const total = to - from + 1;
+        const out = new Uint8Array(total);
+        let got = 0;
+        while (got < total) {
+            await this._audioIdle();
+            if (loadId !== this._loadId || files.signal?.aborted) return null;
+            // Its own abort (to yield to the audio), and the load's.
+            const controller = new AbortController();
+            const onAbort = () => controller.abort();
+            files.signal?.addEventListener('abort', onAbort, { once: true });
+            try {
+                const response = await fetch(url, files.init(url, { range: `bytes=${from + got}-${to}`, signal: controller.signal }));
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                if (response.status !== 206) return { buffer: await response.arrayBuffer(), partial: false };
+                if (!response.body) {
+                    const rest = new Uint8Array(await response.arrayBuffer());
+                    out.set(rest.subarray(0, total - got), got);
+                    got += Math.min(rest.byteLength, total - got);
+                    continue;
+                }
+                const reader = response.body.getReader();
+                for (;;) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    const take = Math.min(value.byteLength, total - got);
+                    out.set(value.subarray(0, take), got);
+                    got += take;
+                    if (got >= total) break;
+                    // A segment the playhead waits for: the link is its own until it is in.
+                    if (this._audioWaiting()) {
+                        controller.abort();
+                        break;
+                    }
+                }
+                if (got >= total) controller.abort(); // a server that sent more than asked
+            } catch (error) {
+                if (!controller.signal.aborted) throw error;
+            } finally {
+                files.signal?.removeEventListener('abort', onAbort);
+            }
+            if (loadId !== this._loadId) return null;
+        }
+        return { buffer: out.buffer, partial: true };
+    }
+
+    /**
+     * The overview files, in the order they are seen and each behind the audio: the waveform's
+     * coarsest level at once (a few KB: the whole recording is drawn with it), then its finer
+     * levels and the spectrogram's (coarse to fine), the bands, the finest levels last; then the
+     * stem's (prefetchStem).
+     */
+    private async _loadOverview(loadId: number): Promise<void> {
+        let firstIn!: () => void;
+        this._overviewFirstIn = false;
+        this._overviewFirst = new Promise<void>((resolve) => { firstIn = resolve; });
+        try {
+            // Together: a few KB each, and the picture needs all of them.
+            await Promise.all([this._loadPeaksFirst(loadId), this._loadSpectrogramFirst(loadId), this._loadStemSpectrogramFirst(loadId)]);
+        } finally {
+            if (loadId === this._loadId) this._overviewFirstIn = true;
+            firstIn();
+        }
+        await this._loadPeakLevels(loadId, false);
+        await this._loadSpectrogramLevels(loadId, false);
+        await this._loadBands(loadId);
+        await this._loadPeakLevels(loadId, true);
+        await this._loadSpectrogramLevels(loadId, true);
+        if (loadId !== this._loadId) return;
+        if (this._options.prefetchStem !== false && this._stemB?.status === 'ready' && !this._bOverviewAsked) {
+            this._bOverviewAsked = true;
+            void this._loadOverviewB(loadId);
+        }
+    }
+
+    /** The peaks file's header and its coarsest level, in one request: what the timeline draws first. */
+    private async _loadPeaksFirst(loadId: number): Promise<void> {
         const m = this._manifest;
         const files = this._files;
         if (!m || !files) return;
         const url = files.resolve(m.peaks.url);
-        const finest = [...m.peaks.levels].sort((a, b) => a.framesPerPeak - b.framesPerPeak)[0];
+        const coarsest = [...m.peaks.levels].sort((x, y) => x.byteLength - y.byteLength)[0];
         try {
-            const first = m.peaks.levels.length > 1 && finest
-                ? await this._fetchFile(files, url, 0, finest.byteOffset - 1)
+            const first = coarsest
+                ? await this._fetchFile(files, url, 0, coarsest.byteOffset + coarsest.byteLength - 1)
                 : await this._fetchFile(files, url);
             if (loadId !== this._loadId) return;
             this._peaks = decodePeaksFile(first.buffer);
             this._stats.coarse = first.buffer.byteLength;
             this._publish({ peaks: peaksToPyramid(this._peaks, this._merged) }, 'peaks');
-            const missing = this._peaks.levels.findIndex((level) => !level.channels);
-            if (missing < 0 || !finest) return;
-            const rest = await this._fetchFile(files, url, finest.byteOffset, finest.byteOffset + finest.byteLength - 1);
-            if (loadId !== this._loadId || !this._peaks) return;
-            this._stats.fine = rest.buffer.byteLength;
-            const level = this._peaks.levels[missing];
-            level.channels = readLevel(rest.buffer, rest.partial ? 0 : finest.byteOffset, level.peaks, this._peaks.channels);
-            this._publish({ peaks: peaksToPyramid(this._peaks, this._merged) }, 'peaks');
         } catch (error) {
             if (loadId === this._loadId) console.warn('[AudioPlayer] peaks unavailable; the waveform stays empty', error);
+        }
+    }
+
+    /**
+     * The spectrogram file's header and its coarsest level, in one request, ahead of the audio as
+     * the waveform's: a few tens of KB, and a spectrogram view shows nothing without them.
+     */
+    private async _loadSpectrogramFirst(loadId: number): Promise<void> {
+        const m = this._manifest;
+        const spec = m?.spectrogram;
+        const files = this._files;
+        if (!m || !spec || !files || this._spectro) return;
+        const coarsest = [...spec.levels].sort((x, y) => x.byteLength - y.byteLength)[0];
+        try {
+            const url = files.resolve(spec.url);
+            const first = coarsest ? await this._fetchFile(files, url, 0, coarsest.byteOffset + coarsest.byteLength - 1) : await this._fetchFile(files, url);
+            if (loadId !== this._loadId) return;
+            this._spectro = decodeSpectrogramFile(first.buffer);
+            this._stats.spectroCoarse = first.buffer.byteLength;
+            this._stats.spectroReadyMs = performance.now() - this._loadStartedAt;
+            this._publishSpectrogram();
+        } catch (error) {
+            if (loadId === this._loadId) console.warn('[AudioPlayer] spectrogram overview unavailable', error);
+        }
+    }
+
+    /**
+     * The overview spectrogram as published: A's levels, each with the stem's beside it. While
+     * the knob is towards the stem, a level without the stem's is left out, and nothing is
+     * published before the stem's first level is in: A alone would draw the wrong picture.
+     */
+    private _publishSpectrogram(): void {
+        const a = this._spectro;
+        const pyramid = a ? toSpectralPyramid(a) : null;
+        if (!pyramid) return;
+        const fileB = this._spectroB;
+        const blended = this._stemB?.status === 'ready' && this._mix > 0 && !this._spectroBFailed;
+        if (!fileB) {
+            if (!blended) this._publish({ spectrogram: pyramid }, 'spectrogram');
+            return;
+        }
+        const pb = toSpectralPyramid(fileB);
+        const levels: typeof pyramid.levels = [];
+        for (const level of pyramid.levels) {
+            const match = pb?.levels.find((l) => l.binSize === level.binSize && l.frames === level.frames);
+            if (match) levels.push({ ...level, b: match.a });
+            else if (!blended) levels.push(level);
+        }
+        if (levels.length === 0) return;
+        this._publish({
+            spectrogram: {
+                ...pyramid,
+                referenceSum: pyramid.referenceMax + fileB.referenceMax,
+                referenceMax: Math.max(pyramid.referenceMax, fileB.referenceMax),
+                levels,
+            },
+        }, 'spectrogram');
+    }
+
+    /**
+     * The stem's spectrogram header and coarsest level, right after A's (a few tens of KB): the
+     * first picture of a blend is blended. Waits for the clip's setup, which picks the stem.
+     */
+    private async _loadStemSpectrogramFirst(loadId: number): Promise<void> {
+        await this._settling;
+        const stem = this._stemB;
+        const spec = stem?.spectrogram;
+        const files = this._files;
+        if (loadId !== this._loadId || !stem || stem.status !== 'ready' || !spec || !files || this._spectroB) return;
+        if (this._options.prefetchStem === false && this._mix <= 0) return;
+        const key = this._stemKey;
+        const coarsest = [...spec.levels].sort((x, y) => x.byteLength - y.byteLength)[0];
+        try {
+            const url = files.resolve(spec.url);
+            const first = coarsest ? await this._fetchFile(files, url, 0, coarsest.byteOffset + coarsest.byteLength - 1) : await this._fetchFile(files, url);
+            if (loadId !== this._loadId || key !== this._stemKey || this._spectroB) return;
+            this._spectroB = decodeSpectrogramFile(first.buffer);
+        } catch (error) {
+            if (loadId !== this._loadId) return;
+            this._spectroBFailed = true;
+            console.warn('[AudioPlayer] the stem\'s spectrogram is unavailable; A\'s is drawn alone', error);
+        }
+        this._publishSpectrogram();
+    }
+
+    /** The peak levels still missing, coarse to fine, behind the audio: all but the finest, or the finest. */
+    private async _loadPeakLevels(loadId: number, finest: boolean): Promise<void> {
+        const m = this._manifest;
+        const files = this._files;
+        const peaks = this._peaks;
+        if (!m || !files || !peaks) return;
+        const url = files.resolve(m.peaks.url);
+        const bySize = [...m.peaks.levels].sort((x, y) => x.byteLength - y.byteLength);
+        const finestLevel = bySize[bySize.length - 1];
+        try {
+            for (const level of bySize) {
+                if ((level === finestLevel) !== finest) continue;
+                const target = peaks.levels.find((l) => l.framesPerPeak === level.framesPerPeak);
+                if (!target || target.channels) continue;
+                const got = await this._fetchBehindAudio(loadId, files, url, level.byteOffset, level.byteOffset + level.byteLength - 1);
+                if (!got || loadId !== this._loadId || this._peaks !== peaks) return;
+                this._stats.fine += got.buffer.byteLength;
+                if (!got.partial) {
+                    // The whole file came: every level is in it.
+                    for (const l of decodePeaksFile(got.buffer).levels) {
+                        const t = peaks.levels.find((x) => x.framesPerPeak === l.framesPerPeak);
+                        if (t && !t.channels) t.channels = l.channels;
+                    }
+                } else {
+                    target.channels = readLevel(got.buffer, 0, target.peaks, peaks.channels);
+                }
+                this._publish({ peaks: peaksToPyramid(peaks, this._merged) }, 'peaks');
+            }
+        } catch (error) {
+            if (loadId === this._loadId) console.warn('[AudioPlayer] a peaks level is unavailable; the waveform stays coarser', error);
         }
     }
 
@@ -901,40 +1142,59 @@ export class SegmentedSource implements PlaybackSource {
         const files = this._files;
         if (!m?.bands || !files) return; // v1 manifest: no high-pass approximation
         try {
-            const { buffer } = await this._fetchFile(files, files.resolve(m.bands.url));
-            if (loadId !== this._loadId) return;
-            this._stats.bands = buffer.byteLength;
-            this._publish({ bands: decodeBandsFile(buffer) }, 'bands');
+            const got = await this._fetchBehindAudio(loadId, files, files.resolve(m.bands.url), 0, m.bands.bytes - 1);
+            if (!got || loadId !== this._loadId) return;
+            this._stats.bands = got.buffer.byteLength;
+            this._publish({ bands: decodeBandsFile(got.buffer) }, 'bands');
         } catch (error) {
             if (loadId === this._loadId) console.warn('[AudioPlayer] bands unavailable; the high-pass preview is skipped outside the decoded window', error);
         }
     }
 
-    /** Header + coarse levels first (one Range request), then the finest level. */
-    private async _loadSpectrogram(loadId: number): Promise<void> {
+    /**
+     * The spectrogram behind the audio: its header with the coarsest level first, then the other
+     * levels coarse to fine; all but the finest, or the finest.
+     */
+    private async _loadSpectrogramLevels(loadId: number, finest: boolean): Promise<void> {
         const m = this._manifest;
         const spec = m?.spectrogram;
         const files = this._files;
         if (!m || !spec || !files) return;
         const url = files.resolve(spec.url);
-        const finest = [...spec.levels].sort((a, b) => a.framesPerColumn - b.framesPerColumn)[0];
+        const bySize = [...spec.levels].sort((x, y) => x.byteLength - y.byteLength);
+        const finestLevel = bySize[bySize.length - 1];
         try {
-            const first = spec.levels.length > 1 && finest
-                ? await this._fetchFile(files, url, 0, finest.byteOffset - 1)
-                : await this._fetchFile(files, url);
-            if (loadId !== this._loadId) return;
-            this._spectro = decodeSpectrogramFile(first.buffer);
-            this._stats.spectroCoarse = first.buffer.byteLength;
-            this._stats.spectroReadyMs = performance.now() - this._loadStartedAt;
-            this._publish({ spectrogram: toSpectralPyramid(this._spectro) }, 'spectrogram');
-            const missing = this._spectro.levels.findIndex((level) => !level.a);
-            if (missing < 0 || !finest) return;
-            const rest = await this._fetchFile(files, url, finest.byteOffset, finest.byteOffset + finest.byteLength - 1);
-            if (loadId !== this._loadId || !this._spectro) return;
-            this._stats.spectroFine = rest.buffer.byteLength;
-            const offset = rest.partial ? 0 : finest.byteOffset;
-            this._spectro.levels[missing].a = new Uint8Array(rest.buffer, offset, finest.byteLength);
-            this._publish({ spectrogram: toSpectralPyramid(this._spectro) }, 'spectrogram');
+            if (!this._spectro) {
+                if (finest) return;
+                const coarsest = bySize[0];
+                const first = coarsest
+                    ? await this._fetchBehindAudio(loadId, files, url, 0, coarsest.byteOffset + coarsest.byteLength - 1)
+                    : null;
+                if (!first || loadId !== this._loadId) return;
+                this._spectro = decodeSpectrogramFile(first.buffer);
+                this._stats.spectroCoarse = first.buffer.byteLength;
+                this._stats.spectroReadyMs = performance.now() - this._loadStartedAt;
+                this._publishSpectrogram();
+            }
+            const file = this._spectro;
+            for (const level of bySize) {
+                if ((level === finestLevel) !== finest) continue;
+                const target = file.levels.find((l) => l.hop === level.framesPerColumn && l.columns === level.columns);
+                if (!target || target.a) continue;
+                const got = await this._fetchBehindAudio(loadId, files, url, level.byteOffset, level.byteOffset + level.byteLength - 1);
+                if (!got || loadId !== this._loadId || this._spectro !== file) return;
+                if (finest) this._stats.spectroFine += got.buffer.byteLength;
+                else this._stats.spectroCoarse += got.buffer.byteLength;
+                if (!got.partial) {
+                    for (const l of decodeSpectrogramFile(got.buffer).levels) {
+                        const t = file.levels.find((x) => x.hop === l.hop && x.columns === l.columns);
+                        if (t && !t.a) t.a = l.a;
+                    }
+                } else {
+                    target.a = new Uint8Array(got.buffer, 0, level.byteLength);
+                }
+                this._publishSpectrogram();
+            }
         } catch (error) {
             if (loadId === this._loadId) console.warn('[AudioPlayer] spectrogram overview unavailable', error);
         }
@@ -1032,7 +1292,7 @@ export class SegmentedSource implements PlaybackSource {
         const loop = this._state.loop;
         const loopFrames = loop ? { start: this._frameOf(loop.start), end: this._frameOf(loop.end) } : null;
         let cursor = scheduler.running ? scheduler.cursorFrame : frame;
-        const ahead = Math.max(1, this._options.prefetchSegments ?? 2);
+        const ahead = Math.max(1, this._aheadSegments());
         const path: number[] = [];
         for (let k = 0; k <= ahead && path.length <= ahead; k += 1) {
             if (loopFrames && cursor >= loopFrames.end) cursor = loopFrames.start;
@@ -1256,6 +1516,14 @@ export class SegmentedSource implements PlaybackSource {
     }
 
     /** Segments the engine should hold: playing (+ the one before, for the stretcher's history), ahead, loop, on screen. */
+    /** Segments fetched ahead of the playhead: prefetchSegments, or as many as hold PREFETCH_SECONDS. */
+    private _aheadSegments(): number {
+        const m = this._manifest;
+        if (this._options.prefetchSegments !== undefined) return this._options.prefetchSegments;
+        if (!m) return 2;
+        return Math.max(2, Math.ceil((PREFETCH_SECONDS * m.sampleRate) / Math.max(1, m.segments.framesPerSegment)));
+    }
+
     private _wantedEngine(frame: number): number[] {
         const m = this._manifest;
         if (!m) return [];
@@ -1263,12 +1531,46 @@ export class SegmentedSource implements PlaybackSource {
         const loop = this._state.loop;
         const out = engineWindow(starts, frame, {
             loop: loop ? { start: this._frameOf(loop.start), end: this._frameOf(loop.end) } : null,
-            ahead: this._options.prefetchSegments ?? 2,
+            ahead: this._aheadSegments(),
             historyFrames: Math.max(this._eng?.stretch.latencyFrames ?? 0, 0.25 * m.sampleRate),
             speed: this._state.processing.speed,
         });
         for (const i of this._visible) if (!out.includes(i)) out.push(i);
+        this._engineWindow = out;
         return out;
+    }
+
+    /**
+     * A part of a segment whose bytes are still coming (a WAV source): to the engine, which plays
+     * as far as the parts reach, when the engine reads that segment and the part is the next one.
+     */
+    private _onPart(stem: EngineStem, index: number, offset: number, planes: Float32Array[], total: number): void {
+        const engine = this._eng;
+        if (!engine || !this._engineWindow.includes(index)) return;
+        if (stem === 'b' && !this._bWanted()) return;
+        const have = engine.partial(stem, index);
+        // A start afresh, unless the engine has the segment whole; else only the part that comes next.
+        if (offset === 0 ? engine.holds(stem, index) && have === null : have !== offset) return;
+        engine.feedPart(stem, index, offset, planes, total);
+    }
+
+    /**
+     * A segment the engine still needs, or the rest of one it holds in parts: from the store's
+     * whole buffer, or fetched (true).
+     */
+    private _feedSegment(stem: EngineStem, store: SegmentStore, i: number, fetch: boolean, urgent: boolean): void {
+        const engine = this._eng!;
+        const part = engine.partial(stem, i);
+        if (engine.holds(stem, i) && part === null) return;
+        const buffer = store.get(i);
+        if (buffer) {
+            const from = part ?? 0;
+            const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c).slice(from));
+            if (part === null) engine.feed(stem, i, channels);
+            else engine.feedPart(stem, i, from, channels, buffer.length);
+        } else if (fetch) {
+            void store.load(i, urgent);
+        }
     }
 
     /** Hand the engine what it should hold and is in memory; fetch the rest; drop the others. */
@@ -1276,38 +1578,28 @@ export class SegmentedSource implements PlaybackSource {
         const engine = this._eng;
         const store = this._store;
         if (!engine || !store) return;
-        // The playhead's segment first, alone: the others would share its bandwidth on a seek.
+        // The playhead's segment first, alone (until it is whole, when it arrives in parts): the
+        // others would share its bandwidth on a seek.
         const first = wanted[0];
-        if (first !== undefined && !engine.holds('a', first) && !store.has(first)) {
+        if (first !== undefined && (!engine.holds('a', first) || engine.partial('a', first) !== null) && !store.has(first)) {
             void store.load(first, true);
             return;
         }
         // Fetch only what the store can keep: more would be evicted and fetched again.
-        const fetchable = new Set(store.withinBudget(wanted.filter((i) => !engine.holds('a', i))));
-        for (const i of wanted) {
-            if (engine.holds('a', i)) continue;
-            const buffer = store.get(i);
-            if (buffer) {
-                const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c).slice());
-                engine.feed('a', i, channels);
-            } else if (fetchable.has(i)) {
-                void store.load(i, i === wanted[0]);
-            }
-        }
-        // Stem B only while the mix wants it: the playhead's segments first.
+        const fetchable = new Set(store.withinBudget(wanted.filter((i) => !engine.holds('a', i) || engine.partial('a', i) !== null)));
+        for (const i of wanted) this._feedSegment('a', store, i, fetchable.has(i), i === wanted[0]);
+        // Stem B only while the mix wants it: the playhead's segments first. Before the knob moves
+        // (prefetchStem), its segment at the playhead, once A's are in: the first move plays at once.
         const storeB = this._storeB;
-        if (!storeB || !this._bWanted()) return;
-        const fetchableB = new Set(storeB.withinBudget(wanted.filter((i) => !engine.holds('b', i))));
-        for (const i of wanted) {
-            if (engine.holds('b', i)) continue;
-            const buffer = storeB.get(i);
-            if (buffer) {
-                const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c).slice());
-                engine.feed('b', i, channels);
-            } else if (fetchableB.has(i)) {
-                void storeB.load(i, i === wanted[0]);
-            }
+        if (!storeB) return;
+        if (!this._bWanted()) {
+            // The playhead's own segment (`wanted` may be one segment that just arrived).
+            const at = this._scheduler?.segmentAt(Math.floor(this._engPlaying ? engine.position() : this._pausedFrame));
+            if (this._options.prefetchStem !== false && at !== undefined && !store.urgentBusy && !storeB.has(at) && !storeB.isLoading(at)) void storeB.load(at);
+            return;
         }
+        const fetchableB = new Set(storeB.withinBudget(wanted.filter((i) => !engine.holds('b', i) || engine.partial('b', i) !== null)));
+        for (const i of wanted) this._feedSegment('b', storeB, i, fetchableB.has(i), i === wanted[0]);
     }
 
     private _pumpEngine(): void {
@@ -1320,10 +1612,11 @@ export class SegmentedSource implements PlaybackSource {
         this._feedEngine(wanted);
         for (const i of engine.held('a')) if (!wanted.includes(i)) engine.drop('a', i);
         store.evict(wanted, 2);
-        // B: the same window while wanted; all of it let go once the knob has rested at 0.
-        const keepB = this._bWanted() ? wanted : [];
-        for (const i of engine.held('b')) if (!keepB.includes(i)) engine.drop('b', i);
-        this._storeB?.evict(keepB, keepB.length ? 2 : 0);
+        // B: the same window while wanted; once the knob has rested at 0, all of it is let go but
+        // the segment at the playhead (prefetchStem).
+        const keepB = this._bWanted() ? wanted : this._options.prefetchStem !== false && wanted.length ? [wanted[0]] : [];
+        for (const i of engine.held('b')) if (!this._bWanted() || !keepB.includes(i)) engine.drop('b', i);
+        this._storeB?.evict(keepB, keepB.length ? Math.min(2, keepB.length) : 0);
         const t = frame / m.sampleRate;
         this._update({ currentTime: t });
         this._host.emit('timeupdate', t);

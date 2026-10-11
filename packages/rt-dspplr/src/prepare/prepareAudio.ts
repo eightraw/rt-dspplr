@@ -121,7 +121,10 @@ export interface PrepareOptions {
     outDir?: string;
     /** Or hand every output to your own store (S3, a database...). */
     storage?: PrepareStorage;
-    /** Segment length in seconds (what the player fetches at a time). Default 10. */
+    /**
+     * Segment length in seconds (what the player fetches at a time). Default: about 192 KB of the
+     * stored file per segment, from 1 s (2 s for MP3, 3 s for Opus) to 10 s (autoSegmentSeconds).
+     */
     segmentSeconds?: number;
     /** Finest stored peak level, frames per peak: a power of two from 16 to 65536. Default 256. */
     framesPerPeak?: number;
@@ -438,7 +441,8 @@ async function run(
     if (signal.aborted) throw signal.reason ?? new Error('prepareAudio cancelled');
     const storage = options.storage ?? (options.outDir ? fsStorage(options.outDir) : null);
     if (!storage) throw new Error('prepareAudio needs `outDir` or `storage`');
-    const segmentSeconds = checkSegmentSeconds(options.segmentSeconds ?? 10);
+    // Given, or chosen from the source's bytes per second once its format is known.
+    const givenSegmentSeconds = options.segmentSeconds === undefined ? null : checkSegmentSeconds(options.segmentSeconds);
     const framesPerPeak = checkFramesPerPeak(options.framesPerPeak ?? DEFAULT_FRAMES_PER_PEAK);
     if (options.concurrency !== undefined) checkConcurrency(options.concurrency);
     const stemSpecs = checkStemSpecs(options.stems);
@@ -542,6 +546,7 @@ async function run(
         const channels = format.channels;
         // The timeline is the source's own rate: nothing is resampled (the player converts).
         const rate = format.sampleRate;
+        const segmentSeconds = givenSegmentSeconds ?? autoSegmentSeconds(format, inputBytes);
         const framesPerSegment = framesPerSegmentOf(segmentSeconds, rate);
 
         // ---- the processors run beside A's own work, all at once ------------------------------
@@ -806,6 +811,43 @@ export function checkSegmentSeconds(value: unknown): number {
         throw new Error(`segmentSeconds must be a number from 0.1 to ${MAX_SEGMENT_SECONDS}, got ${String(value)}`);
     }
     return value;
+}
+
+/** The bytes of the stored file a segment holds by default: a start or a seek fetches one before it plays. */
+const TARGET_SEGMENT_BYTES = 192 * 1024;
+/**
+ * At most this many segments by default: each is an entry of the manifest (about 330 bytes), and
+ * the manifest is fetched before anything else (600 entries: about 200 KB).
+ */
+const MAX_AUTO_SEGMENTS = 600;
+
+/**
+ * The default segment length: about TARGET_SEGMENT_BYTES of the stored file per segment, so a
+ * start or a seek waits for one small request whatever the format (10 s of a 48 kHz stereo WAV
+ * are 1.9 MB). From 1 s (2 s for MP3, 3 s for Opus: each segment's run carries a warm-up) to
+ * 10 s, and long enough for at most MAX_AUTO_SEGMENTS segments. The stored file's bytes per
+ * second: a WAV's from its frame size, a compressed file's from its size and length (a typical
+ * bitrate when either is unknown), and a source that is not kept as it is is stored as a 16-bit WAV.
+ */
+export function autoSegmentSeconds(format: SourceFormat, inputBytes: number | null): number {
+    const rate = format.sampleRate;
+    const layout = format.layout;
+    const seconds = format.frames && format.frames > 0 ? format.frames / rate : null;
+    const measured = inputBytes && seconds ? inputBytes / seconds : null;
+    let bytesPerSecond: number;
+    let min = 1;
+    if (!layout) bytesPerSecond = rate * format.channels * 2;
+    else if (layout.kind === 'wav') bytesPerSecond = rate * layout.blockAlign;
+    else if (layout.kind === 'mp3') {
+        min = 2;
+        bytesPerSecond = measured ?? 16000;
+    } else if (layout.kind === 'opus') {
+        min = 3;
+        bytesPerSecond = measured ?? 12000;
+    } else bytesPerSecond = measured ?? rate * format.channels * 2 * 0.6;
+    const fit = TARGET_SEGMENT_BYTES / Math.max(1, bytesPerSecond);
+    const spread = seconds ? seconds / MAX_AUTO_SEGMENTS : 0;
+    return Math.min(10, Math.max(min, Math.ceil(Math.max(fit, spread) * 10) / 10));
 }
 
 /** Frames of a segment of `seconds` at `rate` (at least one). */

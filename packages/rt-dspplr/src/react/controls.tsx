@@ -115,14 +115,16 @@ export function MixSlider({ core, state }: { core: AudioPlayerCore; state: Audio
             />
             {stems.length > 1 ? (
                 // Prepared clips with more than one stem: which one the knob blends with.
-                <select
-                    className="rtd-mixer-stem"
-                    aria-label="Stem B"
-                    value={state.stem ?? ''}
-                    onChange={(event) => core.setStem(event.currentTarget.value)}
-                >
-                    {stems.map((stem) => <option key={stem.key} value={stem.key}>{stem.label ?? stem.key}</option>)}
-                </select>
+                <span className="rtd-select">
+                    <select
+                        className="rtd-mixer-stem"
+                        aria-label="Stem B"
+                        value={state.stem ?? ''}
+                        onChange={(event) => core.setStem(event.currentTarget.value)}
+                    >
+                        {stems.map((stem) => <option key={stem.key} value={stem.key}>{stem.label ?? stem.key}</option>)}
+                    </select>
+                </span>
             ) : <span className="rtd-mixer-end" aria-hidden="true">Stem B</span>}
             <span className="rtd-mixer-status" aria-live="polite">
                 {state.statusB === 'loading' || state.statusB === 'processing' ? <IconSpinner /> : state.statusB === 'error' ? '!' : null}
