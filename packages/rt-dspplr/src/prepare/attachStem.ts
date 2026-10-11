@@ -1,7 +1,7 @@
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ANALYZER_VERSION, MANIFEST_FORMAT_VERSION, assertManifest, assertStemKey, type AudioManifest, type ManifestStem } from '@saitdigital/rt-dspplr/format';
+import { ANALYZER_VERSION, MANIFEST_FORMAT_VERSION, assertStemKey, parseManifest, type AudioManifest, type ManifestStem } from '@saitdigital/rt-dspplr/format';
 import { checkConcurrency, defaultConcurrency, JobPool, type PreparePool } from './pool';
 import { fsStorage, manifestBytes, storedRanges, type PrepareOptions, type PrepareStorage } from './prepareAudio';
 import { sourceReader } from './sourceReader';
@@ -60,9 +60,7 @@ function storageOf(target: StemTarget): { storage: PrepareStorage; read(key: str
 async function readManifest(read: (key: string) => Promise<Uint8Array | null>): Promise<AudioManifest> {
     const bytes = await read('manifest.json');
     if (!bytes) throw new Error('attachStem: no manifest.json at the target');
-    const manifest: unknown = JSON.parse(new TextDecoder().decode(bytes));
-    assertManifest(manifest);
-    return manifest;
+    return parseManifest(JSON.parse(new TextDecoder().decode(bytes)));
 }
 
 async function writeManifest(storage: PrepareStorage, manifest: AudioManifest): Promise<void> {

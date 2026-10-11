@@ -56,8 +56,12 @@ declare function registerProcessor(name: string, ctor: unknown): void;
 type Stem = 'a' | 'b';
 
 type Message =
-    /** A segment, whole; or (`offset`, `total`) a part of one whose bytes are still coming, from frame `offset`. */
-    | { type: 'seg'; stem: Stem; index: number; data: Float32Array[]; offset?: number; total?: number }
+    /**
+     * A segment, whole; or (`offset`, `total`) a part of one whose bytes are still coming, from
+     * frame `offset`: the next part of its fill, or (`fresh`, and any part from 0) the first of a
+     * new one, which may start mid-segment (a seek that fetched from there).
+     */
+    | { type: 'seg'; stem: Stem; index: number; data: Float32Array[]; offset?: number; total?: number; fresh?: boolean }
     | { type: 'drop'; stem: Stem; index: number }
     | { type: 'clear' }
     | { type: 'play'; position: number; frame?: number; seq: number }
@@ -284,8 +288,8 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
     private readonly starts: Float64Array;
     private readonly total: number;
     private readonly stems: Record<Stem, Map<number, Float32Array[]>> = { a: new Map(), b: new Map() };
-    /** Segments still arriving in parts: how many of their frames are in (absent: whole). */
-    private readonly filled: Record<Stem, Map<number, number>> = { a: new Map(), b: new Map() };
+    /** Segments still arriving in parts: the frames in, [from, to) of the segment (absent: whole). */
+    private readonly filled: Record<Stem, Map<number, { from: number; to: number }>> = { a: new Map(), b: new Map() };
     private queue: Array<{ frame: number; message: Message }> = [];
 
     private playing = false;
@@ -432,9 +436,9 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         if (b < a) return true;
         for (let i = this.segmentOf(a); i < this.starts.length - 1 && this.starts[i] <= b; i += 1) {
             if (!this.stems[stem].has(i)) return false;
-            // A segment still arriving: in as far as it has come.
+            // A segment still arriving: in from where its fill began as far as it has come.
             const got = this.filled[stem].get(i);
-            if (got !== undefined && this.starts[i] + got <= Math.min(b, this.starts[i + 1] - 1)) return false;
+            if (got && (this.starts[i] + got.from > Math.max(a, this.starts[i]) || this.starts[i] + got.to <= Math.min(b, this.starts[i + 1] - 1))) return false;
         }
         return true;
     }
@@ -474,7 +478,7 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
         const f = Math.max(0, Math.min(this.total - 1, Math.floor(frame)));
         const i = this.segmentOf(f);
         const got = this.filled.b.get(i);
-        return this.stems.b.has(i) && (got === undefined || f < this.starts[i] + got);
+        return this.stems.b.has(i) && (!got || (f >= this.starts[i] + got.from && f < this.starts[i] + got.to));
     }
 
     /** One channel's sample of a stem at an integer frame (0 outside the clip or when absent). */
@@ -739,22 +743,23 @@ class StreamEngineProcessor extends AudioWorkletProcessor {
                     this.invalidate(stem);
                     break;
                 }
-                // A part: the segment is kept at its full length and filled as far as it has come.
+                // A part: the segment is kept at its full length and filled from where its fill
+                // began as far as it has come.
                 let planes = this.stems[stem].get(index);
-                if (offset === 0) {
+                if (message.fresh || offset === 0) {
                     planes = data.map(() => new Float32Array(total));
                     this.stems[stem].set(index, planes);
-                    this.filled[stem].set(index, 0);
+                    this.filled[stem].set(index, { from: offset, to: offset });
                     this.invalidate(stem);
                 }
                 const have = this.filled[stem].get(index);
                 // Whole already, let go, or not the part that comes next: left as it is.
-                if (!planes || have === undefined || have !== offset) break;
-                const n = Math.min(data[0]?.length ?? 0, total - have);
-                for (let c = 0; c < planes.length; c += 1) planes[c].set(data[Math.min(c, data.length - 1)].subarray(0, n), have);
+                if (!planes || !have || have.to !== offset) break;
+                const n = Math.min(data[0]?.length ?? 0, total - have.to);
+                for (let c = 0; c < planes.length; c += 1) planes[c].set(data[Math.min(c, data.length - 1)].subarray(0, n), have.to);
                 // The arrays filled in place: what was read before them is unchanged, nothing to invalidate.
-                if (have + n >= total) this.filled[stem].delete(index);
-                else this.filled[stem].set(index, have + n);
+                if (have.from === 0 && have.to + n >= total) this.filled[stem].delete(index);
+                else this.filled[stem].set(index, { from: have.from, to: have.to + n });
                 break;
             }
             case 'drop':

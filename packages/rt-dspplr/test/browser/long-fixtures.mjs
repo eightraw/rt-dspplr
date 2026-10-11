@@ -151,6 +151,7 @@ async function pairs() {
 
 export default async function setup() {
     const { prepareAudio } = await loadPrepare();
+    const { manifestProblem } = await import(pathToFileURL(path.resolve(root, 'dist', 'format.js')).href);
     fs.mkdirSync(FIXTURES, { recursive: true });
     const items = [
         { name: 'stereo70', seconds: 70, rate: 48000, channels: 2, segmentSeconds: 10 },
@@ -161,10 +162,10 @@ export default async function setup() {
     for (const item of items) {
         const src = path.join(FIXTURES, `${item.name}.wav`);
         const out = path.join(FIXTURES, item.name);
-        // Re-prepare when the fixture predates the current manifest version (v4: the source and its index).
+        // Re-prepare when the fixture predates the current manifest (the player would refuse it).
         const manifestPath = path.join(out, 'manifest.json');
         if (fs.existsSync(manifestPath) && fs.existsSync(src)
-            && JSON.parse(fs.readFileSync(manifestPath, 'utf8')).formatVersion === 4) continue;
+            && manifestProblem(JSON.parse(fs.readFileSync(manifestPath, 'utf8'))) === null) continue;
         wav16(src, item.seconds, item.rate, item.channels);
         fs.rmSync(out, { recursive: true, force: true });
         await prepareAudio(src, { outDir: out, segmentSeconds: item.segmentSeconds }).done;
@@ -175,8 +176,8 @@ export default async function setup() {
 
 /**
  * MP3 and Opus clips (prepare's 2 s fixtures) and a 2 s FLAC (flac16()), kept as they are with
- * 0.5 s segments, and the decoder's samples beside them (`<name>.f32`: planar float32, channel
- * after channel).
+ * 0.5 s segments (and with 2 s ones, entries inside them: <codec>whole), and the decoder's
+ * samples beside them (`<name>.f32`: planar float32, channel after channel).
  */
 async function lossy() {
     const { prepareAudio, builtinDecoder } = await loadPrepare();
@@ -187,6 +188,10 @@ async function lossy() {
         const out = path.join(FIXTURES, `${codec}clip`);
         fs.rmSync(out, { recursive: true, force: true });
         await prepareAudio(src, { outDir: out, segmentSeconds: 0.5 }).done;
+        // The same with 2 s segments: entries inside them (entries.bin) for seeks.
+        const whole = path.join(FIXTURES, `${codec}whole`);
+        fs.rmSync(whole, { recursive: true, force: true });
+        await prepareAudio(src, { outDir: whole, segmentSeconds: 2 }).done;
         const decoded = builtinDecoder(fs.createReadStream(src));
         const parts = [];
         for await (const block of decoded.blocks) parts.push(block);

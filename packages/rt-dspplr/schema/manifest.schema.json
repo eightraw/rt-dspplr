@@ -94,33 +94,24 @@
         { "if": { "properties": { "codec": { "const": "opus" } } }, "then": { "properties": { "sampleRate": { "const": 48000 } } } }
       ]
     },
-    "segment": {
-      "type": "object",
-      "description": "A stretch of the timeline and the bytes of the source that hold it: range is decoded as one run, tail counts the run's samples from the segment's first to the run's end.",
-      "required": ["index", "startFrame", "frames", "range", "tail"],
-      "properties": {
-        "index": { "$ref": "#/$defs/count" },
-        "startFrame": { "$ref": "#/$defs/count" },
-        "frames": { "$ref": "#/$defs/count", "description": "at most MAX_SEGMENT_SECONDS (60) × sampleRate (checked by assertManifest)" },
-        "range": {
-          "oneOf": [
-            { "type": "null" },
-            { "type": "array", "items": { "$ref": "#/$defs/count" }, "minItems": 2, "maxItems": 2 }
-          ],
-          "description": "[start, end) bytes of the source, or null: silence"
-        },
-        "tail": { "$ref": "#/$defs/count" },
-        "lead": { "$ref": "#/$defs/count", "description": "frames of silence before the source's samples" },
-        "trail": { "$ref": "#/$defs/count", "description": "frames of silence after them" }
-      }
-    },
     "segments": {
       "type": "object",
-      "required": ["framesPerSegment", "source", "list"],
+      "description": "A segment list, one column each, in timeline order: segment i covers frames [i × framesPerSegment, min((i + 1) × framesPerSegment, frames)) of the timeline. Every column has one entry a segment (ranges two): checked by assertManifest, as the schema cannot count them.",
+      "required": ["framesPerSegment", "source", "ranges", "tail"],
       "properties": {
         "framesPerSegment": { "$ref": "#/$defs/positiveInteger", "description": "at most MAX_SEGMENT_SECONDS (60) × sampleRate (checked by assertManifest)" },
         "source": { "$ref": "#/$defs/source" },
-        "list": { "type": "array", "items": { "$ref": "#/$defs/segment" } }
+        "ranges": { "type": "array", "items": { "$ref": "#/$defs/count" }, "description": "two numbers a segment: the bytes [start, end) of the source decoded as one run; [0, 0]: the segment is silence" },
+        "tail": { "type": "array", "items": { "$ref": "#/$defs/count" }, "description": "the run's samples from the segment's first to the run's end" },
+        "skip": { "type": "array", "items": { "$ref": "#/$defs/count" }, "description": "MP3, FLAC and Opus runs: the run's decoded samples before the segment's first (skip + tail are all of them); absent: decode the runs whole first" },
+        "lead": { "type": "array", "items": { "$ref": "#/$defs/count" }, "description": "frames of silence before the source's samples" },
+        "trail": { "type": "array", "items": { "$ref": "#/$defs/count" }, "description": "frames of silence after them" },
+        "entries": {
+          "type": "object",
+          "description": "MP3, FLAC, Opus: entries.bin, where runs may start inside the segments (for seeks)",
+          "required": ["url", "bytes"],
+          "properties": { "url": { "type": "string" }, "bytes": { "$ref": "#/$defs/count" } }
+        }
       }
     },
     "peaks": {

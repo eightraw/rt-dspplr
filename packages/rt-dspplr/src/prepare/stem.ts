@@ -542,7 +542,7 @@ export async function buildStem(ctx: BuildStemContext): Promise<ManifestStem> {
             loudnessDeltaDb: Math.round((timeline.loudness.gatedRmsDb - manifest.loudness.gatedRmsDb) * 100) / 100,
             gainDb: options.gainDb ?? 0,
             loudness: timeline.loudness,
-            segments: { framesPerSegment: fps, source: stored.source, list: stored.list },
+            segments: { framesPerSegment: fps, source: stored.source, list: stored.list, ...(stored.entries ? { entries: stored.entries } : {}) },
             peaks: timeline.peaks,
             ...(timeline.bands ? { bands: timeline.bands } : {}),
             ...(timeline.spectrogram ? { spectrogram: timeline.spectrogram } : {}),

@@ -31,9 +31,30 @@ player and, from 0.4.0, the Node prepare step for long recordings (its
   playhead, before anything else: the overview files follow it, coarse to fine, at
   full speed while no segment is waited for, and break off within one network chunk
   when a start or a seek asks for one (they carry on from there once it is in).
-  A WAV source plays as its bytes arrive: the segment at the playhead is handed to the
-  engine in parts, which starts once half a second ahead is in (a seek no longer waits
-  for the whole segment). The first picture is the coarsest level of the waveform and
+  A segment plays as its bytes arrive, in every format: a WAV's PCM as it comes, an MP3's,
+  FLAC's or Opus's run through its decoder in the worker frame by frame (packet by packet
+  for Opus), placed by the segment's `skip` (below). The engine gets it in parts and
+  starts once half a second ahead is in: a start or a seek no longer waits for the whole
+  segment, and what arrived before the engine was set up, or before the knob asked for
+  the stem, is handed over then. The codec's decoder is fetched once the manifest is in,
+  and comes before the first run's bytes. With the knob towards the stem, a start or a
+  seek fetches both segments at the playhead first, together; a seek lets go of the
+  stem's prefetch for the old playhead. A segment the playhead waits for is asked for at
+  once, however many others are on their way, and those (both stems' segments and the
+  overview files) give way on the link and carry on from the byte they had come to; the
+  decoded close-up of the view is no longer urgent (on a short clip it was all of it, and
+  a seek waited behind it: 2.3 s -> 0.5 s over 2 Mbit/s). A seek into a segment not yet in
+  fetches it from the playhead (less what the stretcher reads behind it), not from the
+  segment's start: a WAV from that frame, MP3, FLAC and Opus from the nearest entry before
+  it (`entries.bin`, below); the engine plays the segment from there, and the segment comes
+  whole behind it and takes the place of those frames (the same samples). The segment
+  after it is asked for at once too when the start's margin reaches into it. A seek's old
+  urgent fetches go on as any other. Over 2 Mbit/s and 80 ms, 30-minute recordings with a
+  stem, from `play()` to sound, the manifest included: MP3 1.34 -> 0.42 s, Opus 1.35 ->
+  0.35 s, FLAC 0.96 -> 0.43 s, WAV 0.84 -> 0.52 s; a seek anywhere 0.3-2.8 s -> 0.11-
+  0.18 s in every format; the knob to the stem right after a seek 3.5 -> 0.25 s (MP3),
+  7.2 -> 0.06 s (WAV).
+  The first picture is the coarsest level of the waveform and
   of both spectrograms (the stem's too, so a blend is never drawn from A alone),
   fetched together; the decoded close-up of a short view (up to 20 s, now counted in
   seconds, not segments) follows it. Decoded audio stays near 60 s (`segmented.cacheSeconds`).
@@ -95,7 +116,8 @@ player and, from 0.4.0, the Node prepare step for long recordings (its
   `assertStemKey`, `DEFAULT_STEM_KEY`), the readers and writers of peaks.bin,
   bands.bin, spectrogram.bin and WAV, and the source runs (`segmentFromRun`,
   `decodePcmRun`, `decodeStreamRun`, `decodeOpusRun`: a segment's bytes decoded
-  and cut out, given a codec's compiled WebAssembly). Pure code (no DOM, no Node APIs),
+  and cut out, given a codec's compiled WebAssembly; `openRunStream` decodes a run as its
+  bytes arrive, to the same samples). Pure code (no DOM, no Node APIs),
   in a chunk of its own; the prepare package imports it instead of carrying a copy.
   The analysis kernels shared with prepare (`frameRows`, `planBands`, `quantizeRows`,
   `computeHighPassCoefficients`) are exported there as experimental.
@@ -104,7 +126,20 @@ player and, from 0.4.0, the Node prepare step for long recordings (its
   compatibility policy: before 1.0 a player reads its own version only (versions
   1–3, with WAV segment files, are refused: prepare the recording again), and
   ignores unknown optional fields. The timeline is the source's own rate; the
-  manifest has no `resample` any more.
+  manifest has no `resample` any more. An MP3, FLAC or Opus segment says its `skip`:
+  how many of its run's samples come before its first, so a player places them as the
+  run arrives (prepare counts them from the FLAC and Ogg index, and for MP3 from each
+  frame's main_data_begin, the bit reservoir a fresh decoder keeps, without decoding; it
+  checks the segments it keeps decoded both ways, and drops `skip` should they differ). A segment list is held as columns (`ranges`, `tail`,
+  `skip`, `lead`, `trail`: one entry a segment, where each sits following from the grid),
+  and the file has no white space: 30 minutes of WAV with a stem, 96 KB -> 17 KB, what the
+  player fetches before anything plays, on any server (2 Mbit/s: 0.39 s -> 0.07 s).
+  `parseManifest()` reads a file into the segment lists the player and prepare work with,
+  `serializeManifest()` writes them. And `segments.entries`: `entries.bin`, where else a run may
+  start inside each segment, about every half second (`{ at, byte, skip }`: a FLAC frame,
+  an MP3 run from where its bit reservoir is full, an Opus page 500 ms before), 41 KB for
+  30 minutes of MP3; prepare checks the first and last entries of the segments it keeps
+  against those segments and leaves the file out should they differ. A WAV needs none.
 - The JSON Schema (draft 2020-12) ships as `@saitdigital/rt-dspplr/manifest.schema.json`.
   `assertManifest()` now checks the same rules (it used to check only a few fields);
   a test keeps the two in agreement on fixtures, on prepared folders and on 72 broken

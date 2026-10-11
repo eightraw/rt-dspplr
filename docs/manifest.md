@@ -105,14 +105,23 @@ The policy:
 
 ### Segments
 
-`segments`: `{ framesPerSegment, source, list }`. The audio is one file, `source`;
-each segment says which bytes of it hold its frames.
+`segments`: `{ framesPerSegment, source, ranges, tail, skip?, lead?, trail?, entries? }`. The
+audio is one file, `source`; each segment says which bytes of it hold its frames. The segments
+are the grid's: segment `i` covers the timeline's frames from `i × framesPerSegment`, for
+`framesPerSegment` frames (the last one what is left), and there are `n = ceil(frames /
+framesPerSegment)` of them. What each one says is held in columns, one entry a segment in
+timeline order: the manifest is what a player fetches before anything plays, and a column of
+numbers is a fraction of the size of a list of objects (30 minutes: 17 KB instead of 56).
 
 | Field | Type | Req. | Meaning |
 |---|---|---|---|
 | `framesPerSegment` | integer ≥ 1, at most 60 s | yes | The grid; the last segment MAY be shorter. |
 | `source` | object | yes | The file: `{ url, bytes, codec, sampleRate, channels, pcm?, header? }`, below. |
-| `list[]` | array | yes | In timeline order: `{ index, startFrame, frames, range, tail, lead?, trail? }`, below. |
+| `ranges` | 2n integers ≥ 0 | yes | Each segment's `range`, start then end. |
+| `tail` | n integers ≥ 0 | yes | Each segment's `tail`. |
+| `skip` | n integers ≥ 0 | no | Each segment's `skip` (MP3, FLAC, Opus). |
+| `lead`, `trail` | n integers ≥ 0 | no | Each segment's `lead` and `trail`; absent: 0 for all. |
+| `entries` | object | no | MP3, FLAC, Opus: `{ url, bytes }` of [entries.bin](#entriesbin), where else a run may start inside each segment, for seeks. Prepare writes `entries.bin` (`<prefix>entries.bin` for a stem). Absent: a seek fetches its segment from the start; a WAV's entries are any frame (below). |
 
 `source`:
 
@@ -125,24 +134,41 @@ each segment says which bytes of it hold its frames.
 | `pcm` | object | wav | `{ encoding: "int" \| "float", bitsPerSample, blockAlign }` of its samples. |
 | `header` | string, base64 | flac, opus | Put before a run to decode it: FLAC's `fLaC` and STREAMINFO (marked as the last metadata block, its total samples and MD5 0, unknown: a run is not the whole stream), Opus's OpusHead packet. |
 
-A segment:
+A segment (`index`, `startFrame` and `frames` from the grid; the rest from the columns):
 
 | Field | Type | Req. | Meaning |
 |---|---|---|---|
-| `index`, `startFrame`, `frames` | integers | yes | Its place on the timeline; `frames` at most 60 s of it. |
-| `range` | `[start, end)` \| null | yes | The bytes of the source to fetch and decode as one **run**; null: the segment is silence (a stem that does not reach it). |
+| `index`, `startFrame`, `frames` | integers | (grid) | Its place on the timeline; `frames` at most 60 s of it. |
+| `range` | `[start, end)` | yes | The bytes of the source to fetch and decode as one **run**; `[0, 0]`: the segment is silence (a stem that does not reach it). |
 | `tail` | integer ≥ 0 | yes | How many of the run's decoded samples, counted back from the run's **end**, belong to the segment and after it: the segment's first sample is the run's sample `length − tail`. |
+| `skip` | integer ≥ 0 | no | MP3, FLAC and Opus runs: how many of the run's decoded samples, from its **start**, come before the segment's first; `skip + tail` is all of them. With it a reader places samples as the run's bytes arrive, before it is whole. Absent: the run is decoded whole first. |
 | `lead` | integer ≥ 0 | no | Frames of silence before the source's samples (a stem that starts after A). Absent = 0. |
 | `trail` | integer ≥ 0 | no | Frames of silence after them (a stem that ends before A). Absent = 0. |
 
 A reader makes a segment's frames so: `lead` zeros; then `count = min(frames − lead − trail, tail)`
 samples of the decoded run from index `length − tail`; zeros to `frames`. A run starts
 before the segment (a decoder's warm-up, see [Sources](#sources)) and is counted from its
-end because a decoder may give nothing for the first frame of a run.
+end because a decoder may give nothing for the first frame of a run. With `skip`, the same
+samples are the run's from index `skip`, known before the run has ended: a reader that decodes
+the run as it arrives hands them out as they come. Should the run then not come to
+`skip + tail` samples, the reader decodes it whole and uses `tail`, as without `skip`.
 
-Segments tile the timeline exactly: `list[0].startFrame` is 0, each `startFrame` is
-the previous `startFrame + frames`, and the sum of `frames` is `frames`. Their frames
-read back sample-exact (WAV, MP3) or within float rounding (Opus).
+The columns have one entry for each segment of the grid (`ranges` two), so the segments tile
+the timeline exactly; a stem's grid is A's. Their frames read back sample-exact (WAV, MP3) or
+within float rounding (Opus). The reference implementation reads a manifest file into a list
+of segment objects (`parseManifest()`, which checks it as `assertManifest()` does) and writes
+one back as columns (`serializeManifest()`, no white space).
+
+A seek into a segment need not fetch it from its start. An **entry** `{ at, byte, skip }`
+says: the segment's frames from `at` (counted like `lead`, from the segment's first frame)
+are the source's bytes from `byte` to the end of the segment's `range`, decoded, after
+`skip` samples of warm-up; there are `tail − (at − lead)` of them after the warm-up. A
+WAV's entries are any frame: `byte = range[0] + (runFrames − tail + at − lead) × blockAlign`,
+`skip` 0. Other codecs' are in [entries.bin](#entriesbin), about every half second: FLAC at a
+frame (`skip` 0), MP3 from where the bit reservoir is full (as a segment's run), Opus 500 ms
+of pre-roll before `at` (its samples within the same tolerance as a segment's). A reader may
+then fetch the segment whole and put it in place of the frames from the entry (the same
+samples: MP3 and FLAC exactly).
 
 ### Peaks
 
@@ -244,6 +270,17 @@ data: bins × (1 + K) u16, bin-major: [E_total, E_hp(c0) … E_hp(cK-1)]
 `E_hp(c)` is the mean square left after the player's own high-pass (4th-order
 Butterworth, the same coefficients) at cutoff `c`; default cutoffs are half-octave
 steps from 25 to 566 Hz.
+
+### entries.bin
+
+```
+ 0 "RTDE" · 4 u16 version (1) · 6 u16 reserved · 8 u32 segments (N, the segments' n)
+12 u32[N] entries per segment
+then segment by segment, in order of `at`, 3 × u32 each: at, byte − range[0], skip
+```
+
+An entry's `byte` is stored from its segment's `range[0]` (a segment's run is under 4 GiB
+however long the file). Entries come after their segment's own start (`byte > range[0]`).
 
 ### spectrogram.bin
 

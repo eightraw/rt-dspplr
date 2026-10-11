@@ -47,6 +47,7 @@ interface RunExports {
     rtd_in_reserve(n: number): number;
     rtd_in_commit(n: number): void;
     rtd_in_end(): void;
+    rtd_in_ahead(): number;
     rtd_open(kind: number, blockFrames: number): number;
     rtd_channels(): number;
     rtd_rate(): number;
@@ -56,6 +57,12 @@ interface RunExports {
     rtd_opus_raw_packet?(n: number): number;
     rtd_opus_raw_decode?(n: number): number;
     rtd_opus_raw_pcm?(): number;
+    rtd_mp3_raw_open?(): number;
+    rtd_mp3_raw_frame?(n: number): number;
+    rtd_mp3_raw_decode?(n: number): number;
+    rtd_mp3_raw_pcm?(): number;
+    rtd_mp3_raw_channels?(): number;
+    rtd_mp3_raw_rate?(): number;
 }
 
 const IMPORTS = { wasi_snapshot_preview1: { random_get: () => 0 } };
@@ -177,6 +184,237 @@ export async function decodeOpusRun(module: WebAssembly.Module, header: Uint8Arr
         total += n;
     }
     return { channels: concatPlanes(blocks, C, total), sampleRate: 48000 };
+}
+
+// ---- runs decoded as they arrive -------------------------------------------------------------
+//
+// The same decoders, fed the run's bytes as the network brings them: an MP3 frame by frame, an
+// Ogg Opus packet by packet, a FLAC through its stream reader once enough is in that it cannot
+// run dry mid-frame. The samples are those of the whole run's decode (decodeStreamRun,
+// decodeOpusRun), in the same order; where the segment's first one falls among them a prepared
+// segment says (its `skip`).
+
+/** A run decoded as its bytes arrive (openRunStream). */
+export interface RunStream {
+    /**
+     * The run's next bytes (`end`: no more come): the planes of the frames they completed, in
+     * order. Throws on bytes the codec does not read; the stream is then unusable.
+     */
+    push(bytes: Uint8Array, end: boolean): Float32Array[][];
+    /** Frames decoded so far. */
+    readonly frames: number;
+    /** The decoded format, once known (0 before: an MP3 says it with its first samples). */
+    readonly sampleRate: number;
+    readonly channels: number;
+}
+
+/** Most frames per read of a FLAC stream; never more than its smallest block, so a read decodes at most one new frame. */
+const FLAC_STEP = 1024;
+/**
+ * Bytes kept ahead of the FLAC reader besides its largest frame: dr_flac refills its cache 4 KB
+ * at a time, and a read that finds less than it asks for breaks the stream.
+ */
+const FLAC_SLACK = 8192;
+
+/** Planar copies of `frames` interleaved frames at `ptr`. */
+function planar(x: RunExports, ptr: number, frames: number, channels: number): Float32Array[] {
+    const pcm = new Float32Array(x.memory.buffer, ptr, frames * channels);
+    return Array.from({ length: channels }, (_, c) => {
+        const ch = new Float32Array(frames);
+        for (let i = 0; i < frames; i += 1) ch[i] = pcm[i * channels + c];
+        return ch;
+    });
+}
+
+function concatTo(a: Uint8Array, b: Uint8Array): Uint8Array {
+    if (a.length === 0) return b;
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a);
+    out.set(b, a.length);
+    return out;
+}
+
+/** An MPEG Layer III frame's length from its header (the 4 bytes at `o`), or 0: not such a frame (free format included). */
+export function mp3FrameBytes(b: Uint8Array, o: number): number {
+    if (b[o] !== 0xff || (b[o + 1] & 0xe0) !== 0xe0) return 0;
+    const version = (b[o + 1] >> 3) & 3; // 3 MPEG-1, 2 MPEG-2, 0 MPEG-2.5
+    const layer = (b[o + 1] >> 1) & 3; // 1 Layer III
+    const bitrate = b[o + 2] >> 4;
+    const rate = (b[o + 2] >> 2) & 3;
+    if (version === 1 || layer !== 1 || bitrate === 0 || bitrate === 15 || rate === 3) return 0;
+    const kbps = (version === 3 ? MP3_KBPS_V1 : MP3_KBPS_V2)[bitrate];
+    const hz = (version === 3 ? [44100, 48000, 32000] : version === 2 ? [22050, 24000, 16000] : [11025, 12000, 8000])[rate];
+    return Math.floor(((version === 3 ? 144 : 72) * kbps * 1000) / hz) + ((b[o + 2] >> 1) & 1);
+}
+const MP3_KBPS_V1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const MP3_KBPS_V2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+
+/**
+ * A run of `codec` decoded as its bytes arrive: an MP3's frames from the middle, a FLAC's frames
+ * after its `header` (fLaC and STREAMINFO), an Ogg Opus file's pages (its OpusHead as `header`).
+ */
+export async function openRunStream(module: WebAssembly.Module, codec: 'mp3' | 'flac' | 'opus', header?: Uint8Array): Promise<RunStream> {
+    const x = await instance(module);
+    if (codec === 'mp3') return mp3Stream(x);
+    if (codec === 'opus') return opusStream(x, header);
+    return flacStream(x, header);
+}
+
+function mp3Stream(x: RunExports): RunStream {
+    if (!x.rtd_mp3_raw_open || x.rtd_mp3_raw_open() !== 0) throw new Error('mp3 frame decoder unavailable');
+    let pending: Uint8Array = new Uint8Array(0);
+    let frames = 0;
+    let sampleRate = 0;
+    let channels = 0;
+    return {
+        get frames() { return frames; },
+        get sampleRate() { return sampleRate; },
+        get channels() { return channels; },
+        push(bytes, end) {
+            pending = concatTo(pending, bytes);
+            const out: Float32Array[][] = [];
+            let o = 0;
+            while (pending.length - o >= 4) {
+                const n = mp3FrameBytes(pending, o);
+                if (n === 0) throw new Error('mp3 run: not a Layer III frame');
+                if (pending.length - o < n) break;
+                const p = x.rtd_mp3_raw_frame!(n);
+                if (!p) throw new Error('mp3 run: frame too large');
+                new Uint8Array(x.memory.buffer, p, n).set(pending.subarray(o, o + n));
+                const got = x.rtd_mp3_raw_decode!(n);
+                if (got < 0) throw new Error('mp3 run: a frame failed to decode');
+                o += n;
+                if (got === 0) continue;
+                const C = x.rtd_mp3_raw_channels!();
+                const rate = x.rtd_mp3_raw_rate!();
+                if ((channels && C !== channels) || (sampleRate && rate !== sampleRate)) throw new Error('mp3 run: the format changes');
+                channels = C;
+                sampleRate = rate;
+                out.push(planar(x, x.rtd_mp3_raw_pcm!(), got, C));
+                frames += got;
+            }
+            pending = pending.slice(o);
+            if (end && pending.length > 0) throw new Error('mp3 run: it ends inside a frame');
+            return out;
+        },
+    };
+}
+
+function opusStream(x: RunExports, header?: Uint8Array): RunStream {
+    if (!header) throw new Error('opus runs need the OpusHead');
+    const head = opusHead(header);
+    if (head.mapping !== 0 || head.channels < 1 || head.channels > 2) throw new Error('opus runs: mono or stereo only');
+    if (!x.rtd_opus_raw_open || x.rtd_opus_raw_open(head.channels, head.gainQ8) !== 0) throw new Error('opus decoder unavailable');
+    const C = head.channels;
+    let pending: Uint8Array = new Uint8Array(0);
+    let frames = 0;
+    let first = true;
+    // As oggPackets(): the bytes up to the end of a packet begun before the run are no packet.
+    let fragment = false;
+    let parts: Uint8Array[] = [];
+    let page: { laces: Uint8Array; at: number } | null = null;
+    return {
+        get frames() { return frames; },
+        sampleRate: 48000,
+        channels: C,
+        push(bytes, end) {
+            pending = concatTo(pending, bytes);
+            const out: Float32Array[][] = [];
+            let o = 0;
+            for (;;) {
+                if (!page) {
+                    if (pending.length - o < 27) break;
+                    if (pending[o] !== 0x4f || pending[o + 1] !== 0x67 || pending[o + 2] !== 0x67 || pending[o + 3] !== 0x53) throw new Error('not an Ogg page');
+                    const count = pending[o + 26];
+                    if (pending.length - o < 27 + count) break;
+                    const continued = (pending[o + 5] & 1) !== 0;
+                    if (first) fragment = continued;
+                    first = false;
+                    if (!continued) parts = [];
+                    page = { laces: pending.slice(o + 27, o + 27 + count), at: 0 };
+                    o += 27 + count;
+                }
+                // A packet is decoded once its last lace is in, before the rest of its page.
+                while (page.at < page.laces.length) {
+                    const lace = page.laces[page.at];
+                    if (pending.length - o < lace) break;
+                    if (!fragment) parts.push(pending.slice(o, o + lace));
+                    o += lace;
+                    page.at += 1;
+                    if (lace === 255) continue;
+                    if (!fragment) {
+                        const packet = parts.length === 1 ? parts[0] : concatBytes(parts);
+                        const p = x.rtd_opus_raw_packet!(packet.length);
+                        new Uint8Array(x.memory.buffer, p, packet.length).set(packet);
+                        const n = x.rtd_opus_raw_decode!(packet.length);
+                        if (n < 0) throw new Error('opus run: a packet failed to decode');
+                        out.push(planar(x, x.rtd_opus_raw_pcm!(), n, C));
+                        frames += n;
+                    }
+                    fragment = false;
+                    parts = [];
+                }
+                if (page.at < page.laces.length) break;
+                page = null;
+            }
+            pending = pending.slice(o);
+            if (end && (page || pending.length > 0)) throw new Error('opus run: it ends inside a page');
+            return out;
+        },
+    };
+}
+
+function flacStream(x: RunExports, header?: Uint8Array): RunStream {
+    if (!header || header.length < 22) throw new Error('flac runs need the STREAMINFO');
+    // STREAMINFO, after fLaC and its block header: block sizes at 8 and 10, the largest frame at 15
+    // (0: unknown), channels and bits per sample in bytes 20 and 21.
+    const minBlock = (header[8] << 8) | header[9];
+    const maxBlock = (header[10] << 8) | header[11];
+    const maxFrame = (header[15] << 16) | (header[16] << 8) | header[17];
+    const streamChannels = ((header[20] >> 1) & 7) + 1;
+    const bits = (((header[20] & 1) << 4) | (header[21] >> 4)) + 1;
+    const step = Math.max(16, Math.min(FLAC_STEP, minBlock || FLAC_STEP));
+    // The largest frame ahead; when the stream does not say, as large as a frame stored
+    // uncompressed (a side channel has one bit more).
+    const guard = FLAC_SLACK + (maxFrame || Math.ceil((maxBlock * streamChannels * (bits + 1)) / 8) + 64);
+    let opened = false;
+    let frames = 0;
+    let sampleRate = 0;
+    let channels = 0;
+    const give = (data: Uint8Array) => {
+        if (data.length === 0) return;
+        const p = x.rtd_in_reserve(data.length);
+        if (!p) throw new Error('decoder: out of memory');
+        new Uint8Array(x.memory.buffer, p, data.length).set(data);
+        x.rtd_in_commit(data.length);
+    };
+    give(header);
+    return {
+        get frames() { return frames; },
+        get sampleRate() { return sampleRate; },
+        get channels() { return channels; },
+        push(bytes, end) {
+            give(bytes);
+            if (end) x.rtd_in_end();
+            const out: Float32Array[][] = [];
+            if (!opened) {
+                if (!end && x.rtd_in_ahead() < guard) return out;
+                if (x.rtd_open(FLAC, step) !== 0) throw new Error('not a flac run');
+                opened = true;
+                channels = x.rtd_channels();
+                sampleRate = x.rtd_rate();
+            }
+            while (end || x.rtd_in_ahead() >= guard) {
+                const n = x.rtd_read();
+                if (n === 0) break;
+                if (n < 0) throw new Error(`flac run: decode failed (${n})`);
+                const planes = new Float32Array(x.memory.buffer, x.rtd_planes(), step * channels);
+                out.push(Array.from({ length: channels }, (_, c) => planes.slice(c * step, c * step + n)));
+                frames += n;
+            }
+            return out;
+        },
+    };
 }
 
 /** base64 → bytes (no Buffer, no atob dependency on the DOM's typing). */

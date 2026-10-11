@@ -27,57 +27,24 @@
    "channels": 2,
    "header": "T3B1c0hlYWQBAjgBgLsAAAAAAA=="
   },
-  "list": [
-   {
-    "index": 0,
-    "startFrame": 0,
-    "frames": 24000,
-    "range": [
-     137,
-     8180
-    ],
-    "tail": 47688
-   },
-   {
-    "index": 1,
-    "startFrame": 24000,
-    "frames": 24000,
-    "range": [
-     137,
-     16007
-    ],
-    "tail": 71688
-   },
-   {
-    "index": 2,
-    "startFrame": 48000,
-    "frames": 24000,
-    "range": [
-     137,
-     16007
-    ],
-    "tail": 47688
-   },
-   {
-    "index": 3,
-    "startFrame": 72000,
-    "frames": 24000,
-    "range": [
-     8180,
-     16305
-    ],
-    "tail": 24648
-   },
-   {
-    "index": 4,
-    "startFrame": 96000,
-    "frames": 333,
-    "range": [
-     8180,
-     16305
-    ],
-    "tail": 648
-   }
+  "ranges": [
+   137,
+   8180,
+   137,
+   16007,
+   137,
+   16007,
+   8180,
+   16305,
+   8180,
+   16305
+  ],
+  "tail": [
+   47688,
+   71688,
+   47688,
+   24648,
+   648
   ]
  },
  "peaks": {

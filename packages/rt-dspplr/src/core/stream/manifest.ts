@@ -1,6 +1,12 @@
 // ---------------------------------------------------------------------------
 // The prepared-audio manifest: what `prepareAudio()` writes and the stream
 // player reads. JSON, versioned. Specified in docs/manifest.md.
+//
+// The file holds each segment list as columns (ManifestSegmentsFile: the runs'
+// byte ranges, their tails…; where each segment sits follows from the grid),
+// a few KB where a list of objects took tens: it is what the player fetches
+// before anything plays. In memory (AudioManifest) the segments are a list of
+// objects. parseManifest() reads a file into that, serializeManifest() writes it.
 // ---------------------------------------------------------------------------
 
 export const MANIFEST_FORMAT = 'rtd-audio-manifest';
@@ -44,10 +50,12 @@ export interface ManifestSource {
  * [range[0], range[1]) are fetched and decoded as one run: it starts a little
  * early (a decoder's warm-up), and `tail` counts the run's samples from the
  * segment's first one to the run's end - counted from the end because a
- * decoder may give nothing for the run's first frame. `lead` frames of
- * silence come first (a stem that starts after A), `trail` frames of silence
- * last (a stem that ends before A); a segment the source does not reach is
- * silence (`range` null).
+ * decoder may give nothing for the run's first frame. `skip` counts the run's
+ * samples before the segment's first, as the run decodes from its start
+ * (`skip` + `tail` is all of them): with it a player plays the run as it
+ * arrives. `lead` frames of silence come first (a stem that starts after A),
+ * `trail` frames of silence last (a stem that ends before A); a segment the
+ * source does not reach is silence (`range` null).
  */
 export interface ManifestSegment {
     index: number;
@@ -56,6 +64,8 @@ export interface ManifestSegment {
     frames: number;
     range: [number, number] | null;
     tail: number;
+    /** MP3, FLAC and Opus runs: the run's samples before the segment's first. Absent: the run is decoded whole first. */
+    skip?: number;
     lead?: number;
     trail?: number;
 }
@@ -164,6 +174,31 @@ export interface ManifestStem {
 /** Named stems of a manifest (v3): key -> stem. See STEM_KEY_PATTERN. */
 export type ManifestStems = Record<string, ManifestStem>;
 
+/**
+ * A segment list as manifest.json holds it: per segment, in timeline order, one column each.
+ * The segments are the grid's (`framesPerSegment` each, the last one what is left of the
+ * timeline), so where each sits is not written.
+ */
+export interface ManifestSegmentsFile {
+    framesPerSegment: number;
+    source: ManifestSource;
+    /** Each segment's run, two numbers a segment: its bytes [start, end); [0, 0] for a segment that is silence. */
+    ranges: number[];
+    tail: number[];
+    /** MP3, FLAC, Opus. */
+    skip?: number[];
+    /** Present when a segment has some (a stem that starts after A, or ends before it). */
+    lead?: number[];
+    trail?: number[];
+    entries?: { url: string; bytes: number };
+}
+
+/** The manifest as manifest.json holds it: AudioManifest with its segment lists as columns. */
+export type ManifestFile = Omit<AudioManifest, 'segments' | 'stems'> & {
+    segments: ManifestSegmentsFile;
+    stems?: Record<string, Omit<ManifestStem, 'segments'> & { segments?: ManifestSegmentsFile }>;
+};
+
 export interface AudioManifest {
     /** Bumped on every rewrite of the manifest (a stem attached…). */
     revision?: number;
@@ -195,6 +230,8 @@ export interface AudioManifest {
         framesPerSegment: number;
         source: ManifestSource;
         list: ManifestSegment[];
+        /** MP3, FLAC, Opus: where runs may start inside the segments (entries.bin), for seeks. */
+        entries?: { url: string; bytes: number };
     };
     peaks: {
         url: string;
@@ -277,8 +314,15 @@ function checkSource(src: unknown, where: string): string | null {
     return null;
 }
 
-/** `sampleRate`: the timeline's, for the longest segment (MAX_SEGMENT_SECONDS). */
-function checkSegments(s: unknown, where: string, sampleRate: number): string | null {
+const isInts = (v: unknown, n: number): v is number[] => Array.isArray(v) && v.length === n && v.every((x) => isInt(x));
+const optInts = (v: unknown, n: number) => v === undefined || isInts(v, n);
+
+/**
+ * A segment list as the file holds it (ManifestSegmentsFile) on a timeline of `frames`:
+ * segments of at most MAX_SEGMENT_SECONDS at `sampleRate` (the timeline's), as many columns
+ * as segments, ranges within the source.
+ */
+function checkSegments(s: unknown, where: string, sampleRate: number, frames: number): string | null {
     if (!isObj(s)) return `${where} is missing`;
     if (!isInt(s.framesPerSegment, 1)) return `${where}.framesPerSegment must be a positive integer`;
     const most = MAX_SEGMENT_SECONDS * sampleRate;
@@ -286,45 +330,59 @@ function checkSegments(s: unknown, where: string, sampleRate: number): string | 
     const source = checkSource(s.source, `${where}.source`);
     if (source) return source;
     const bytes = (s.source as ManifestSource).bytes;
-    if (!Array.isArray(s.list)) return `${where}.list must be an array`;
-    for (const [i, seg] of s.list.entries()) {
-        if (!isObj(seg) || !isInt(seg.index) || !isInt(seg.startFrame) || !isInt(seg.frames) || !isInt(seg.tail) || !optInt(seg.lead) || !optInt(seg.trail)) {
-            return `${where}.list[${i}] needs index, startFrame, frames and tail (lead and trail counts)`;
-        }
-        if (seg.frames > most) return `${where}.list[${i}] is over ${MAX_SEGMENT_SECONDS} s (${seg.frames} frames)`;
-        if ((seg.lead ?? 0) + (seg.trail ?? 0) > seg.frames) return `${where}.list[${i}]: lead + trail exceed its frames`;
-        const r = seg.range;
-        if (r !== null && !(Array.isArray(r) && r.length === 2 && isInt(r[0]) && isInt(r[1]) && r[1] > r[0] && r[1] <= bytes)) {
-            return `${where}.list[${i}].range must be null or [start, end) within the source`;
-        }
+    if (s.entries !== undefined && !(isObj(s.entries) && isStr(s.entries.url) && isInt(s.entries.bytes))) return `${where}.entries needs url and bytes`;
+    const n = Math.ceil(frames / s.framesPerSegment);
+    if (n < 1) return `${where}: the timeline has no frames`;
+    if (!isInts(s.ranges, 2 * n)) return `${where}.ranges must be ${2 * n} counts (start and end of each of the ${n} segments)`;
+    if (!isInts(s.tail, n)) return `${where}.tail must be ${n} counts`;
+    if (!optInts(s.skip, n) || !optInts(s.lead, n) || !optInts(s.trail, n)) return `${where}: skip, lead and trail must be ${n} counts each`;
+    for (let i = 0; i < n; i += 1) {
+        const length = Math.min(s.framesPerSegment, frames - i * s.framesPerSegment);
+        if ((s.lead?.[i] ?? 0) + (s.trail?.[i] ?? 0) > length) return `${where}: segment ${i}'s lead + trail exceed its frames`;
+        const a = s.ranges[2 * i];
+        const b = s.ranges[2 * i + 1];
+        if (!(a === 0 && b === 0) && !(b > a && b <= bytes)) return `${where}: segment ${i}'s range must be [0, 0] (silence) or [start, end) within the source`;
     }
     return null;
 }
 
-/**
- * Segments that tile the timeline: in order from frame 0, back to back, none
- * empty, ending at `frames` (docs/manifest.md; the schema cannot say it).
- */
-function checkTiling(list: ManifestSegment[], frames: number, where: string): string | null {
-    if (list.length === 0) return `${where}.list is empty`;
-    let next = 0;
-    for (const [i, seg] of list.entries()) {
-        if (seg.index !== i) return `${where}.list[${i}].index must be ${i}`;
-        if (seg.startFrame !== next) return `${where}.list[${i}] must start at frame ${next} (segments tile the timeline)`;
-        if (seg.frames < 1) return `${where}.list[${i}] is empty`;
-        next += seg.frames;
+/** A file's segment list (checked) as a list of segments. */
+function segmentsFromFile(s: ManifestSegmentsFile, frames: number): AudioManifest['segments'] {
+    const n = Math.ceil(frames / s.framesPerSegment);
+    const list: ManifestSegment[] = [];
+    for (let i = 0; i < n; i += 1) {
+        const startFrame = i * s.framesPerSegment;
+        const a = s.ranges[2 * i];
+        const b = s.ranges[2 * i + 1];
+        const lead = s.lead?.[i] ?? 0;
+        const trail = s.trail?.[i] ?? 0;
+        list.push({
+            index: i,
+            startFrame,
+            frames: Math.min(s.framesPerSegment, frames - startFrame),
+            range: a === 0 && b === 0 ? null : [a, b],
+            tail: s.tail[i],
+            ...(s.skip ? { skip: s.skip[i] } : {}),
+            ...(lead ? { lead } : {}),
+            ...(trail ? { trail } : {}),
+        });
     }
-    if (next !== frames) return `${where} cover ${next} frames, the timeline has ${frames}`;
-    return null;
+    const { ranges: _r, tail: _t, skip: _s, lead: _l, trail: _tr, ...rest } = s;
+    return { ...rest, list };
 }
 
-/** A ready stem's segments sit on A's grid: the same frames in the same places. */
-function checkGrid(list: ManifestSegment[], grid: ManifestSegment[], where: string): string | null {
-    if (list.length !== grid.length) return `${where} has ${list.length} segments, A has ${grid.length} (stems are on A's grid)`;
-    for (const [i, seg] of list.entries()) {
-        if (seg.startFrame !== grid[i].startFrame || seg.frames !== grid[i].frames) return `${where}.list[${i}] is off A's grid`;
-    }
-    return null;
+/** A segment list as the file holds it: the columns; skip, lead and trail only when a segment has them. */
+function segmentsToFile(s: AudioManifest['segments']): ManifestSegmentsFile {
+    const { list, ...rest } = s;
+    const out: ManifestSegmentsFile = {
+        ...rest,
+        ranges: list.flatMap((seg) => seg.range ?? [0, 0]),
+        tail: list.map((seg) => seg.tail),
+    };
+    if (list.some((seg) => seg.skip !== undefined)) out.skip = list.map((seg) => seg.skip ?? 0);
+    if (list.some((seg) => seg.lead)) out.lead = list.map((seg) => seg.lead ?? 0);
+    if (list.some((seg) => seg.trail)) out.trail = list.map((seg) => seg.trail ?? 0);
+    return out;
 }
 
 function checkPeaks(p: unknown, where: string): string | null {
@@ -422,16 +480,14 @@ export function manifestProblem(value: unknown): string | null {
     if (!isObj(src) || !(src.name === null || isStr(src.name)) || !isInt(src.bytes) || !isStr(src.encoding) || !isInt(src.bitsPerSample, 1) || !isInt(src.frames)) {
         return 'Manifest is missing required fields (source)';
     }
-    const problem = checkSegments(m.segments, 'segments', m.sampleRate) ?? checkPeaks(m.peaks, 'peaks') ?? checkLoudness(m.loudness, 'loudness')
+    const problem = checkSegments(m.segments, 'segments', m.sampleRate, m.frames) ?? checkPeaks(m.peaks, 'peaks') ?? checkLoudness(m.loudness, 'loudness')
         ?? checkBlock(m.bands, 'bands', 'rtd-bands') ?? checkBlock(m.spectrogram, 'spectrogram', 'rtd-spectrogram');
     if (problem) return problem;
-    const a = (m.segments as AudioManifest['segments']).source;
+    const a = (m.segments as ManifestSegmentsFile).source;
     if (a.sampleRate !== m.sampleRate || a.channels !== m.channels) {
         return `segments.source decodes to ${a.sampleRate} Hz, ${a.channels} channel(s); the timeline is ${m.sampleRate} Hz, ${m.channels}`;
     }
-    const grid = (m.segments as AudioManifest['segments']).list;
-    const tiling = checkTiling(grid, m.frames, 'segments');
-    if (tiling) return tiling;
+    const grid = (m.segments as ManifestSegmentsFile).framesPerSegment;
     if (m.stems !== undefined) {
         if (!isObj(m.stems)) return 'stems must be an object of named stems';
         const seen = new Set<string>();
@@ -453,14 +509,13 @@ export function manifestProblem(value: unknown): string | null {
             if (fields) return fields;
             // The blocks are checked whenever present; a ready stem must have segments and peaks.
             if (stem.status === 'ready' && (stem.segments === undefined || stem.peaks === undefined)) return `${where} is ready but has no segments or peaks`;
-            const p = (stem.segments === undefined ? null : checkSegments(stem.segments, `${where}.segments`, m.sampleRate))
+            const p = (stem.segments === undefined ? null : checkSegments(stem.segments, `${where}.segments`, m.sampleRate, m.frames))
                 ?? (stem.peaks === undefined ? null : checkPeaks(stem.peaks, `${where}.peaks`))
                 ?? checkBlock(stem.bands, `${where}.bands`, 'rtd-bands') ?? checkBlock(stem.spectrogram, `${where}.spectrogram`, 'rtd-spectrogram');
             if (p) return p;
             if (stem.status === 'ready') {
-                const segments = stem.segments as AudioManifest['segments'];
-                const g = checkGrid(segments.list, grid, `${where}.segments`);
-                if (g) return g;
+                const segments = stem.segments as ManifestSegmentsFile;
+                if (segments.framesPerSegment !== grid) return `${where}.segments is off A's grid (framesPerSegment ${segments.framesPerSegment}, A's ${grid})`;
                 // Played under A: at A's rate, on A's channels or on all of them from one.
                 const s = segments.source;
                 if (s.sampleRate !== m.sampleRate || (s.channels !== m.channels && s.channels !== 1)) {
@@ -473,9 +528,27 @@ export function manifestProblem(value: unknown): string | null {
 }
 
 /** Throws when `value` is not a manifest this version can play (see manifestProblem()). */
-export function assertManifest(value: unknown): asserts value is AudioManifest {
+export function assertManifest(value: unknown): asserts value is ManifestFile {
     const problem = manifestProblem(value);
     if (problem) throw new Error(problem);
+}
+
+/** A manifest file (what JSON makes of manifest.json), checked (assertManifest()), with its segment lists as lists. */
+export function parseManifest(value: unknown): AudioManifest {
+    assertManifest(value);
+    const stems = value.stems
+        ? Object.fromEntries(Object.entries(value.stems).map(([key, stem]) => [key, stem.segments ? { ...stem, segments: segmentsFromFile(stem.segments, value.frames) } : (stem as ManifestStem)]))
+        : undefined;
+    return { ...value, segments: segmentsFromFile(value.segments, value.frames), ...(stems ? { stems } : {}) } as AudioManifest;
+}
+
+/** The text of manifest.json for `manifest`: its segment lists as columns, no white space. */
+export function serializeManifest(manifest: AudioManifest): string {
+    const stems = manifest.stems
+        ? Object.fromEntries(Object.entries(manifest.stems).map(([key, stem]) => [key, stem.segments ? { ...stem, segments: segmentsToFile(stem.segments) } : stem]))
+        : undefined;
+    const file: ManifestFile = { ...manifest, segments: segmentsToFile(manifest.segments), ...(stems ? { stems } : {}) } as ManifestFile;
+    return JSON.stringify(file);
 }
 
 /** Keys of the manifest's stems that are ready to play, in manifest order. */

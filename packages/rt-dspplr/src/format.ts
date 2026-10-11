@@ -21,6 +21,8 @@ export {
     DEFAULT_STEM_KEY,
     assertManifest,
     manifestProblem,
+    parseManifest,
+    serializeManifest,
     isStemKey,
     assertStemKey,
     readyStemKeys,
@@ -48,9 +50,21 @@ export {
     decodeOpusRun,
     oggPackets,
     opusHead,
+    openRunStream,
+    mp3FrameBytes,
     base64Bytes,
     type DecodedRun,
+    type RunStream,
 } from './core/stream/sourceRuns';
+
+// ---- where runs may start inside segments (entries.bin) ------------------------------------
+export {
+    encodeEntriesFile,
+    decodeEntriesFile,
+    ENTRIES_MAGIC,
+    ENTRIES_VERSION,
+    type SegmentEntry,
+} from './core/stream/entriesFile';
 
 // ---- binary overview files ---------------------------------------------------------------
 export {

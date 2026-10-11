@@ -6,11 +6,14 @@ import type { SpectralPyramid } from '../spectrogram/protocol';
 import type { WaveformPeakLevel, WaveformPeakPyramid } from '../waveform/pyramid';
 import { decodeBandsFile, type BandsFile } from '../stream/bandsFile';
 import { FileAccess, SourceError } from '../stream/fileAccess';
-import { assertManifest, DEFAULT_STEM_KEY, readyStemKeys, type AudioManifest, type ManifestSegment, type ManifestStem, type ManifestStems } from '../stream/manifest';
+import { DEFAULT_STEM_KEY, parseManifest, readyStemKeys, type AudioManifest, type ManifestSegment, type ManifestStem, type ManifestStems } from '../stream/manifest';
 import { mixGains, type MixLaw } from '../controls';
 import { decodePeaksFile, peaksToPyramid, readLevel, type PeaksFile } from '../stream/peaksFile';
+import { decodeEntriesFile } from '../stream/entriesFile';
 import { SegmentScheduler } from '../stream/SegmentScheduler';
 import { SegmentStore, type SegmentStoreStats } from '../stream/SegmentStore';
+import { warmDecoder } from '../stream/RunDecoder';
+import { LinkPriority } from '../stream/linkPriority';
 import { loadStreamEngine, StreamEngine, type EngineReport, type EngineStem } from '../engine/StreamEngine';
 import { engineWindow } from '../engine/engineWindow';
 import { decodeSpectrogramFile, toSpectralPyramid, type SpectrogramFile } from '../stream/spectrogramFile';
@@ -110,6 +113,8 @@ const LOOKAHEAD = 0.025;
 const PUMP_MS = 40;
 /** Views up to this long get their segments decoded for exact previews. */
 export const WINDOW_MAX_SECONDS = 20;
+/** What the playhead reads before it plays on after a start or a seek: the engine's margin (0.5 s) and some to spare. */
+const PLAYHEAD_SECONDS = 0.75;
 /** The decoded window covers the view and a quarter of it each side: at most this many seconds of segments. */
 const WINDOW_MAX_COVER_SECONDS = WINDOW_MAX_SECONDS * 1.5;
 /** Failures in a row after which a segment counts as broken (the store keeps retrying, slowly). */
@@ -142,6 +147,8 @@ export class SegmentedSource implements PlaybackSource {
     private _engPlaying = false;
     // ---- stem B (manifest v3) ----
     private _storeB: SegmentStore | null = null;
+    /** The clip's fetches the playhead waits for, A's and the stem's: the rest give way to them. */
+    private _priority = new LinkPriority();
     private _stemB: ManifestStem | null = null;
     /** Key of the stem the knob blends with (null: none); and the one the host asked for. */
     private _stemKey: string | null = null;
@@ -311,12 +318,12 @@ export class SegmentedSource implements PlaybackSource {
             const files = new FileAccess(url, { fetchOptions, fetchOptionsOrigins, signal: abort.signal });
             const response = await fetch(url, files.init(url));
             if (!response.ok) throw new Error(`Manifest: HTTP ${response.status}`);
-            const manifest: unknown = await response.json();
-            assertManifest(manifest);
+            const manifest = parseManifest(await response.json());
             files.check(manifest);
             if (loadId !== this._loadId) return false;
             this._manifest = manifest;
             this._files = files;
+            warmDecoder(manifest.segments.source);
             this._overviewA = this._loadOverview(loadId);
             const start = clampTime(startAt ?? 0, manifest.duration);
             this._pausedFrame = this._frameOf(start);
@@ -328,12 +335,15 @@ export class SegmentedSource implements PlaybackSource {
             if (!out || loadId !== this._loadId) return false;
             this._engine = out.engine;
             const cacheSeconds = this._options.cacheSeconds ?? 60;
+            this._priority = new LinkPriority();
             this._store = new SegmentStore(files, manifest, {
                 maxBytes: Math.max(1, cacheSeconds) * manifest.sampleRate * manifest.channels * 4,
+                priority: this._priority,
             });
             this._store.onLoad((index) => this._onSegment(index));
-            this._store.onPartial((index, offset, planes, total) => this._onPart('a', index, offset, planes, total));
+            this._store.onPartial((index) => this._onPart('a', index));
             this._store.onError((index, error, failures) => this._onSegmentError(index, error, failures));
+            void this._loadEntries(loadId, manifest.segments, this._store);
             this._scheduler = new SegmentScheduler(out.ctx, out.input, manifest.segments.list, manifest.sampleRate);
             this._scheduler.setRate(this._state.processing.speed);
             await this._createEngine(out.ctx, out.input, manifest, loadId);
@@ -509,8 +519,7 @@ export class SegmentedSource implements PlaybackSource {
         try {
             const response = await fetch(files.manifestUrl, files.init(files.manifestUrl, { cache: 'no-store' }));
             if (!response.ok) return;
-            const next: unknown = await response.json();
-            assertManifest(next);
+            const next = parseManifest(await response.json());
             if (loadId !== this._loadId || (next.revision ?? 1) <= (m.revision ?? 1)) return;
             // Another recording (or another grid) behind the URL is no newer revision of this clip: keep what plays.
             if (next.id !== m.id || next.sampleRate !== m.sampleRate || next.channels !== m.channels || !SegmentedSource._sameGrid(next.segments.list, m.segments.list)) {
@@ -624,15 +633,18 @@ export class SegmentedSource implements PlaybackSource {
         const files = this._files;
         if (stem?.status === 'ready' && stem.segments && files && (was?.status !== 'ready' || !this._storeB || replaced)) {
             const shim = { ...manifest, segments: stem.segments } as AudioManifest;
+            warmDecoder(stem.segments.source);
             this._storeB?.dispose();
             this._storeB = new SegmentStore(files, shim, {
                 maxBytes: Math.max(1, this._options.cacheSeconds ?? 60) * manifest.sampleRate * manifest.channels * 4,
+                priority: this._priority,
             });
             this._storeB.onError((index, error, failures) => {
                 // A source that cannot be read (SourceError) is let go at once: retries would not help.
                 if (error instanceof SourceError || failures >= SEGMENT_FAILURES_MAX) this._failStemB(index, error);
             });
-            this._storeB.onPartial((index, offset, planes, total) => this._onPart('b', index, offset, planes, total));
+            this._storeB.onPartial((index) => this._onPart('b', index));
+            void this._loadEntries(this._loadId, stem.segments, this._storeB);
             this._storeB.onLoad((index) => {
                 if (this._eng && this._bWanted()) this._feedEngine(this._wantedEngine(this._engPlaying ? this._eng.position() : this._pausedFrame));
                 if (this._visible.includes(index)) this._host.emit('sourceupdate', { clipId: this._clipId, what: 'segment' });
@@ -804,7 +816,9 @@ export class SegmentedSource implements PlaybackSource {
         this._visible = visible;
         const fetch = () => {
             if (this._visible !== visible || this._store !== store) return;
-            for (const i of visible) if (!store.has(i)) void store.load(i, true);
+            // Not urgent: the playhead's segments come first, and the window of a short clip is
+            // all of it.
+            for (const i of visible) if (!store.has(i)) void store.load(i);
         };
         // After the overview's first levels: the whole picture first, then its close-up.
         if (this._overviewFirstIn) fetch();
@@ -905,18 +919,34 @@ export class SegmentedSource implements PlaybackSource {
         return { buffer: await response.arrayBuffer(), partial: response.status === 206 };
     }
 
-    /** Resolves once no segment the playhead waits for is on its way (A's, or the stem's). */
-    private async _audioIdle(): Promise<void> {
-        for (;;) {
-            const busy = [this._store, this._storeB].find((store) => store?.urgentBusy);
-            if (!busy) return;
-            await busy.idle();
+    /**
+     * Where seeks may start inside a source's segments (entries.bin: MP3, FLAC, Opus), handed to its
+     * store: after the overview's first levels, behind the audio. Without them a seek fetches its
+     * segment from the start.
+     */
+    private async _loadEntries(loadId: number, segments: AudioManifest['segments'], store: SegmentStore): Promise<void> {
+        const entries = segments.entries;
+        const files = this._files;
+        if (!entries || !files) return;
+        await this._overviewFirst;
+        if (loadId !== this._loadId || store.broken) return;
+        try {
+            const got = await this._fetchBehindAudio(loadId, files, files.resolve(entries.url), 0, entries.bytes - 1);
+            if (!got || loadId !== this._loadId) return;
+            store.setEntries(decodeEntriesFile(got.buffer, segments.list.map((seg) => seg.range?.[0] ?? null)));
+        } catch (error) {
+            if (loadId === this._loadId) console.warn('[AudioPlayer] no entries inside the segments; seeks fetch from their starts', error);
         }
+    }
+
+    /** Resolves once no segment the playhead waits for is on its way (A's, or the stem's). */
+    private _audioIdle(): Promise<void> {
+        return this._priority.idle();
     }
 
     /** Whether a segment the playhead waits for is on its way (A's, or the stem's). */
     private _audioWaiting(): boolean {
-        return !!(this._store?.urgentBusy || this._storeB?.urgentBusy);
+        return this._priority.busy();
     }
 
     /**
@@ -1470,6 +1500,13 @@ export class SegmentedSource implements PlaybackSource {
         });
         const wanted = this._wantedEngine(frame);
         this._store?.cancelExcept(new Set(wanted));
+        // The stem's too: a fetch for the old playhead (a prefetch the knob never asked for)
+        // would share the new one's bandwidth.
+        this._storeB?.cancelExcept(new Set(this._bWanted() ? wanted : wanted.slice(0, 1)));
+        // What the old playhead waited for and is still wanted (on screen, ahead) is no longer
+        // urgent: it gives way to the new one's.
+        this._store?.relaxExcept(new Set());
+        this._storeB?.relaxExcept(new Set());
         if (!(await ctxEngine.resume()) || playId !== this._playId || this._disposed) {
             if (playId === this._playId) this._update({ isPlaying: false, buffering: false });
             return false;
@@ -1541,36 +1578,84 @@ export class SegmentedSource implements PlaybackSource {
     }
 
     /**
-     * A part of a segment whose bytes are still coming (a WAV source): to the engine, which plays
-     * as far as the parts reach, when the engine reads that segment and the part is the next one.
+     * A part of a segment whose bytes are still coming: to the engine, which plays as far as the
+     * parts reach, when the engine reads that segment (the store keeps what has arrived: see
+     * _feedArrived).
      */
-    private _onPart(stem: EngineStem, index: number, offset: number, planes: Float32Array[], total: number): void {
-        const engine = this._eng;
-        if (!engine || !this._engineWindow.includes(index)) return;
+    private _onPart(stem: EngineStem, index: number): void {
+        if (!this._eng || !this._engineWindow.includes(index)) return;
         if (stem === 'b' && !this._bWanted()) return;
-        const have = engine.partial(stem, index);
-        // A start afresh, unless the engine has the segment whole; else only the part that comes next.
-        if (offset === 0 ? engine.holds(stem, index) && have === null : have !== offset) return;
-        engine.feedPart(stem, index, offset, planes, total);
+        this._feedArrived(stem, stem === 'a' ? this._store : this._storeB, index);
     }
 
     /**
-     * A segment the engine still needs, or the rest of one it holds in parts: from the store's
-     * whole buffer, or fetched (true).
+     * The frames of segment `i` that have arrived and the engine does not hold yet: the next of
+     * the fill it holds, or a fill of their own (they begin elsewhere: a seek fetched them from an
+     * entry, or the engine holds none of the segment).
      */
-    private _feedSegment(stem: EngineStem, store: SegmentStore, i: number, fetch: boolean, urgent: boolean): void {
+    private _feedArrived(stem: EngineStem, store: SegmentStore | null, i: number): void {
+        const engine = this._eng;
+        if (!engine || !store) return;
+        // The engine has the segment whole: nothing to add.
+        if (engine.holds(stem, i) && engine.partial(stem, i) === null) return;
+        const arrived = store.arrived(i);
+        if (!arrived) return;
+        const from = engine.partialFrom(stem, i);
+        const to = engine.partial(stem, i);
+        const slice = (a: number, b: number) => arrived.planes.map((p) => p.slice(a, b));
+        if (from !== null && to !== null && from <= arrived.from && arrived.from <= to) {
+            if (arrived.to > to) engine.feedPart(stem, i, to, slice(to, arrived.to), arrived.total, false);
+        } else {
+            engine.feedPart(stem, i, arrived.from, slice(arrived.from, arrived.to), arrived.total, true);
+        }
+    }
+
+    /**
+     * A segment the engine still needs, or one it holds in parts: from the store's whole buffer
+     * (all of it, also over parts held: should they have come out wrong, they are replaced), or
+     * as far as it has arrived and fetched (true; `at`: the playhead waits for its frames from
+     * there, see SegmentStore.load).
+     */
+    private _feedSegment(stem: EngineStem, store: SegmentStore, i: number, fetch: boolean, urgent: boolean, at?: number): void {
         const engine = this._eng!;
-        const part = engine.partial(stem, i);
-        if (engine.holds(stem, i) && part === null) return;
+        if (engine.holds(stem, i) && engine.partial(stem, i) === null) return;
         const buffer = store.get(i);
         if (buffer) {
-            const from = part ?? 0;
-            const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c).slice(from));
-            if (part === null) engine.feed(stem, i, channels);
-            else engine.feedPart(stem, i, from, channels, buffer.length);
-        } else if (fetch) {
-            void store.load(i, urgent);
+            engine.feed(stem, i, Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c).slice()));
+            return;
         }
+        this._feedArrived(stem, store, i);
+        if (fetch) void store.load(i, urgent, at);
+    }
+
+    /**
+     * Where in segment `i` the playhead waits for frames, when it is in that segment: its frame,
+     * less what the stretcher reads behind it; else undefined.
+     */
+    private _playheadIn(i: number): number | undefined {
+        const engine = this._eng;
+        const m = this._manifest;
+        if (!engine || !m || !this._scheduler) return undefined;
+        const frame = Math.floor(this._engPlaying ? engine.position() : this._pausedFrame);
+        if (this._scheduler.segmentAt(frame) !== i) return undefined;
+        const history = Math.max(engine.stretch.latencyFrames, 0.25 * m.sampleRate);
+        return Math.max(0, frame - m.segments.list[i].startFrame - history);
+    }
+
+    /**
+     * The segments the playhead reads before it plays on (a start or a seek waits for them): its
+     * own, and the next ones the start's margin (and a little more) reaches into, at the speed.
+     */
+    private _playheadSegments(): number[] {
+        const engine = this._eng;
+        const m = this._manifest;
+        const scheduler = this._scheduler;
+        if (!engine || !m || !scheduler) return [];
+        const frame = Math.floor(this._engPlaying ? engine.position() : this._pausedFrame);
+        const ahead = Math.min(m.frames - 1, frame + Math.ceil(PLAYHEAD_SECONDS * m.sampleRate * Math.max(1, this._state.processing.speed)));
+        const out: number[] = [];
+        for (let i = scheduler.segmentAt(Math.min(frame, m.frames - 1)); i <= scheduler.segmentAt(ahead); i += 1) out.push(i);
+        return out;
     }
 
     /** Hand the engine what it should hold and is in memory; fetch the rest; drop the others. */
@@ -1578,28 +1663,52 @@ export class SegmentedSource implements PlaybackSource {
         const engine = this._eng;
         const store = this._store;
         if (!engine || !store) return;
-        // The playhead's segment first, alone (until it is whole, when it arrives in parts): the
-        // others would share its bandwidth on a seek.
-        const first = wanted[0];
-        if (first !== undefined && (!engine.holds('a', first) || engine.partial('a', first) !== null) && !store.has(first)) {
-            void store.load(first, true);
+        // What the playhead reads first, alone (until it is in, when it arrives in parts): its
+        // segment, and the next while the start's margin reaches into it; of A and, while the knob
+        // is towards it, of stem B. The others would share their bandwidth on a seek, and the stem
+        // would wait for A's next segments. (Not while B is only kept after the knob came back to
+        // 0: A's would get half the bandwidth for a stem nobody hears.)
+        const blending = this._mix > 0 ? this._storeB : null;
+        const playing = this._playheadSegments().filter((i) => wanted.includes(i));
+        const at = (i: number) => (i === playing[0] ? this._playheadIn(i) : undefined);
+        // Missing for the playhead: the engine lacks frames of it from where the playhead reads
+        // (a fill from an entry before that, to the segment's end, is all it needs; the segment
+        // whole then comes behind the rest).
+        const missing = (stem: EngineStem, s: SegmentStore, i: number) => {
+            if (s.has(i)) return false;
+            if (!engine.holds(stem, i)) return true;
+            const to = engine.partial(stem, i);
+            if (to === null) return false;
+            return !((engine.partialFrom(stem, i) ?? 0) <= (at(i) ?? 0) && to >= this._manifest!.segments.list[i].frames);
+        };
+        const lacking = playing.filter((i) => missing('a', store, i) || (blending && missing('b', blending, i)));
+        if (lacking.length > 0) {
+            for (const i of lacking) {
+                this._feedSegment('a', store, i, true, true, at(i));
+                if (blending) this._feedSegment('b', blending, i, true, true, at(i));
+            }
             return;
         }
         // Fetch only what the store can keep: more would be evicted and fetched again.
         const fetchable = new Set(store.withinBudget(wanted.filter((i) => !engine.holds('a', i) || engine.partial('a', i) !== null)));
-        for (const i of wanted) this._feedSegment('a', store, i, fetchable.has(i), i === wanted[0]);
+        for (const i of wanted) this._feedSegment('a', store, i, fetchable.has(i), false);
         // Stem B only while the mix wants it: the playhead's segments first. Before the knob moves
         // (prefetchStem), its segment at the playhead, once A's are in: the first move plays at once.
         const storeB = this._storeB;
         if (!storeB) return;
         if (!this._bWanted()) {
             // The playhead's own segment (`wanted` may be one segment that just arrived).
-            const at = this._scheduler?.segmentAt(Math.floor(this._engPlaying ? engine.position() : this._pausedFrame));
-            if (this._options.prefetchStem !== false && at !== undefined && !store.urgentBusy && !storeB.has(at) && !storeB.isLoading(at)) void storeB.load(at);
+            const here = this._scheduler?.segmentAt(Math.floor(this._engPlaying ? engine.position() : this._pausedFrame));
+            if (this._options.prefetchStem !== false && here !== undefined && !this._priority.busy() && !storeB.has(here) && !storeB.isLoading(here)) void storeB.load(here);
             return;
         }
         const fetchableB = new Set(storeB.withinBudget(wanted.filter((i) => !engine.holds('b', i) || engine.partial('b', i) !== null)));
-        for (const i of wanted) this._feedSegment('b', storeB, i, fetchableB.has(i), i === wanted[0]);
+        // Its segments at the playhead come first once A's are in, from where the playhead reads
+        // (the knob moved a moment ago: the next move should play at once).
+        for (const i of wanted) {
+            const here = playing.includes(i) && missing('b', storeB, i);
+            this._feedSegment('b', storeB, i, fetchableB.has(i) || here, here, here ? at(i) : undefined);
+        }
     }
 
     private _pumpEngine(): void {

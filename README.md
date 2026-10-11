@@ -32,8 +32,36 @@ are included.
 Short files are decoded whole in the browser. Long ones, up to hours, can be
 **prepared once on your server** with the same package (in Node) and then
 streamed: the whole waveform and spectrogram appear at once, only the audio
-around the playhead is downloaded (a WAV starts playing while it downloads),
+around the playhead is downloaded (and starts playing while it downloads, in every format),
 and the first move of the slider to the other version is heard at once.
+
+## How it works
+
+```
+ SERVER, once per recording (rtd-prepare)       BROWSER (@saitdigital/rt-dspplr)
+ ──────────────────────────────────────────     ────────────────────────────────────────
+  recording + versions (stems)                   play({ manifest })
+    │ decode, analyse, align the stems             1. manifest.json (13-17 KB / 30 min)
+    ▼                                              2. coarsest pictures: whole timeline drawn
+  peaks.bin  bands.bin  spectrogram.bin            3. the segment at the playhead first,
+    │                                                 by Range; plays as its bytes arrive
+    ▼                                              4. a seek fetches from the playhead
+  index of the original file:                      5. the rest behind it, giving way
+    segments of ~192 KB, entry points every          │
+    0.5 s (entries.bin); checked sample by           ▼
+    sample against the player's decode           AudioWorklet engine: A + stem from the
+    │                                              same sample, the slider's mix, speed
+    ▼                                              (tonal: Signalsmith, attacks: overlap-add),
+  manifest.json + .bin files + the original      resampled to the sound card
+  file, as it was ─── plain HTTP, Range ───▶       │
+                                                   ▼
+                                                 effects → ceiling → speakers
+```
+
+Nothing is converted: the player fetches parts of the original file by HTTP Range requests,
+decodes them as they arrive (WAV, MP3, FLAC, Ogg Opus) and plays as soon as half a second is in.
+Over 2 Mbit/s, 30 minutes with a stem start in 0.35-0.52 s and seek anywhere in 0.11-0.18 s.
+The whole pipeline, step by step: [docs/how-it-works.md](docs/how-it-works.md).
 
 ## The package
 
@@ -166,6 +194,7 @@ player side.
 
 ## Documentation
 
+- [How it works: the pipeline from the server to the speakers](docs/how-it-works.md)
 - [API, React examples, themes, browser support and memory](packages/rt-dspplr/README.md)
 - [Preparing long recordings](packages/rt-dspplr/PREPARE.md) and [the manifest format](docs/manifest.md)
 - [Speed and time stretch](packages/rt-dspplr/README.md#speed-and-time-stretch)

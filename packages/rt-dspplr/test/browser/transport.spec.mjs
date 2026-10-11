@@ -189,7 +189,7 @@ test('a segment that keeps failing pauses with an error and is not requested on 
     let hits = 0;
     // Segment 3's Range request of the source fails; the others go through.
     const manifest = JSON.parse(fs.readFileSync(path.join(FIXTURES, 'stereo70', 'manifest.json'), 'utf8'));
-    const [start, end] = manifest.segments.list[3].range;
+    const [start, end] = manifest.segments.ranges.slice(6, 8); // segment 3's run
     await page.route('**/stereo70/source.wav', (route) => {
         if (route.request().headers().range !== `bytes=${start}-${end - 1}`) return route.continue();
         hits += 1;

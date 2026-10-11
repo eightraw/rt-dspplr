@@ -93,8 +93,8 @@ export class StreamEngine {
     private readonly _scale: number;
     private _loop: { start: number; end: number } | null = null;
     private readonly _sent: Record<EngineStem, Set<number>> = { a: new Set(), b: new Set() };
-    /** Segments handed in parts that are not whole yet: frames handed so far. */
-    private readonly _parts: Record<EngineStem, Map<number, number>> = { a: new Map(), b: new Map() };
+    /** Segments handed in parts that are not whole yet: the frames handed so far, [from, to). */
+    private readonly _parts: Record<EngineStem, Map<number, { from: number; to: number }>> = { a: new Map(), b: new Map() };
     private _stretchState: { ready: boolean; latencyFrames: number; error?: string; reused?: boolean } = { ready: false, latencyFrames: 0 };
     onReport: ((report: EngineReport) => void) | null = null;
     onEnded: (() => void) | null = null;
@@ -168,20 +168,27 @@ export class StreamEngine {
 
     /**
      * Hand the engine a part of a segment whose bytes are still coming: its frames from `offset`
-     * (0 starts it afresh) of `total` (the arrays are transferred). The engine plays as far as
-     * the parts reach and holds the playhead there.
+     * of `total` (the arrays are transferred), the next of its fill, or (`fresh`, and any part
+     * from 0) the first of a new one, which may start mid-segment. The engine plays the frames
+     * the fill holds and holds the playhead where they end.
      */
-    feedPart(stem: EngineStem, index: number, offset: number, channels: Float32Array[], total: number): void {
+    feedPart(stem: EngineStem, index: number, offset: number, channels: Float32Array[], total: number, fresh = offset === 0): void {
         this._sent[stem].add(index);
-        const now = offset + (channels[0]?.length ?? 0);
-        if (now >= total) this._parts[stem].delete(index);
-        else this._parts[stem].set(index, now);
-        this.post({ type: 'seg', stem, index, data: channels, offset, total }, channels.map((c) => c.buffer as ArrayBuffer));
+        const from = fresh ? offset : this._parts[stem].get(index)?.from ?? 0;
+        const to = offset + (channels[0]?.length ?? 0);
+        if (from === 0 && to >= total) this._parts[stem].delete(index);
+        else this._parts[stem].set(index, { from, to });
+        this.post({ type: 'seg', stem, index, data: channels, offset, total, fresh }, channels.map((c) => c.buffer as ArrayBuffer));
     }
 
-    /** Frames of a segment handed in parts so far, while it is not whole (null: whole, or not held). */
+    /** Where the next part of a segment handed in parts goes, while it is not whole (null: whole, or not held). */
     partial(stem: EngineStem, index: number): number | null {
-        return this._parts[stem].get(index) ?? null;
+        return this._parts[stem].get(index)?.to ?? null;
+    }
+
+    /** Where the frames of a segment handed in parts begin (0, or mid-segment after a seek; null: whole, or not held). */
+    partialFrom(stem: EngineStem, index: number): number | null {
+        return this._parts[stem].get(index)?.from ?? null;
     }
 
     /** Stem B is another stem now (or none): A plays on until the new B's segments arrive. */

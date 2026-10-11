@@ -49,6 +49,7 @@ function namedFiles(manifest: AudioManifest): Array<[string, string]> {
     const out: Array<[string, string]> = [];
     const blocks = (m: FileBlocks, where: string) => {
         if (m.segments) out.push([`${where}segments.source.url`, m.segments.source.url]);
+        if (m.segments?.entries) out.push([`${where}segments.entries.url`, m.segments.entries.url]);
         if (m.peaks) out.push([`${where}peaks.url`, m.peaks.url]);
         if (m.bands) out.push([`${where}bands.url`, m.bands.url]);
         if (m.spectrogram) out.push([`${where}spectrogram.url`, m.spectrogram.url]);

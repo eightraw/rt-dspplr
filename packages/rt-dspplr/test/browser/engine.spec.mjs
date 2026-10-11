@@ -44,7 +44,7 @@ test('engine output is sample-exact across segment boundaries and loop wraps', a
     const result = await page.evaluate(async () => {
         const sr = 48000;
         const ref = h.format.parseWavFile(await (await fetch(`${longBase}/mono30.wav`)).arrayBuffer()).channels[0];
-        const manifest = await (await fetch(`${longBase}/mono30/manifest.json`)).json();
+        const manifest = h.format.parseManifest(await (await fetch(`${longBase}/mono30/manifest.json`)).json());
         const segs = (await h.preparedSegments(`${longBase}/mono30`, manifest)).map((planes) => planes[0]);
         const skip = 192; // the 4 ms fade-in of a start
         // 1) From an odd frame across three 3 s boundaries.

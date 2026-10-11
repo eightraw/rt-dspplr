@@ -32,6 +32,7 @@ import {
 import { autoSegmentSeconds, storedRanges } from '../src/prepare/prepareAudio';
 import { readSegment } from '../src/prepare/sourceReader';
 import { deepestRun, indexSegments, mapSource } from '../src/prepare/sourceIndex';
+import { decodersModule } from '../src/prepare/wasm/decoders';
 import { main } from '../src/prepare/cli';
 import { multipartHead, redactUrl } from '../src/prepare/processors';
 import { designResampler, StreamingResampler } from '../src/prepare/resampler';
@@ -43,12 +44,15 @@ import manifestSchema from '@saitdigital/rt-dspplr/manifest.schema.json';
 // The formats come from the player package (one implementation for both).
 import {
     assertManifest,
+    serializeManifest,
     computeHighPassCoefficients,
     decodeBandsFile,
     decodePeaksFile,
     decodeSpectrogramFile,
     highPassEnergyRatio,
     HIGH_PASS_SECTION_Q,
+    decodeEntriesFile,
+    openRunStream,
     parseWavFile,
 } from '@saitdigital/rt-dspplr/format';
 
@@ -154,6 +158,76 @@ async function timelineAt(storage: { getObject(key: string): Promise<Uint8Array 
         planes.forEach((p, c) => out[c].set(p, seg.startFrame));
     }
     return out;
+}
+
+/**
+ * A whole timeline read back as a player streams it: each segment's run fed to openRunStream in
+ * pieces of 1 byte to 4 KB, its samples placed by `skip`. Every coded segment must have one.
+ */
+async function streamedTimelineAt(storage: { getObject(key: string): Promise<Uint8Array | null> }, segments: AudioManifest['segments'], channels: number): Promise<Float32Array[]> {
+    const source = segments.source;
+    const read = storedRanges(storage as never, source.url);
+    const header = source.header ? Buffer.from(source.header, 'base64') : undefined;
+    const frames = segments.list.reduce((n, seg) => n + seg.frames, 0);
+    const out = Array.from({ length: channels }, () => new Float32Array(frames));
+    const sizes = [1, 7, 333, 4096, 2];
+    for (const seg of segments.list) {
+        if (!seg.range) continue;
+        assert.ok(Number.isInteger(seg.skip), `segment ${seg.index} has a skip`);
+        const bytes = await read(seg.range[0], seg.range[1]);
+        const stream = await openRunStream(decodersModule(), source.codec as 'mp3' | 'flac' | 'opus', header);
+        const run = Array.from({ length: channels }, () => new Float32Array(seg.skip! + seg.tail));
+        let decoded = 0;
+        for (let o = 0, k = 0; o < bytes.length || k === 0; k += 1) {
+            const to = Math.min(bytes.length, o + sizes[k % sizes.length]);
+            for (const block of stream.push(bytes.subarray(o, to), to === bytes.length)) {
+                assert.ok(decoded + block[0].length <= run[0].length, `segment ${seg.index}: more samples than skip and tail`);
+                for (let c = 0; c < channels; c += 1) run[c].set(block[c % block.length], decoded);
+                decoded += block[0].length;
+            }
+            o = to;
+        }
+        assert.equal(decoded, seg.skip! + seg.tail, `segment ${seg.index}: skip and tail are the run`);
+        const lead = seg.lead ?? 0;
+        const count = Math.max(0, Math.min(seg.frames - lead - (seg.trail ?? 0), seg.tail));
+        for (let c = 0; c < channels; c += 1) out[c].set(run[c].subarray(seg.skip!, seg.skip! + count), seg.startFrame + lead);
+    }
+    return out;
+}
+
+/**
+ * Every entry of every segment (entries.bin) read back: its run from the entry's byte to the
+ * segment's end, decoded, its samples after `skip` placed from the entry's frame. The largest
+ * difference from `timeline` (the samples played), and how many entries there were.
+ */
+async function entriesAgainst(storage: { getObject(key: string): Promise<Uint8Array | null> }, segments: AudioManifest['segments'], channels: number, timeline: Float32Array[]): Promise<{ worst: number; count: number }> {
+    const source = segments.source;
+    assert.ok(segments.entries, 'the segments have entries');
+    const file = await storage.getObject(segments.entries!.url);
+    assert.ok(file && file.length === segments.entries!.bytes, 'entries.bin as the manifest says');
+    const all = decodeEntriesFile(file!.slice().buffer, segments.list.map((seg) => seg.range?.[0] ?? null));
+    const read = storedRanges(storage as never, source.url);
+    const header = source.header ? Buffer.from(source.header, 'base64') : undefined;
+    let worst = 0;
+    let count = 0;
+    for (const seg of segments.list) {
+        for (const e of all[seg.index]) {
+            const bytes = await read(e.byte, seg.range![1]);
+            const stream = await openRunStream(decodersModule(), source.codec as 'mp3' | 'flac' | 'opus', header);
+            const tail = seg.tail - (e.at - (seg.lead ?? 0));
+            let n = 0;
+            for (const block of stream.push(bytes, true)) {
+                for (let k = 0; k < block[0].length; k += 1, n += 1) {
+                    const at = e.at + n - e.skip;
+                    if (n < e.skip || at >= Math.min(seg.frames - (seg.trail ?? 0), e.at + tail)) continue;
+                    for (let c = 0; c < channels; c += 1) worst = Math.max(worst, Math.abs(block[c % block.length][k] - timeline[c][seg.startFrame + at]));
+                }
+            }
+            assert.equal(n, e.skip + tail, `segment ${seg.index}, entry at ${e.at}: skip and the rest are the run`);
+            count += 1;
+        }
+    }
+    return { worst, count };
 }
 
 /** The largest difference between two planar signals of the same shape. */
@@ -315,7 +389,9 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
     const viaFlac = await prepareMemory(flac, { segmentSeconds: 1 });
     const viaWav = await prepareMemory(encodeWav(src, rate, { tag: 1, bits: 16 }), { segmentSeconds: 1 });
     const keys = [...viaWav.storage.objects.keys()].filter((k) => k !== 'manifest.json' && k !== 'source.wav').sort();
-    assert.deepEqual([...viaFlac.storage.objects.keys()].filter((k) => k !== 'manifest.json' && k !== 'source.flac').sort(), keys);
+    // Besides the entries inside its segments, for seeks (a WAV's are any frame).
+    assert.deepEqual([...viaFlac.storage.objects.keys()].filter((k) => k !== 'manifest.json' && k !== 'source.flac' && k !== 'entries.bin').sort(), keys);
+    assert.ok(viaFlac.storage.objects.has('entries.bin') && !viaWav.storage.objects.has('entries.bin'), 'entries.bin for the FLAC, none for the WAV');
     for (const k of keys) assert.ok(Buffer.from(viaFlac.storage.objects.get(k)!).equals(Buffer.from(viaWav.storage.objects.get(k)!)), `${k}: FLAC and WAV prepare alike`);
     assert.ok(sameSamples(await timelineAt(viaFlac.storage, viaFlac.manifest.segments, 2), await timelineAt(viaWav.storage, viaWav.manifest.segments, 2)), 'FLAC and WAV play the same samples');
     const kept: Array<[string, Uint8Array]> = [
@@ -342,7 +418,12 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
         assert.ok(m.segments.list.every((seg) => seg.range && seg.range[1] - seg.range[0] < bytes.length), `${name}: ranges`);
         const { channels } = await decodeAll(builtinDecoder, chunks(bytes, 7, 65536));
         assert.equal(maxDiff(await timelineAt(storage, m.segments, 2), channels), 0, `${name}: every segment reads back the decoder's samples`);
-        assert.doesNotThrow(() => assertManifest(JSON.parse(JSON.stringify(m))), name);
+        assert.equal(maxDiff(await streamedTimelineAt(storage, m.segments, 2), channels), 0, `${name}: and the same as the bytes arrive`);
+        if (bytes === flac) {
+            const fromEntries = await entriesAgainst(storage, m.segments, 2, channels);
+            assert.ok(fromEntries.count > 0 && fromEntries.worst === 0, `${name}: every entry reads back the decoder's samples (${fromEntries.count}, off by ${fromEntries.worst})`);
+        }
+        assert.doesNotThrow(() => assertManifest(JSON.parse(serializeManifest(m))), name);
     }
     // A stream cut short after its header fails, it is not taken for a shorter one.
     await assert.rejects(decodeAll(builtinDecoder, chunks(flac.subarray(0, Math.floor(flac.length * 0.6)))), /FLAC stream is broken/);
@@ -403,10 +484,17 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
         assert.deepEqual(job.stats!.warnings, []);
         assert.ok(m.segments.list.length >= 6 && m.segments.list.every((seg) => seg.range && seg.range[1] - seg.range[0] < bytes.length), `${c.file}: ranges`);
         const { channels } = await decodeAll(builtinDecoder, chunks(bytes, 7, 4096));
-        const diff = maxDiff(await timelineAt(storage, m.segments, 2), channels);
+        const whole = await timelineAt(storage, m.segments, 2);
+        const diff = maxDiff(whole, channels);
         assert.ok(c.encoding === 'mp3' ? diff === 0 : diff < 1e-6, `${c.file}: every segment reads back the decoder's samples (off by ${diff})`);
+        assert.equal(maxDiff(await streamedTimelineAt(storage, m.segments, 2), whole), 0, `${c.file}: as the bytes arrive, the same samples`);
+        // From the entries inside 1 s segments: MP3 exactly, Opus within its pre-roll's tolerance.
+        const { manifest: m1, storage: s1 } = await prepareMemory(bytes, { segmentSeconds: 1 });
+        const fromEntries = await entriesAgainst(s1, m1.segments, 2, await timelineAt(s1, m1.segments, 2));
+        assert.ok(fromEntries.count > 0 && (c.encoding === 'mp3' ? fromEntries.worst === 0 : fromEntries.worst < 1e-4), `${c.file}: every entry reads back (${fromEntries.count}, off by ${fromEntries.worst})`);
+        notes.push(`${c.encoding} ${fromEntries.count} entries ${fromEntries.worst === 0 ? 'exact' : `within ${fromEntries.worst.toExponential(0)}`}`);
         notes.push(`${c.encoding} index ${diff === 0 ? 'exact' : `within ${diff.toExponential(0)}`}`);
-        assert.doesNotThrow(() => assertManifest(JSON.parse(JSON.stringify(m))), `${c.encoding} source`);
+        assert.doesNotThrow(() => assertManifest(JSON.parse(serializeManifest(m))), `${c.encoding} source`);
     }
     // Ogg that is not Opus (a Vorbis identification page): the hint to pass a decoder.
     const ascii = (t: string) => [...t].map((ch) => ch.charCodeAt(0));
@@ -432,6 +520,11 @@ function encodeFlac(channels: Float64Array[], rate: number, bits: 16 | 24, block
             assert.equal(m.segments.source.url, 'source.mp3', file);
             const diff = maxDiff(await timelineAt(storage, m.segments, channels.length), channels);
             assert.equal(diff, 0, `${file}, ${segmentSeconds} s segments: every segment reads back the decoder's samples (off by ${diff})`);
+            assert.equal(maxDiff(await streamedTimelineAt(storage, m.segments, channels.length), channels), 0, `${file}, ${segmentSeconds} s segments: the same as the bytes arrive`);
+            if (segmentSeconds === 1) {
+                const fromEntries = await entriesAgainst(storage, m.segments, channels.length, channels);
+                assert.ok(fromEntries.count > 0 && fromEntries.worst === 0, `${file}: every entry reads back the decoder's samples (${fromEntries.count}, off by ${fromEntries.worst})`);
+            }
         }
         // The index is checked on the segment whose run goes back furthest too, against a run from further back still.
         const map = await mapSource(fileURLToPath(new URL(file, fixtures)), format.layout!, format.sampleRate, format.channels, channels[0].length);
@@ -887,10 +980,14 @@ const RATE = 48000;
 const A40 = speechLike(RATE * 40, RATE, 1, 41);
 const A40wav = asWav16(A40, RATE);
 
-/** Every manifest the stem tests publish is checked against the shipped JSON Schema and assertManifest(). */
+/**
+ * Every manifest the stem tests publish is checked against the shipped JSON Schema and assertManifest(), as
+ * its file holds it (one in memory, with segment lists, written out first).
+ */
 const validateSchema = new Ajv2020({ allErrors: true, strict: false }).compile(manifestSchema as object);
 const schemaChecked: string[] = [];
-function checkManifest(m: unknown, name: string): void {
+function checkManifest(value: unknown, name: string): void {
+    const m = (value as AudioManifest).segments && 'list' in (value as AudioManifest).segments ? JSON.parse(serializeManifest(value as AudioManifest)) : value;
     const ok = validateSchema(m);
     assert.ok(ok, `${name}: schema: ${JSON.stringify(validateSchema.errors)}`);
     assert.doesNotThrow(() => assertManifest(m), `${name}: assertManifest`);

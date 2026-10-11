@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
-import { wavHeader16, type ManifestSegment, type ManifestSource, type SourceCodec } from '@saitdigital/rt-dspplr/format';
+import { wavHeader16, type ManifestSegment, type ManifestSource, type SegmentEntry, type SourceCodec } from '@saitdigital/rt-dspplr/format';
 import type { SourceLayout } from './decoder';
 import { wasmInt16 } from './wasm/kernels';
 
@@ -22,6 +22,13 @@ import { wasmInt16 } from './wasm/kernels';
 //   flac  whole frames, after the stream's fLaC and STREAMINFO (the header): a
 //         frame decodes on its own, so a run starts at the frame of its first
 //         sample
+//
+// MP3, Opus and FLAC segments also say how many of the run's samples come
+// before their first (`skip`), so a player places the samples as they arrive:
+// counted from the frame and page index (for MP3, which of a run's first frames
+// find their main data in it: mp3Decoded()). And where else a run may start
+// inside each segment, about every ENTRY_SECONDS (entries, for entries.bin):
+// a seek fetches from there instead of from the segment's start.
 // ---------------------------------------------------------------------------
 
 /**
@@ -37,6 +44,23 @@ const MP3_CHECK_MARGIN = 64;
  * left errors up to -35 dBFS (music, 40 ms pages); 240 ms, -81 dB; 400 ms, the same samples.
  */
 const OPUS_PREROLL = 24000;
+/** Seconds between the entries inside a segment (MP3, FLAC, Opus; see entries()). */
+export const ENTRY_SECONDS = 0.5;
+
+/**
+ * The frames inside segment `seg` an entry is wanted at, every ENTRY_SECONDS after its first
+ * sample: the segment's frame (`at`) and the source's sample (`s`) of each.
+ */
+function entryTargets(seg: ManifestSegment, offset: number, sampleRate: number): Array<{ at: number; s: number }> {
+    if (!seg.range) return [];
+    const lead = seg.lead ?? 0;
+    const s0 = Math.max(0, seg.startFrame + offset);
+    const count = seg.frames - lead - (seg.trail ?? 0);
+    const step = Math.max(1, Math.round(ENTRY_SECONDS * sampleRate));
+    const out: Array<{ at: number; s: number }> = [];
+    for (let k = step; k < count; k += step) out.push({ at: lead + k, s: s0 + k });
+    return out;
+}
 
 export interface SourceMap {
     /** What the manifest says about the file (its url and bytes are the caller's). */
@@ -45,11 +69,20 @@ export interface SourceMap {
     frames: number;
     /**
      * The bytes of a run holding samples [start, start + count) and how many of the run's samples, from `start` to its end,
-     * there are. `warmup`: codec frames the run starts before the frame of `start` (MP3).
+     * there are. `warmup`: codec frames the run starts before the frame of `start` (MP3). `skip`: the run's samples
+     * before `start` (FLAC, Opus; an MP3's come from fillSkips()).
      */
-    rangeFor(start: number, count: number): { range: [number, number]; tail: number; warmup?: number };
+    rangeFor(start: number, count: number): { range: [number, number]; tail: number; warmup?: number; skip?: number };
     /** A run of the same samples that starts much earlier: what a check of rangeFor()'s warm-up compares with (MP3). */
     referenceFor?(start: number, count: number): { range: [number, number]; tail: number };
+    /** Sets the segments' `skip` by decoding the first frames of each run (MP3: a frame whose main data lies before the run gives nothing). */
+    fillSkips?(list: ManifestSegment[]): Promise<void>;
+    /**
+     * Where a run may start inside each segment of `list` (whose sample `t + offset` plays at
+     * timeline frame t), about every ENTRY_SECONDS, each after the segment's own start: MP3,
+     * FLAC and Opus (a WAV's are any frame, worked out by the player).
+     */
+    entries?(list: ManifestSegment[], offset: number): Promise<SegmentEntry[][]>;
 }
 
 /** Whether the player decodes this layout itself (else the source is written as a WAV). */
@@ -112,10 +145,77 @@ export async function mapSource(file: string, layout: SourceLayout, sampleRate: 
             const runEnd = fl + 1 < table.count ? table.firstSample[fl + 1] : table.totalSamples;
             return { range: [table.offset[f0], end] as [number, number], tail: runEnd - r, warmup: f - f0 };
         };
+        /**
+         * The samples a fresh decoder gives for frames `from` to `to`: dr_mp3 (minimp3) decodes a
+         * frame once the reservoir it has kept holds the main_data_begin bytes the frame reaches
+         * back for, and keeps after a frame that gave nothing all its main data, up to 511 bytes;
+         * after the first frame that decodes, every one does.
+         */
+        const mp3Decoded = (from: number, to: number) => {
+            let reservoir = 0;
+            let decoded = 0;
+            let started = false;
+            for (let k = from; k <= to; k += 1) {
+                if (started || reservoir >= table.mainBegin[k]) {
+                    started = true;
+                    decoded += (k + 1 < table.count ? table.firstSample[k + 1] : table.totalSamples) - table.firstSample[k];
+                } else {
+                    reservoir = Math.min(511, Math.min(reservoir, table.mainBegin[k]) + table.mainBytes[k]);
+                }
+            }
+            return decoded;
+        };
+        /** The frame starting at byte `b` of the file (a run's first, or the one after its last). */
+        const frameAt = (b: number) => {
+            let lo = 0;
+            let hi = table.count - 1;
+            while (lo < hi) {
+                const mid = (lo + hi + 1) >> 1;
+                if (table.offset[mid] <= b) lo = mid;
+                else hi = mid - 1;
+            }
+            return lo;
+        };
         return {
             describe: { codec: 'mp3', sampleRate, channels },
             frames,
             rangeFor: (start, count) => run(start, count, runStart),
+            async entries(list, offset) {
+                return list.map((seg) => {
+                    const entries: SegmentEntry[] = [];
+                    let last = seg.range?.[0] ?? 0;
+                    for (const { at, s } of entryTargets(seg, offset, sampleRate)) {
+                        const r = s + delay;
+                        const f = frameOf(r);
+                        const f0 = runStart(f);
+                        if (table.offset[f0] <= last) continue;
+                        // As a segment's run: from f0, its samples to the end of the frame after r's.
+                        const upto = Math.min(table.count - 1, f + 1);
+                        const skip = mp3Decoded(f0, upto) - ((upto + 1 < table.count ? table.firstSample[upto + 1] : table.totalSamples) - r);
+                        if (skip < 0) continue;
+                        entries.push({ at, byte: table.offset[f0], skip });
+                        last = table.offset[f0];
+                    }
+                    return entries;
+                });
+            },
+            async fillSkips(list) {
+                // Up to the frame after the segment's first sample's: by then every frame gives its
+                // samples (the run's reservoir is full two frames before), so those the run's first
+                // frames give, less the ones from the segment's first on, are the ones before it.
+                for (const seg of list) {
+                    if (!seg.range) continue;
+                    const f0 = frameAt(seg.range[0]);
+                    const last = seg.range[1] >= table.end ? table.count - 1 : frameAt(seg.range[1]) - 1;
+                    const runEnd = last + 1 < table.count ? table.firstSample[last + 1] : table.totalSamples;
+                    const r = runEnd - seg.tail;
+                    const upto = Math.min(last, frameOf(r) + 1);
+                    const decoded = mp3Decoded(f0, upto);
+                    const skip = decoded - ((upto + 1 < table.count ? table.firstSample[upto + 1] : table.totalSamples) - r);
+                    if (skip < 0) throw new Error(`segment ${seg.index}: its run's first frames give ${decoded} samples, short of its first`);
+                    seg.skip = skip;
+                }
+            },
             referenceFor: (start, count) => {
                 const { range, tail } = run(start, count, (f) => {
                     const f0 = runStart(f);
@@ -161,8 +261,21 @@ export async function mapSource(file: string, layout: SourceLayout, sampleRate: 
                 const r = start + t.preSkip;
                 const p0 = firstPage(Math.max(0, r - OPUS_PREROLL));
                 const pl = lastPage(r + count);
-                return { range: [t.offset[p0], t.pageEnd[pl]], tail: t.endRaw[pl] - r };
+                return { range: [t.offset[p0], t.pageEnd[pl]], tail: t.endRaw[pl] - r, skip: r - t.runStart[p0] };
             },
+            // A run from a page OPUS_PREROLL before the target, as a segment's: one entry per page.
+            entries: async (list, offset) => list.map((seg) => {
+                const entries: SegmentEntry[] = [];
+                let last = seg.range?.[0] ?? 0;
+                for (const { at, s } of entryTargets(seg, offset, sampleRate)) {
+                    const r = s + t.preSkip;
+                    const p0 = firstPage(Math.max(0, r - OPUS_PREROLL));
+                    if (t.offset[p0] <= last) continue;
+                    entries.push({ at, byte: t.offset[p0], skip: r - t.runStart[p0] });
+                    last = t.offset[p0];
+                }
+                return entries;
+            }),
         };
     }
     if (layout.kind === 'flac') {
@@ -188,8 +301,21 @@ export async function mapSource(file: string, layout: SourceLayout, sampleRate: 
                 const f = frameOf(start);
                 const fl = frameOf(start + count - 1);
                 const last = fl + 1 >= t.count;
-                return { range: [t.offset[f], last ? t.end : t.offset[fl + 1]], tail: (last ? t.totalSamples : t.firstSample[fl + 1]) - start };
+                return { range: [t.offset[f], last ? t.end : t.offset[fl + 1]], tail: (last ? t.totalSamples : t.firstSample[fl + 1]) - start, skip: start - t.firstSample[f] };
             },
+            // A frame decodes on its own: an entry at the frame holding each target, from its first sample.
+            entries: async (list, offset) => list.map((seg) => {
+                const entries: SegmentEntry[] = [];
+                const s0 = Math.max(0, seg.startFrame + offset);
+                let last = seg.range?.[0] ?? 0;
+                for (const { s } of entryTargets(seg, offset, sampleRate)) {
+                    const f = frameOf(s);
+                    if (t.offset[f] <= last || t.firstSample[f] <= s0) continue;
+                    entries.push({ at: (seg.lead ?? 0) + t.firstSample[f] - s0, byte: t.offset[f], skip: 0 });
+                    last = t.offset[f];
+                }
+                return entries;
+            }),
         };
     }
     throw new Error(`no index for ${(layout as SourceLayout).kind} sources yet`);
@@ -212,8 +338,8 @@ export function indexSegments(frames: number, framesPerSegment: number, map: Sou
             continue;
         }
         const trail = length - lead - (s1 - s0);
-        const { range, tail } = map.rangeFor(s0, s1 - s0);
-        list.push({ index, startFrame: start, frames: length, range, tail, ...(lead ? { lead } : {}), ...(trail ? { trail } : {}) });
+        const { range, tail, skip } = map.rangeFor(s0, s1 - s0);
+        list.push({ index, startFrame: start, frames: length, range, tail, ...(skip !== undefined ? { skip } : {}), ...(lead ? { lead } : {}), ...(trail ? { trail } : {}) });
     }
     return list;
 }
@@ -250,6 +376,8 @@ interface Mp3Table {
     firstSample: Float64Array;
     /** Bytes of main data each frame brings to the bit reservoir (the frame less its header, CRC and side info). */
     mainBytes: Float64Array;
+    /** How far back in the reservoir each frame's main data begins (main_data_begin, bytes). */
+    mainBegin: Float64Array;
     /** How far back the reservoir reaches: 511 bytes (MPEG-1), 255 (MPEG-2 and 2.5). */
     reservoir: number;
     totalSamples: number;
@@ -287,7 +415,7 @@ function columns(n: number) {
  * frame (the decoder skips it too), resynchronising over junk. Layer III, as dr_mp3 decodes it.
  */
 export async function mp3Frames(file: string): Promise<Mp3Table> {
-    const table = columns(3); // offset, firstSample, mainBytes
+    const table = columns(4); // offset, firstSample, mainBytes, mainBegin
     let samples = 0;
     let end = 0;
     let first = true;
@@ -326,7 +454,10 @@ export async function mp3Frames(file: string): Promise<Mp3Table> {
             if (mpeg1) reservoir = 511;
             // The protection bit clear: a 16-bit CRC after the header.
             const crc = bytes[i + 1] & 1 ? 0 : 2;
-            table.push(base + i, samples, Math.max(0, size - 4 - crc - side));
+            // Side info's first field: 9 bits (MPEG-1), 8 (MPEG-2 and 2.5).
+            const si = i + 4 + crc;
+            const begin = mpeg1 ? (bytes[si] << 1) | (bytes[si + 1] >> 7) : bytes[si];
+            table.push(base + i, samples, Math.max(0, size - 4 - crc - side), begin);
             samples += n;
             end = base + i + size;
             i += size;
@@ -335,7 +466,7 @@ export async function mp3Frames(file: string): Promise<Mp3Table> {
         carry = bytes.slice(i);
         base = pos;
     }
-    return { count: table.count, offset: table.column(0), firstSample: table.column(1), mainBytes: table.column(2), reservoir, totalSamples: samples, end };
+    return { count: table.count, offset: table.column(0), firstSample: table.column(1), mainBytes: table.column(2), mainBegin: table.column(3), reservoir, totalSamples: samples, end };
 }
 
 // ---- Ogg Opus pages --------------------------------------------------------------------------

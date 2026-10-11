@@ -94,13 +94,14 @@ const broken: Array<[string, (m: any) => void]> = [
     ['wav source pcm encoding pcm-int', (m) => { m.segments.source.pcm.encoding = 'pcm-int'; }],
     ['opus source without header', (m) => { m.segments.source.codec = 'opus'; }],
     ['flac source without header', (m) => { m.segments.source.codec = 'flac'; }],
-    ['segment without range', (m) => { delete m.segments.list[0].range; }],
-    ['segment without tail', (m) => { delete m.segments.list[0].tail; }],
-    ['segment range of one number', (m) => { m.segments.list[0].range = [44]; }],
-    ['segment range negative', (m) => { m.segments.list[0].range = [-1, 100]; }],
-    ['segment lead a string', (m) => { m.segments.list[0].lead = '5'; }],
-    ['segment trail 1.5', (m) => { m.segments.list[0].trail = 1.5; }],
-    ['segments.list not an array', (m) => { m.segments.list = {}; }],
+    ['no segments.ranges', (m) => { delete m.segments.ranges; }],
+    ['no segments.tail', (m) => { delete m.segments.tail; }],
+    ['segments.ranges with a string', (m) => { m.segments.ranges[0] = '44'; }],
+    ['a range negative', (m) => { m.segments.ranges[0] = -1; }],
+    ['segments.lead a string', (m) => { m.segments.lead = m.segments.tail.map(() => '5'); }],
+    ['segments.trail with 1.5', (m) => { m.segments.trail = m.segments.tail.map(() => 1.5); }],
+    ['segments.ranges not an array', (m) => { m.segments.ranges = {}; }],
+    ['segments.skip with null', (m) => { m.segments.skip = m.segments.tail.map(() => null); }],
     ['peaks format', (m) => { m.peaks.format = 'other'; }],
     ['peak level without byteLength', (m) => { delete m.peaks.levels[0].byteLength; }],
     ['bands format', (m) => { m.bands.format = 'rtd-peaks'; }],
@@ -173,27 +174,26 @@ results.push(`${broken.length} broken manifests: refused by the schema and by as
     results.push('labels: 120 emoji accepted, 121 refused by both (code points)');
 }
 
-// Segments tile the timeline and stems sit on A's grid: assertManifest only (JSON Schema cannot express them).
+// A column for every segment of the grid, stems on A's grid: assertManifest only (JSON Schema cannot count them).
 {
     const tiling: Array<[string, (m: any) => void]> = [
-        ['no segments', (m) => { m.segments.list = []; }],
-        ['a gap between segments', (m) => { m.segments.list[1].startFrame += 1; }],
-        ['segments overlap', (m) => { m.segments.list[1].startFrame -= 1; }],
-        ['an empty segment', (m) => { m.segments.list[0].frames = 0; }],
-        ['segments shorter than the timeline', (m) => { m.frames += 1; }],
-        ['an index out of order', (m) => { m.segments.list[1].index = 5; }],
-        ['a ready stem with a segment fewer', (m) => { m.stems.b.segments.list.pop(); }],
-        ['a ready stem off the grid', (m) => { m.stems.b.segments.list[0].frames -= 1; m.stems.b.segments.list[1].startFrame -= 1; }],
-        ['a range past the source', (m) => { m.segments.list[0].range = [44, m.segments.source.bytes + 1]; }],
-        ['a range that ends where it starts', (m) => { m.segments.list[0].range = [100, 100]; }],
-        ['lead + trail longer than the segment', (m) => { m.segments.list[0].lead = m.segments.list[0].frames; m.segments.list[0].trail = 1; }],
+        ['no segments', (m) => { m.segments.ranges = []; m.segments.tail = []; }],
+        ['ranges for a segment fewer', (m) => { m.segments.ranges.splice(-2); }],
+        ['tail for a segment more', (m) => { m.segments.tail.push(0); }],
+        ['skip for a segment fewer', (m) => { m.segments.skip = m.segments.tail.slice(1).map(() => 0); }],
+        ['a timeline a segment longer than its columns', (m) => { m.frames += m.segments.framesPerSegment; }],
+        ['a ready stem with a segment fewer', (m) => { m.stems.b.segments.ranges.splice(-2); m.stems.b.segments.tail.pop(); }],
+        ['a ready stem off the grid', (m) => { m.stems.b.segments.framesPerSegment -= 1; }],
+        ['a range past the source', (m) => { m.segments.ranges[1] = m.segments.source.bytes + 1; }],
+        ['a range that ends where it starts', (m) => { m.segments.ranges[0] = 100; m.segments.ranges[1] = 100; }],
+        ['lead + trail longer than the segment', (m) => { m.segments.lead = m.segments.tail.map(() => m.segments.framesPerSegment); m.segments.trail = m.segments.tail.map(() => 1); }],
     ];
     for (const [name, mutate] of tiling) {
         const m = clone();
         mutate(m);
         assert.equal(assertOk(m), false, `assertManifest accepted: ${name}`);
     }
-    results.push(`${tiling.length} manifests off the grid (gaps, overlaps, empty or short lists, stems off A's grid, ranges past the source or empty, lead + trail too long): refused by assertManifest (documented: not expressible in the schema)`);
+    results.push(`${tiling.length} manifests whose columns do not fit the grid (a segment fewer or more, stems off A's grid, ranges past the source or empty, lead + trail too long): refused by assertManifest (documented: not expressible in the schema)`);
 }
 
 // Rules across fields: segments of at most MAX_SEGMENT_SECONDS at the timeline's rate, and sources
@@ -206,13 +206,16 @@ results.push(`${broken.length} broken manifests: refused by the schema and by as
         delete m.stems;
         m.frames = frames;
         m.duration = frames / rate;
-        m.segments.list = [{ ...m.segments.list[0], frames, tail: frames }];
+        m.segments.framesPerSegment = frames;
+        m.segments.ranges = m.segments.ranges.slice(0, 2);
+        m.segments.tail = [frames];
+        for (const column of ['skip', 'lead', 'trail']) delete m.segments[column];
     };
     const crossField: Array<[string, (m: any) => void, RegExp]> = [
         ['one segment of 2^27 frames (a 1 GB allocation)', oneSegment(2 ** 27), /over 60 s/],
         [`one segment of ${MAX_SEGMENT_SECONDS} s + 1 frame`, oneSegment(over), /over 60 s/],
         [`framesPerSegment of ${MAX_SEGMENT_SECONDS} s + 1 frame`, (m) => { m.segments.framesPerSegment = over; }, /framesPerSegment is over 60 s/],
-        ['a stem segment over 60 s', (m) => { m.stems.b.status = 'failed'; m.stems.b.segments.list[0].frames = over; }, /stems\.b\.segments\.list\[0\] is over 60 s/],
+        ['a stem with segments over 60 s', (m) => { m.stems.b.status = 'failed'; m.stems.b.segments.framesPerSegment = over; }, /stems\.b\.segments\.framesPerSegment is over 60 s/],
         ['A source at another rate', (m) => { m.segments.source.sampleRate = 44100; }, /the timeline is 48000/],
         ['A source with other channels', (m) => { m.segments.source.channels = 2; }, /the timeline is/],
         ['a stem source at another rate', (m) => { m.stems.b.segments.source.sampleRate = 44100; }, /A's rate/],

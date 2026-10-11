@@ -180,7 +180,7 @@ test('spectrogram draws before any segment arrives and refines from decoded segm
 test('a WAV segment handed out as its bytes arrive: the parts, laid end to end, are the whole segment', async ({ page }) => {
     const r = await page.evaluate(async (base) => {
         const url = new URL(`${base}/pairEq/manifest.json`, location.href).href;
-        const m = await (await fetch(url)).json();
+        const m = h.format.parseManifest(await (await fetch(url)).json());
         const src = m.segments.source;
         const block = src.pcm.blockAlign;
         // Segments shaped as stems and warm-ups shape them: a run longer than the segment's audio
@@ -229,10 +229,174 @@ test('a WAV segment handed out as its bytes arrive: the parts, laid end to end, 
     console.log(`parts per segment: ${r.map((x) => x.parts).join(', ')}`);
 });
 
+test('a compressed source\'s decoder is fetched once the manifest is in, not after its first segment', async ({ page }) => {
+    const order = [];
+    page.on('request', (req) => {
+        if (/rtdDecodeMp3/.test(req.url())) order.push('decoder');
+        else if (/mp3clip\/source\.mp3/.test(req.url()) && req.headers().range) order.push('segment');
+    });
+    await page.evaluate(async () => {
+        const { player } = mk();
+        await player.play({ manifest: `${longBase}/mp3clip/manifest.json` });
+        await h.sleep(800);
+        player.dispose();
+    });
+    expect(order[0]).toBe('decoder');
+    expect(order).toContain('segment');
+});
+
+test('a segment asked for at a frame inside it is fetched from an entry there: MP3, FLAC and Opus parts from it are the decoder\'s samples, then the segment whole', async ({ page }) => {
+    test.setTimeout(60000);
+    for (const [name, kbps, tolerance] of [['mp3', 20, 0], ['flac', 150, 0], ['opus', 20, 1e-4]]) {
+        const r = await page.evaluate(async ({ base, name, kbps }) => {
+            const dir = `${base}/${name}whole`;
+            const url = new URL(`${dir}/manifest.json`, location.href).href;
+            const m = h.format.parseManifest(await (await fetch(url)).json());
+            const starts = m.segments.list.map((seg) => seg.range?.[0] ?? null);
+            const entries = h.format.decodeEntriesFile(await (await fetch(new URL(m.segments.entries.url, url))).arrayBuffer(), starts);
+            // The source slowly (test/browser/vite.config.mjs): the fetch from the entry is what plays first.
+            const slow = { ...m, segments: { ...m.segments, source: { ...m.segments.source, url: `/__slow/${kbps}${dir}/${m.segments.source.url}` } } };
+            const store = new h.internals.SegmentStore(new h.internals.FileAccess(url), slow, { maxBytes: 1e9 });
+            store.setEntries(entries);
+            const ranges = [];
+            const plain = window.fetch.bind(window);
+            window.fetch = (input, init) => {
+                const range = new Headers(init?.headers).get('range');
+                if (range) ranges.push(range);
+                return plain(input, init);
+            };
+            const parts = [];
+            store.onPartial((index, offset, planes) => parts.push({ index, offset, data: planes.map((p) => p.slice()) }));
+            // The decoder's samples of the whole file: planar, channel after channel.
+            const ref = new Float32Array(await (await fetch(`${base}/${name}clip.f32`)).arrayBuffer());
+            const frames = m.frames;
+            const at = Math.round(1.6 * m.sampleRate);
+            const chosen = entries[0].filter((e) => e.at <= at).at(-1);
+            const whole = await store.load(0, true, at);
+            window.fetch = plain;
+            const mine = parts.filter((p) => p.index === 0);
+            let next = mine[0]?.offset;
+            let contiguous = true;
+            let partsDiff = 0;
+            for (const p of mine) {
+                if (p.offset !== next) contiguous = false;
+                for (let c = 0; c < p.data.length; c += 1) {
+                    for (let i = 0; i < p.data[c].length; i += 1) partsDiff = Math.max(partsDiff, Math.abs(p.data[c][i] - ref[c * frames + p.offset + i]));
+                }
+                next = p.offset + p.data[0].length;
+            }
+            let wholeDiff = 0;
+            for (let c = 0; c < whole.numberOfChannels; c += 1) {
+                const d = whole.getChannelData(c);
+                for (let i = 0; i < d.length; i += 1) wholeDiff = Math.max(wholeDiff, Math.abs(d[i] - ref[c * frames + i]));
+            }
+            store.dispose();
+            return {
+                entries: entries[0].length, chosen: chosen?.at, firstOffset: mine[0]?.offset, parts: mine.length, contiguous,
+                covered: next, segmentFrames: m.segments.list[0].frames, partsDiff, wholeDiff,
+                firstRange: ranges[0], entryRange: chosen ? `bytes=${chosen.byte}-${m.segments.list[0].range[1] - 1}` : null,
+            };
+        }, { base: BASE, name, kbps });
+        console.log(`${name} from an entry: ${JSON.stringify(r)}`);
+        expect(r.entries, name).toBeGreaterThan(0);
+        expect(r.chosen, name).toBeGreaterThan(0);
+        // Fetched from the entry first, handed out from its frame to the segment's end.
+        expect(r.firstRange, name).toBe(r.entryRange);
+        expect(r.firstOffset, name).toBe(r.chosen);
+        expect(r.contiguous, name).toBe(true);
+        expect(r.covered, name).toBe(r.segmentFrames);
+        expect(r.partsDiff, name).toBeLessThanOrEqual(tolerance);
+        expect(r.wholeDiff, name).toBeLessThanOrEqual(1e-6);
+    }
+});
+
+/**
+ * In the page: every segment of a fixture loaded by a SegmentStore whose source comes at `kbps`
+ * KB/s (test/browser/vite.config.mjs), its parts collected; and the same segment decoded whole by
+ * a store whose manifest has no `skip`. `edit` changes the streamed store's manifest.
+ */
+async function streamedAndWhole(page, name, kbps, edit = 'none') {
+    return page.evaluate(async ({ base, name, kbps, edit }) => {
+        const url = new URL(`${base}/${name}/manifest.json`, location.href).href;
+        const m = h.format.parseManifest(await (await fetch(url)).json());
+        const list = edit === 'wrong-skip' ? m.segments.list.map((seg, i) => (i === 1 ? { ...seg, skip: seg.skip + 1 } : seg)) : m.segments.list;
+        const slow = { ...m, segments: { ...m.segments, list, source: { ...m.segments.source, url: `/__slow/${kbps}${base}/${name}/${m.segments.source.url}` } } };
+        const plain = { ...m, segments: { ...m.segments, list: m.segments.list.map(({ skip, ...seg }) => seg) } };
+        const store = new h.internals.SegmentStore(new h.internals.FileAccess(url), slow, { maxBytes: 1e9 });
+        const reference = new h.internals.SegmentStore(new h.internals.FileAccess(url), plain, { maxBytes: 1e9 });
+        const parts = [];
+        store.onPartial((index, offset, planes, total) => parts.push({ index, offset, total, data: planes.map((p) => p.slice()) }));
+        reference.onPartial(() => {});
+        const out = [];
+        for (const seg of m.segments.list) {
+            const got = await store.load(seg.index, true);
+            const want = await reference.load(seg.index, true);
+            const mine = parts.filter((p) => p.index === seg.index);
+            // Laid end to end; a part from 0 again starts over.
+            const joined = Array.from({ length: want.numberOfChannels }, () => new Float32Array(seg.frames));
+            let next = 0;
+            let contiguous = true;
+            for (const p of mine) {
+                if (p.offset !== 0 && p.offset !== next) contiguous = false;
+                p.data.forEach((d, c) => joined[c].set(d, p.offset));
+                next = p.offset + p.data[0].length;
+            }
+            let partsDiff = 0;
+            let bufferDiff = 0;
+            for (let c = 0; c < want.numberOfChannels; c += 1) {
+                const w = want.getChannelData(c);
+                const g = got.getChannelData(c);
+                for (let i = 0; i < seg.frames; i += 1) {
+                    partsDiff = Math.max(partsDiff, Math.abs(joined[c][i] - w[i]));
+                    bufferDiff = Math.max(bufferDiff, Math.abs(g[i] - w[i]));
+                }
+            }
+            out.push({ index: seg.index, parts: mine.length, restarts: mine.filter((p, k) => k > 0 && p.offset === 0).length, contiguous, covered: next, frames: seg.frames, partsDiff, bufferDiff });
+        }
+        store.dispose();
+        reference.dispose();
+        return out;
+    }, { base: BASE, name, kbps, edit });
+}
+
+test('an MP3, FLAC or Opus segment handed out as its bytes arrive: the parts, laid end to end, are the segment decoded whole', async ({ page }) => {
+    test.setTimeout(60000);
+    // About a second per segment: the FLAC's are some ten times the size of the others.
+    for (const [name, kbps] of [['mp3clip', 20], ['flacclip', 200], ['opusclip', 20]]) {
+        const r = await streamedAndWhole(page, name, kbps);
+        console.log(`${name}: parts per segment ${r.map((x) => x.parts).join(', ')}`);
+        for (const x of r) {
+            expect(x.contiguous, `${name} ${JSON.stringify(x)}`).toBe(true);
+            expect(x.restarts, `${name} ${JSON.stringify(x)}`).toBe(0);
+            expect(x.covered, `${name} ${JSON.stringify(x)}`).toBe(x.frames);
+            expect(x.partsDiff, `${name} ${JSON.stringify(x)}`).toBe(0);
+            expect(x.bufferDiff, `${name} ${JSON.stringify(x)}`).toBe(0);
+        }
+        // So slowly a segment comes in several parts, not once it is whole.
+        expect(Math.max(...r.map((x) => x.parts)), name).toBeGreaterThan(1);
+    }
+});
+
+test('a segment whose run does not come to skip + tail is decoded whole (the player then hands the engine all of it); the rest decode whole', async ({ page }) => {
+    const warnings = [];
+    page.on('console', (m) => { if (m.type() === 'warning') warnings.push(m.text()); });
+    const r = await streamedAndWhole(page, 'mp3clip', 20, 'wrong-skip');
+    console.log(`wrong skip: ${JSON.stringify(r.map(({ index, parts, restarts }) => ({ index, parts, restarts })))}`);
+    // Segment 1 (its skip one too many): parts, shifted by a sample, then the right segment
+    // whole (which the player hands the engine in place of the parts).
+    expect(r[1].parts).toBeGreaterThan(0);
+    expect(r[1].partsDiff).toBeGreaterThan(0);
+    for (const x of r) expect(x.bufferDiff, JSON.stringify(x)).toBe(0);
+    expect(r[0].partsDiff).toBe(0);
+    // The segments after it are not streamed: no parts.
+    for (const x of r.slice(2)) expect(x.parts, JSON.stringify(x)).toBe(0);
+    expect(warnings.some((w) => /could not be decoded as it arrived/.test(w))).toBe(true);
+});
+
 test('segment boundaries and a loop across one are sample-exact (OfflineAudioContext)', async ({ page }) => {
     const result = await page.evaluate(async () => {
         const base = `${longBase}/mono30`;
-        const manifest = await (await fetch(`${base}/manifest.json`)).json();
+        const manifest = h.format.parseManifest(await (await fetch(`${base}/manifest.json`)).json());
         const ref = h.format.parseWavFile(await (await fetch(`${longBase}/mono30.wav`)).arrayBuffer()).channels[0];
         const sr = manifest.sampleRate;
         const segs = (await h.preparedSegments(base, manifest)).map((planes) => {

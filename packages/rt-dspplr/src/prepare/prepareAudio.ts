@@ -13,18 +13,21 @@ import {
     MAX_SEGMENT_SECONDS,
     PEAKS_VERSION,
     SPECTROGRAM_VERSION,
-    assertManifest,
     assertStemKey,
     encodeBandsFile,
+    encodeEntriesFile,
     encodePeaksFile,
     encodeSpectrogramFile,
+    parseManifest,
     peaksLayout,
+    serializeManifest,
     spectrogramLayout,
     type AudioManifest,
     type ManifestLoudness,
     type ManifestSegment,
     type ManifestSource,
     type ManifestStem,
+    type SegmentEntry,
     type SpectrogramFile,
 } from '@saitdigital/rt-dspplr/format';
 import { binFrames, checkFramesPerPeak, DEFAULT_FRAMES_PER_PEAK, levelsFromFinest, loudnessFrom, type FinestPeaks } from './analysis';
@@ -36,7 +39,7 @@ import { checkAudioShape, finiteBlocks, type AudioDecoder, type SourceFormat, ty
 import { builtinDecoder } from './wasm/decoders';
 import { type ResamplerOptions } from './resampler';
 import { deepestRun, indexSegments, mappable, mapSource, readRange, SOURCE_CONTENT_TYPES, sourceWavSink, wavMap, type SourceMap, type WavSink } from './sourceIndex';
-import { readSegment, sourceReader, verifyIndex } from './sourceReader';
+import { readSegment, sourceReader, verifyEntries, verifyIndex, verifySkips } from './sourceReader';
 import { buildStem, failedStem, StemAlignmentError, type StemInput, type StemOptions } from './stem';
 import { plainExtension, runProcessor, StemProcessorError, type StemProcessor } from './processors';
 
@@ -295,14 +298,14 @@ export function fileNameOnly(name: string | null | undefined): string | null {
 }
 
 /**
- * The manifest's bytes, checked with the player's own assertManifest() on
- * what JSON makes of it (a non-finite number becomes null): a manifest the
- * player would refuse is never published.
+ * The manifest's bytes (serializeManifest(): its segment lists as columns), checked with the
+ * player's own parseManifest() on what JSON makes of them (a non-finite number becomes null): a
+ * manifest the player would refuse is never published.
  */
 export function manifestBytes(manifest: AudioManifest): Uint8Array {
-    const text = JSON.stringify(manifest, null, 1);
+    const text = serializeManifest(manifest);
     try {
-        assertManifest(JSON.parse(text));
+        parseManifest(JSON.parse(text));
     } catch (error) {
         throw new Error(`the manifest does not validate, so it was not written: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -649,7 +652,7 @@ async function run(
             channels,
             frames: totalFrames,
             source: { name, bytes: bytesRead, encoding: format.encoding, bitsPerSample: format.bitsPerSample, frames: format.frames ?? totalFrames },
-            segments: { framesPerSegment, source: stored.source, list: stored.list },
+            segments: { framesPerSegment, source: stored.source, list: stored.list, ...(stored.entries ? { entries: stored.entries } : {}) },
             peaks: timeline.peaks,
             loudness,
             ...(bands ? { bands } : {}),
@@ -884,6 +887,8 @@ export function segmentChecks(): { keep: (index: number, planes: Float32Array[],
 export interface StoredSource {
     source: ManifestSource;
     list: ManifestSegment[];
+    /** Where runs may start inside the segments (entries.bin), when the source has them. */
+    entries?: { url: string; bytes: number };
     /** The local file that was stored. */
     file: string;
     bytes: number;
@@ -921,12 +926,14 @@ export async function storeSource(a: {
     let file = a.file;
     let offset = a.offset;
     let list: ManifestSegment[] = [];
+    let entries: SegmentEntry[][] | undefined;
     if (!a.wav && file && mappable(a.layout)) {
         const original = file;
         const read = (start: number, end: number) => readRange(original, start, end);
         try {
             map = await mapSource(original, a.layout, a.sampleRate, a.channels, a.sourceFrames);
             list = indexSegments(a.frames, a.framesPerSegment, map, offset);
+            await map.fillSkips?.(list);
             // Besides the segments kept as they were decoded: the one whose run reaches furthest
             // back (MP3), against the same samples from a run that starts much earlier.
             const deepest = deepestRun(list, map, offset);
@@ -934,9 +941,27 @@ export async function storeSource(a: {
                 ? [...a.checks, { index: deepest.index, planes: await readSegment(map.describe, deepest.reference, a.timeline.channels, read) }]
                 : a.checks;
             await verifyIndex(map.describe, list, a.timeline.channels, read, checks);
+            // Played as it arrives, the same segments: should that differ, the player decodes
+            // every run whole first, as it does without `skip`.
+            const skipped = await verifySkips(map.describe, list, a.timeline.channels, read, checks.map((c) => c.index));
+            if (skipped) {
+                for (const seg of list) delete seg.skip;
+                a.onWarning(`${a.what}: ${skipped}; its segments are decoded whole before they play`);
+            } else if (map.entries) {
+                // Where seeks may start inside the segments: checked as the segments were, else left out.
+                try {
+                    const all = await map.entries(list, offset);
+                    const wrong = await verifyEntries(map.describe, list, all, a.timeline.channels, read, checks.map((c) => c.index));
+                    if (wrong) a.onWarning(`${a.what}: ${wrong}; seeks fetch from the segments' starts`);
+                    else entries = all;
+                } catch (error) {
+                    a.onWarning(`${a.what}: no entries inside the segments (${error instanceof Error ? error.message : String(error)}); seeks fetch from their starts`);
+                }
+            }
         } catch (error) {
             a.onWarning(`${a.what}: the ${a.layout.kind} file could not be indexed (${error instanceof Error ? error.message : String(error)}); kept as a 16-bit WAV instead`);
             map = null;
+            entries = undefined;
         }
     }
     if (!map) {
@@ -959,7 +984,14 @@ export async function storeSource(a: {
     }
     const key = `${a.prefix}source.${map.describe.codec}`;
     const bytes = await storeFile(a.storage, key, file!, SOURCE_CONTENT_TYPES[map.describe.codec]);
-    return { source: { url: key, bytes, ...map.describe }, list, file: file!, bytes };
+    let stored: StoredSource['entries'];
+    if (entries) {
+        const data = encodeEntriesFile(entries, list.map((seg) => seg.range?.[0] ?? null));
+        const url = `${a.prefix}entries.bin`;
+        await a.storage.putObject(url, data, 'application/octet-stream');
+        stored = { url, bytes: data.length };
+    }
+    return { source: { url: key, bytes, ...map.describe }, list, file: file!, bytes: bytes + (stored?.bytes ?? 0), ...(stored ? { entries: stored } : {}) };
 }
 
 export interface TimelineOutput {

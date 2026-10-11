@@ -7,6 +7,7 @@
 // publishes later; the waveform and spectrogram show the blend.
 // Fixtures from long-fixtures.mjs: pairEq (B = A, 37 ms late), pairQuiet
 // (B = A, 37 ms late, -6 dB), both made in one prepare call; pairHot (A only).
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, expect } from '@playwright/test';
@@ -15,6 +16,32 @@ import { loadPrepare } from './long-fixtures.mjs';
 const BASE = '/node_modules/.cache/rtd-long';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const FIXTURES = path.join(root, 'node_modules', '.cache', 'rtd-long');
+
+/**
+ * A fixture's manifest, served in its place, with the source of A (`a`) or of its stem (`b`)
+ * sent at that many KB/s (test/browser/vite.config.mjs, /__slow/): parts of a segment arrive
+ * over a second or more, as on a slow network.
+ */
+async function slowed(page, name, { a, b } = {}) {
+    const m = JSON.parse(fs.readFileSync(path.join(FIXTURES, name, 'manifest.json'), 'utf8'));
+    if (a) m.segments.source.url = `/__slow/${a}${BASE}/${name}/${m.segments.source.url}`;
+    if (b) m.stems.b.segments.source.url = `/__slow/${b}${BASE}/${name}/${m.stems.b.segments.source.url}`;
+    await page.route(`**${BASE}/${name}/manifest.json`, (route) => route.fulfill({ json: m }));
+}
+
+/** In the page: every fetch's URL, Range header and start time, in window.fetches. */
+async function recordFetches(page) {
+    await page.evaluate(() => {
+        window.fetches = [];
+        const plain = window.fetch.bind(window);
+        window.fetch = (input, init) => {
+            const url = typeof input === 'string' ? input : input.url;
+            const range = new Headers(init?.headers ?? (typeof input === 'string' ? undefined : input.headers)).get('range');
+            window.fetches.push({ url, range, at: performance.now() });
+            return plain(input, init);
+        };
+    });
+}
 
 test.beforeEach(async ({ page }) => {
     await page.goto('/test/browser/index.html');
@@ -158,6 +185,189 @@ test('a mix set before the first prepared clip is the mix it plays and draws at'
     console.log('mix before load:', JSON.stringify(r));
     expect(Math.abs(r.delta + 6.02)).toBeLessThan(0.5);
     expect(r.pictureDiff).toBeLessThan(0.01);
+});
+
+test('play while the first segment of a WAV source is arriving starts from what is in, not once it is whole', async ({ page }) => {
+    // 384 KB segments at 250 KB/s: whole after about 1.5 s. Loaded, its first segment comes
+    // ahead of a play; the play comes while it is on its way.
+    await slowed(page, 'pairQuiet', { a: 250 });
+    await recordFetches(page);
+    const r = await page.evaluate(async () => {
+        const { player } = mk();
+        await player.load({ manifest: `${longBase}/pairQuiet/manifest.json` });
+        await until(() => fetches.find((f) => f.url.includes('/__slow/')), 8000);
+        await h.sleep(400);
+        const t0 = performance.now();
+        void player.play();
+        await until(() => player.getStreamStats()?.startLatencyMs, 8000);
+        const startedAt = performance.now() - t0;
+        // The first segment whole: the first one the store finishes (the others give way to it).
+        await until(() => player.getStreamStats()?.fetches >= 1, 8000);
+        const wholeAt = performance.now() - t0;
+        player.dispose();
+        return { startedAt, wholeAt };
+    });
+    console.log('play while A arrives:', JSON.stringify(r));
+    expect(r.startedAt).toBeLessThan(r.wholeAt - 400);
+});
+
+test('a seek while other segments are on their way fetches its own at once; the others give way and carry on from where they were', async ({ page }) => {
+    // 384 KB segments at 200 KB/s. The timeline's close-up of the whole 20 s clip asks for every
+    // segment, three at a time: the seek's must not wait for a free one, nor share the link.
+    await slowed(page, 'pairQuiet', { a: 200 });
+    await recordFetches(page);
+    const r = await page.evaluate(async () => {
+        const { player } = mk();
+        await player.play({ manifest: `${longBase}/pairQuiet/manifest.json` });
+        await until(() => player.getStreamStats()?.startLatencyMs, 8000);
+        await h.sleep(200);
+        const m = player.getState().manifest;
+        const from = fetches.length;
+        const t0 = performance.now();
+        await player.seek(14.5);
+        await until(() => player.getStreamStats().seekLatencies.length > 0, 8000);
+        const seekMs = player.getStreamStats().seekLatencies.at(-1);
+        await h.sleep(3000);
+        const own = m.segments.list[3];
+        const begin = (f) => Number(/bytes=(\d+)-/.exec(f.range)[1]);
+        const after = fetches.slice(from).filter((f) => f.url.includes('/__slow/'));
+        // The seek's: from inside segment 3 (an entry near 14.5 s), to its end.
+        const first = after.find((f) => begin(f) >= own.range[0] && begin(f) < own.range[1]);
+        const entries = new Set(after.filter((f) => f !== first).map(begin));
+        player.dispose();
+        return {
+            seekMs,
+            askedAfterMs: first ? first.at - t0 : null,
+            fromInside: first ? begin(first) > own.range[0] : false,
+            // Fetches that carry on (from no segment's start, and not the seek's).
+            resumed: after.filter((f) => f !== first && !m.segments.list.some((seg) => seg.range[0] === begin(f))).length,
+            entries: entries.size,
+        };
+    });
+    console.log('seek while others load:', JSON.stringify(r));
+    // Asked for at once, not once one of the three in flight is whole (about 2 s here), and from
+    // an entry near 14.5 s, not from the segment's start at 12 s: about 0.75 s of audio to wait
+    // for instead of 3. The others let go of their requests and later ask for the rest.
+    expect(r.askedAfterMs).toBeLessThan(150);
+    expect(r.fromInside).toBe(true);
+    expect(r.seekMs).toBeLessThan(1000);
+    expect(r.resumed).toBeGreaterThan(0);
+});
+
+test('a stem being prefetched plays from what has arrived when the knob moves, before its segment is whole', async ({ page }) => {
+    // The stem's 384 KB segment at the playhead at 200 KB/s: whole after about 1.9 s.
+    await slowed(page, 'pairQuiet', { b: 200 });
+    await recordFetches(page);
+    const r = await page.evaluate(async () => {
+        const { player } = mk();
+        await player.play({ manifest: `${longBase}/pairQuiet/manifest.json` });
+        await until(() => fetches.find((f) => f.url.includes('/__slow/')), 8000);
+        await h.sleep(600);
+        const level = async () => {
+            let sum = 0;
+            for (let i = 0; i < 10; i += 1) { sum += h.rms(player) ** 2; await h.sleep(25); }
+            return 10 * Math.log10(sum / 10);
+        };
+        const atA = await level();
+        player.setMix(1);
+        await h.sleep(150);
+        const atB = await level();
+        const measured = performance.now();
+        const slow = () => performance.getEntriesByType('resource').filter((e) => e.name.includes('/__slow/')).sort((x, y) => x.startTime - y.startTime)[0];
+        await until(slow, 8000);
+        player.dispose();
+        return { delta: atB - atA, beforeWhole: slow().responseEnd - measured };
+    });
+    console.log('prefetched stem:', JSON.stringify(r));
+    // Measured while the segment was still arriving, at the stem's level (-6 dB).
+    expect(r.beforeWhole).toBeGreaterThan(0);
+    expect(Math.abs(r.delta + 6.02)).toBeLessThan(1.5);
+});
+
+test('a seek near the end of a segment fetches the next one at once too: the start\'s margin reaches into it', async ({ page }) => {
+    // 4 s segments at 200 KB/s; 15.8 s is 0.2 s before segment 4.
+    await slowed(page, 'pairQuiet', { a: 200 });
+    await recordFetches(page);
+    const r = await page.evaluate(async () => {
+        const { player } = mk();
+        await player.play({ manifest: `${longBase}/pairQuiet/manifest.json` });
+        await until(() => player.getStreamStats()?.startLatencyMs, 8000);
+        await h.sleep(200);
+        const m = player.getState().manifest;
+        const from = fetches.length;
+        const t0 = performance.now();
+        await player.seek(15.8);
+        await until(() => player.getStreamStats().seekLatencies.length > 0, 8000);
+        const seekMs = player.getStreamStats().seekLatencies.at(-1);
+        const segmentOf = (f) => {
+            const start = Number(/bytes=(\d+)-/.exec(f.range)[1]);
+            return m.segments.list.findIndex((seg) => start >= seg.range[0] && start < seg.range[1]);
+        };
+        const asked = fetches.slice(from).filter((f) => f.url.includes('/__slow/')).map((f) => ({ segment: segmentOf(f), at: f.at - t0 }));
+        player.dispose();
+        return { seekMs, three: asked.find((a) => a.segment === 3)?.at ?? null, four: asked.find((a) => a.segment === 4)?.at ?? null };
+    });
+    console.log('seek near a segment end:', JSON.stringify(r));
+    expect(r.three).toBeLessThan(150);
+    expect(r.four).toBeLessThan(150);
+    expect(r.seekMs).toBeLessThan(1000);
+});
+
+test('a seek with the knob towards the stem fetches both segments at the new playhead first, together', async ({ page }) => {
+    // A's source at 200 KB/s: its 384 KB segment takes about 1.9 s, which the stem's must not wait for.
+    await slowed(page, 'pairQuiet', { a: 200 });
+    await recordFetches(page);
+    const r = await page.evaluate(async () => {
+        // No timeline: its decoded close-up of the whole 20 s clip would fetch every segment.
+        const player = h.createAudioPlayer({ element: document.body.appendChild(document.createElement('div')), prewarmSpeeds: false, stretcher: 'native', segmented: { prefetchSegments: 1 } });
+        player.setMix(1);
+        await player.play({ manifest: `${longBase}/pairQuiet/manifest.json` });
+        await until(() => player.getStreamStats()?.startLatencyMs, 8000);
+        const m = player.getState().manifest;
+        const from = fetches.length;
+        await player.seek(14.5);
+        await h.sleep(1000);
+        // Each fetch by the segment its range is in (a seek fetches from an entry inside it).
+        const segmentOf = (list, range) => list.findIndex((seg) => range >= seg.range[0] && range < seg.range[1]);
+        const sources = fetches.slice(from).filter((f) => f.range && f.url.includes('source.wav')).map((f) => {
+            const b = f.url.includes('/b/');
+            const start = Number(/bytes=(\d+)-/.exec(f.range)[1]);
+            return { name: `${b ? 'b' : 'a'} ${segmentOf(b ? m.stems.b.segments.list : m.segments.list, start)}`, at: f.at };
+        });
+        player.dispose();
+        return { sources, both: ['a 3', 'b 3'] };
+    });
+    console.log('after the seek:', r.sources.map((s) => `${s.name} @${Math.round(s.at)}`).join(' | '));
+    expect(r.sources.slice(0, 2).map((s) => s.name).sort()).toEqual(r.both.sort());
+    // The stem's asked for within a moment of A's, not once A's is whole.
+    expect(Math.abs(r.sources[1].at - r.sources[0].at)).toBeLessThan(500);
+});
+
+test('a seek lets go of the stem prefetch for the old playhead', async ({ page }) => {
+    // The stem's first segment at 100 KB/s: still on its way when the seek comes.
+    await slowed(page, 'pairQuiet', { b: 100 });
+    const failed = [];
+    page.on('requestfailed', (req) => { if (req.url().includes('/__slow/')) failed.push(req.headers().range); });
+    await recordFetches(page);
+    const r = await page.evaluate(async () => {
+        const { player } = mk();
+        window.player = player;
+        await player.play({ manifest: `${longBase}/pairQuiet/manifest.json` });
+        await until(() => fetches.find((f) => f.url.includes('/__slow/')), 8000);
+        await h.sleep(300);
+        await player.seek(14.5);
+        await h.sleep(1500);
+        const list = player.getState().manifest.stems.b.segments.list;
+        const range = (seg) => `bytes=${seg.range[0]}-${seg.range[1] - 1}`;
+        return { slow: fetches.filter((f) => f.url.includes('/__slow/')).map((f) => f.range), old: range(list[0]), now: range(list[3]) };
+    });
+    await page.waitForTimeout(200);
+    const abortedBeforeDispose = [...failed];
+    await page.evaluate(() => window.player.dispose());
+    console.log('stem fetches:', JSON.stringify(r), 'aborted:', abortedBeforeDispose);
+    expect(r.slow[0]).toBe(r.old);
+    expect(abortedBeforeDispose).toContain(r.old);
+    expect(r.slow).toContain(r.now);
 });
 
 test('before the knob moves only the stem\'s segment at the playhead is fetched (prefetchStem), the rest once the mix asks; none with prefetchStem: false', async ({ page }) => {

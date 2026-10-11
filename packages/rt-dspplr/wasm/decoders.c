@@ -14,7 +14,9 @@
 // too little, the stream is reported broken (RTD_STARVED), never cut short.
 // A run of an MP3 (frames from the middle) and a run of a FLAC (its header,
 // then frames) go through the same calls. Opus runs are decoded packet by
-// packet (rtd_opus_raw_*: JS takes the packets out of the Ogg pages).
+// packet (rtd_opus_raw_*: JS takes the packets out of the Ogg pages), and MP3
+// runs can be decoded frame by frame as their bytes arrive (rtd_mp3_raw_*:
+// JS splits the frames).
 // ---------------------------------------------------------------------------
 
 #include <stdint.h>
@@ -296,4 +298,42 @@ EXPORT(rtd_opus_raw_decode) int rtd_opus_raw_decode(int n) {
     return got < 0 ? RTD_ERROR : got;
 }
 EXPORT(rtd_opus_raw_pcm) float* rtd_opus_raw_pcm(void) { return o.pcm; }
+#endif
+
+#ifndef RTD_NO_MP3
+// ---- MP3 frames (a run decoded as it arrives: JS hands over one whole frame at a time) -------
+//
+// dr_mp3's frame decoder keeps the bit reservoir and the synthesis state from frame to frame, as
+// its stream reader does; the samples are the reader's, without its read-ahead of the input.
+
+/** The largest Layer III frame: 144 × 320 kbit/s / 32 kHz + padding is 1441 bytes. */
+#define RTD_MP3_MAX_FRAME 2048
+
+static struct {
+    drmp3dec decoder;
+    drmp3dec_frame_info info;
+    uint8_t frame[RTD_MP3_MAX_FRAME];
+    drmp3d_sample_t samples[DRMP3_MAX_SAMPLES_PER_FRAME];
+    float pcm[DRMP3_MAX_SAMPLES_PER_FRAME]; // interleaved
+} m;
+
+EXPORT(rtd_mp3_raw_open) int rtd_mp3_raw_open(void) {
+    drmp3dec_init(&m.decoder);
+    return 0;
+}
+/** Room for a frame of `n` bytes, or 0 when it cannot be one; JS writes it there and calls rtd_mp3_raw_decode(n). */
+EXPORT(rtd_mp3_raw_frame) uint8_t* rtd_mp3_raw_frame(int n) { return n > 0 && n <= RTD_MP3_MAX_FRAME ? m.frame : 0; }
+/**
+ * Decodes the frame into rtd_mp3_raw_pcm() (interleaved); returns its frames (0 when its main
+ * data lies before the run), or RTD_ERROR when the bytes were not that one frame.
+ */
+EXPORT(rtd_mp3_raw_decode) int rtd_mp3_raw_decode(int n) {
+    int got = drmp3dec_decode_frame(&m.decoder, m.frame, n, m.samples, &m.info);
+    if (m.info.frame_bytes != n) return RTD_ERROR;
+    drmp3_s16_to_f32(m.pcm, m.samples, (drmp3_uint64)got * (drmp3_uint64)m.info.channels);
+    return got;
+}
+EXPORT(rtd_mp3_raw_pcm) float* rtd_mp3_raw_pcm(void) { return m.pcm; }
+EXPORT(rtd_mp3_raw_channels) int rtd_mp3_raw_channels(void) { return m.info.channels; }
+EXPORT(rtd_mp3_raw_rate) int rtd_mp3_raw_rate(void) { return m.info.sample_rate; }
 #endif

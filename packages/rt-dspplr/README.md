@@ -413,7 +413,33 @@ folder in milliseconds and downloads only the audio around the playhead, with
 HTTP Range requests to the original; about 60 s of decoded audio is kept. Audio
 always comes first: the overview files load after it, from coarse to fine, and
 pause whenever a start or a seek is waiting. A segment is about 192 KB of the
-file by default, and a WAV starts playing while it downloads:
+file by default, and it starts playing while it downloads, in every format (MP3, FLAC and Opus
+are decoded in a worker as their bytes arrive; the manifest says where each segment's samples
+start in its run). A seek fetches from the playhead, not from its segment's start: a WAV from
+any frame, MP3, FLAC and Opus from an entry about every half second (`entries.bin`):
+
+```
+ SERVER, once per recording (rtd-prepare)       BROWSER (@saitdigital/rt-dspplr)
+ ──────────────────────────────────────────     ────────────────────────────────────────
+  recording + versions (stems)                   play({ manifest })
+    │ decode, analyse, align the stems             1. manifest.json (13-17 KB / 30 min)
+    ▼                                              2. coarsest pictures: whole timeline drawn
+  peaks.bin  bands.bin  spectrogram.bin            3. the segment at the playhead first,
+    │                                                 by Range; plays as its bytes arrive
+    ▼                                              4. a seek fetches from the playhead
+  index of the original file:                      5. the rest behind it, giving way
+    segments of ~192 KB, entry points every          │
+    0.5 s (entries.bin); checked sample by           ▼
+    sample against the player's decode           AudioWorklet engine: A + stem from the
+    │                                              same sample, the slider's mix, speed
+    ▼                                              (tonal: Signalsmith, attacks: overlap-add),
+  manifest.json + .bin files + the original      resampled to the sound card
+  file, as it was ─── plain HTTP, Range ───▶       │
+                                                   ▼
+                                                 effects → ceiling → speakers
+```
+
+The whole pipeline, step by step: [How it works](https://github.com/eightraw/rt-dspplr/blob/main/docs/how-it-works.md).
 
 ```bash
 npx rtd-prepare talk.wav public/media/talk --stem b=talk.b.wav --label b="Noise reduction"
