@@ -261,7 +261,9 @@ test('maxClipBytes and maxClipSeconds fail a whole clip early, pointing to prepa
     expect(r.declared.message).toMatch(/MiB/);
     expect(r.long.message).toMatch(/2\.05 s long, over the limit of 2 s/);
     expect(r.errors).toBe(5);
-    expect(r.fits).toMatchObject({ ok: true, duration: 1, playing: true });
+    expect(r.fits).toMatchObject({ ok: true, playing: true });
+    // At a context rate other than the file's 48 kHz the decode is resampled and may come out a sample short.
+    expect(r.fits.duration).toBeCloseTo(1, 3);
     expect(r.fits.rms).toBeGreaterThan(0.02);
 });
 
