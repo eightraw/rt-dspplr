@@ -89,7 +89,9 @@ export interface AudioPlayerProps {
     /** Colours and axis of the spectrogram. */
     spectrogram?: SpectrogramOptions;
     /**
-     * 'plain' (default): the wheel over the waveform zooms around the pointer.
+     * 'plain' (default): the wheel over the waveform zooms around the pointer and never
+     * scrolls the page (a page scroll that brings the waveform under a still pointer goes on
+     * until the wheel rests or the mouse moves).
      * 'modifier': only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page.
      * Shift + wheel or a horizontal wheel pans in both modes.
      */

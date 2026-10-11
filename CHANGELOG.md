@@ -182,6 +182,11 @@ player and, from 0.4.0, the Node prepare step for long recordings (its
   (checked at build time). `engines` is Node 20.3 or later (the prepare step
   needs `AbortSignal.any`).
 - Play and resume no longer reset the timeline's zoom and pan; only another clip does.
+- The wheel over the timeline is the player's (`wheelZoom: 'plain'`): at the whole
+  clip, at the closest zoom, or sideways with nothing to pan it does nothing, and the
+  page no longer scrolls (nor zooms, for a pinch). A wheel gesture that began
+  elsewhere stays with the page when the page scrolls the player under a still
+  pointer, until the wheel rests for half a second or the mouse moves.
 - `THIRD_PARTY_NOTICES.md` ships in the package with the notices of Signalsmith
   Stretch (MIT), dr_mp3 and dr_flac (public domain or MIT-0) and libopus
   (BSD-3-Clause), each also embedded in its chunk; the build checks both.

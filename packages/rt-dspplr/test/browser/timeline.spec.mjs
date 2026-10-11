@@ -41,19 +41,82 @@ test('zoom={false}: the wheel scrolls the page, nothing zooms or pans, a click s
     await expect.poll(() => page.evaluate(() => window.timelinePlayer.getCurrentTime())).toBeGreaterThan(5.5);
 });
 
-test('by default the wheel zooms and the page stays put; scrolling down at 1x still scrolls the page', async ({ page }) => {
+// Whether the page was refused the last wheel event: read after the timeline's handler.
+const watchWheel = (page) => page.evaluate(() => {
+    window.wheelTaken = [];
+    window.addEventListener('wheel', (event) => window.wheelTaken.push(event.defaultPrevented));
+});
+const lastTaken = (page) => page.evaluate(() => window.wheelTaken.at(-1));
+
+test("by default the wheel over the timeline is the timeline's: it zooms, and where it changes nothing the page stays put", async ({ page }) => {
     const { box } = await mount(page, {});
+    await watchWheel(page);
     await page.mouse.wheel(0, -300);
     await expect.poll(() => zoomed(page)).toBe(1);
     expect(await page.evaluate(() => window.scrollY)).toBe(0);
     expect(await page.locator('.rtd-overview').count()).toBe(1);
 
+    // Down at 1x.
     await page.locator('.rtd-zoom-reset').click();
     await expect.poll(() => zoomed(page)).toBe(0);
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
     await page.mouse.wheel(0, 400);
-    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
+    await page.waitForTimeout(200);
+    expect(await lastTaken(page)).toBe(true);
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
     expect(await zoomed(page)).toBe(0);
+
+    // Sideways with nothing to pan.
+    await page.mouse.wheel(300, 0);
+    expect(await lastTaken(page)).toBe(true);
+
+    // Up to the closest zoom, and on.
+    for (let i = 0; i < 12; i += 1) await page.mouse.wheel(0, -600);
+    await expect.poll(() => zoomed(page)).toBe(1);
+    await page.mouse.wheel(0, -600);
+    expect(await lastTaken(page)).toBe(true);
+    // A pinch there: not the browser's zoom either.
+    await page.keyboard.down('Control');
+    await page.mouse.wheel(0, -300);
+    await page.keyboard.up('Control');
+    expect(await lastTaken(page)).toBe(true);
+    await page.waitForTimeout(200);
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+});
+
+test('a page scroll that carries the timeline under a still pointer goes on scrolling the page; after a rest the wheel zooms', async ({ page }) => {
+    const { box } = await mount(page, {});
+    await page.evaluate(() => window.scrollTo(0, 600));
+    // A point the timeline (the top 120 px of the page) passes under as the page scrolls up.
+    const x = box.x + box.width / 2;
+    await page.mouse.move(x, 10);
+    let over = false;
+    for (let i = 0; i < 40 && (await page.evaluate(() => window.scrollY)) > 0; i += 1) {
+        await page.mouse.wheel(0, -50);
+        await page.waitForTimeout(60);
+        over ||= await page.evaluate((px) => !!document.elementFromPoint(px, 10)?.closest('.rtd-scrub'), x);
+    }
+    expect(over).toBe(true);
+    // The top reached: the timeline let the gesture through instead of zooming in.
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+    expect(await zoomed(page)).toBe(0);
+
+    await page.waitForTimeout(700);
+    await page.mouse.wheel(0, -300);
+    await expect.poll(() => zoomed(page)).toBe(1);
+});
+
+test('moving the pointer onto the timeline begins a new gesture at once', async ({ page }) => {
+    const { box } = await mount(page, {});
+    const x = box.x + box.width / 2;
+    // The page's gesture, below the timeline (at the top already, so nothing moves).
+    await page.mouse.move(x, box.y + box.height + 200);
+    await page.mouse.wheel(0, -100);
+    // Onto the timeline well within the rest: the wheel there is the timeline's.
+    await page.mouse.move(x, box.y + box.height / 2);
+    await page.mouse.wheel(0, -300);
+    await expect.poll(() => zoomed(page)).toBe(1);
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
 });
 
 test("wheelZoom 'modifier': the wheel scrolls the page, Ctrl + wheel zooms", async ({ page }) => {

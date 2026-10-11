@@ -20,7 +20,11 @@ export interface TimelineOptions {
     waveformStyle?: 'envelope' | 'bars';
     /** Colours and axis of the spectrogram. */
     spectrogram?: SpectrogramOptions;
-    /** 'plain' (default): the wheel alone zooms. 'modifier': only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. */
+    /**
+     * 'plain' (default): the wheel alone zooms, and the wheel over the timeline never scrolls the page
+     * (a page scroll that brings the timeline under a still pointer goes on until the wheel rests).
+     * 'modifier': only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page.
+     */
     wheelZoom?: 'plain' | 'modifier';
     /** Zoom and pan with the wheel, the keys and the overview strip. Default true. */
     zoom?: boolean;

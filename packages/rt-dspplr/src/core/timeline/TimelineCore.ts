@@ -23,10 +23,12 @@ import { drawEnvelope } from './waveEnvelope';
 //   loop handles     drag or arrow keys to move an edge
 //   Ctrl/Cmd + wheel zoom around the pointer, in proportion to the wheel's
 //                    travel, down to a 0.5 s window (wheelZoom 'plain': the
-//                    wheel alone). Only a change of zoom takes the event from
-//                    the page: scrolling down at 1x, or up at the closest zoom,
-//                    scrolls the page; scrolling up over a clip at 1x zooms in
-//                    until the closest zoom before the page moves again.
+//                    wheel alone, and the wheel over the timeline is the
+//                    timeline's: at 1x or at the closest zoom it does nothing
+//                    and the page stays put). A wheel gesture that began
+//                    elsewhere stays with the page when the page carries the
+//                    timeline under a still pointer: it ends when the wheel
+//                    rests (WHEEL_REST_MS) or the pointer moves (WHEEL_SLOP_PX).
 //   Shift + wheel /  pan while zoomed; the overview strip under the ruler
 //   horizontal wheel can also be dragged or clicked
 //   keyboard         ←/→ ±1 s, PageUp/PageDown ±5 s, Home/End,
@@ -50,6 +52,10 @@ const TOUCH_DRAG_THRESHOLD_PX = 8;
 const MIN_VISIBLE_WINDOW = 0.5;
 /** Wheel travel that doubles (or halves) the zoom: three notches of a mouse wheel. */
 const WHEEL_PIXELS_PER_OCTAVE = 300;
+/** A wheel gesture ends after this long without a wheel event (a trackpad's momentum keeps it going)... */
+const WHEEL_REST_MS = 500;
+/** ...or once the pointer is this far from where the gesture began. */
+const WHEEL_SLOP_PX = 10;
 
 /** A wheel's delta in pixels, whatever unit the event reports it in. */
 function wheelPixels(delta: number, deltaMode: number, pageHeight: number): number {
@@ -158,6 +164,8 @@ export class TimelineCore {
     private _ticksKey = '';
     private _handlesShown = { start: false, end: false };
     private _ariaNow = '';
+    /** The wheel gesture under way: its last event, where it began, and whether it began over the timeline. */
+    private readonly _wheel = { last: -Infinity, x: 0, y: 0, ours: true };
     private _disposed = false;
     private readonly _off: Array<() => void> = [];
 
@@ -242,6 +250,8 @@ export class TimelineCore {
             this._renderHover();
         });
         on(element, 'wheel', this._onWheel, { passive: false });
+        // Every wheel event on the page, before the timeline's own handler: which gesture it belongs to.
+        if (doc.defaultView) on(doc.defaultView, 'wheel', this._trackWheel, { passive: true, capture: true });
 
         this._applyDisplay();
         this._applyEmptyText();
@@ -591,29 +601,50 @@ export class TimelineCore {
         this._render();
     }
 
+    /**
+     * A new gesture begins after the wheel has rested or the pointer has moved, and belongs to
+     * the timeline only when it begins over it: the page scrolling the timeline under a still
+     * pointer goes on scrolling the page. The window sees each event before the timeline does.
+     */
+    private readonly _trackWheel = (event: WheelEvent): void => {
+        const w = this._wheel;
+        const moved = Math.abs(event.clientX - w.x) > WHEEL_SLOP_PX || Math.abs(event.clientY - w.y) > WHEEL_SLOP_PX;
+        if (event.timeStamp - w.last > WHEEL_REST_MS || moved) {
+            w.x = event.clientX;
+            w.y = event.clientY;
+            w.ours = event.composedPath().includes(this.element);
+        }
+        w.last = event.timeStamp;
+    };
+
     private readonly _onWheel = (event: WheelEvent): void => {
-        // Without zoom the wheel (and a trackpad pinch, which arrives as Ctrl + wheel) stays with the page.
-        if (!this._input.zoomable || this._input.duration <= 0) return;
+        // Without zoom the wheel (and a trackpad pinch, which arrives as Ctrl + wheel) stays with
+        // the page, as does a gesture that began elsewhere.
+        if (!this._input.zoomable || this._input.duration <= 0 || !this._wheel.ours) return;
         const rect = this._frame.getBoundingClientRect();
         const pageHeight = this.element.ownerDocument.defaultView?.innerHeight ?? 800;
+        // 'plain': the wheel over the timeline is the timeline's, also where it changes nothing
+        // (at 1x, at the closest zoom, sideways with nothing to pan). 'modifier': only what moves
+        // the view, and a pinch.
+        const plain = this._input.wheelZoom === 'plain';
         const horizontal = Math.abs(event.deltaX) > Math.abs(event.deltaY);
         if (horizontal || event.shiftKey) {
             // Pan (Shift + wheel arrives as deltaX in some browsers).
-            if (this._zoom <= 1) return;
+            if (this._zoom <= 1) {
+                if (plain) event.preventDefault();
+                return;
+            }
             event.preventDefault();
             const delta = wheelPixels(horizontal ? event.deltaX : event.deltaY, event.deltaMode, pageHeight);
             this._panTo(this._offset + (delta / Math.max(1, rect.width)) * this._viewSize);
             return;
         }
-        if (event.deltaY === 0) return;
-        if (this._input.wheelZoom === 'modifier' && !event.ctrlKey && !event.metaKey) return;
-        // In proportion to the wheel's travel: a notch is a small step, a trackpad's
-        // fine deltas finer ones. The event is taken from the page only when the zoom
-        // changes, so scrolling down at 1x, or up at the closest zoom, scrolls the page.
+        if (!plain && !event.ctrlKey && !event.metaKey) return;
+        event.preventDefault();
+        // In proportion to the wheel's travel: a notch is a small step, a trackpad's fine deltas finer ones.
         const pixels = wheelPixels(event.deltaY, event.deltaMode, pageHeight);
         const next = this._clampZoom(this._zoom * 2 ** (-pixels / WHEEL_PIXELS_PER_OCTAVE));
         if (Math.abs(next - this._zoom) < 1e-6) return;
-        event.preventDefault();
         const f = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
         this._zoomTo(next, f);
     };

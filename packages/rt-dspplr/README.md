@@ -323,7 +323,7 @@ below it. The ruler is hidden in this layout.
 | `display` | `'waveform'` | What the seek bar draws: `'waveform'`, `'spectrogram'` (see [Spectrogram](#spectrogram)), or `'both'`: the waveform as an outline over the spectrogram. |
 | `spectrogram` | none | Options of the spectrogram, see [Spectrogram](#spectrogram). |
 | `waveformStyle` | `'envelope'` | `'envelope'`: min/max peak envelope with an inner RMS layer, one column per device pixel. `'bars'`: rounded bars. |
-| `wheelZoom` | `'plain'` | `'plain'`: the wheel over the waveform zooms (at 1x, scrolling down still scrolls the page). `'modifier'`: only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. |
+| `wheelZoom` | `'plain'` | `'plain'`: the wheel over the waveform zooms and never scrolls the page. `'modifier'`: only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. |
 | `zoom` | `true` | `false`: no zoom or pan by any means (wheel, keys, overview strip). The waveform always shows the whole clip and the wheel scrolls the page; seeking and loops stay. |
 | `ruler` | `true` | Time ruler and zoom overview under the waveform (full layout only). |
 | `layout` | `'auto'` | `'full' \| 'compact' \| 'auto'`. |
@@ -334,10 +334,13 @@ below it. The ruler is hidden in this layout.
 **Mouse.** Click the waveform to seek; a click outside an active loop also
 clears it. Drag across the waveform to select a loop, then drag its handles to
 adjust it. The wheel over the waveform (or the ruler) zooms around the
-pointer, in proportion to the wheel's travel, down to a 0.5 s visible window;
-at the whole clip, scrolling down still scrolls the page (`wheelZoom="modifier"`:
-only Ctrl/Cmd + wheel zooms and the wheel alone scrolls the page; `zoom={false}`:
-no zoom at all). A trackpad pinch arrives as Ctrl + wheel and zooms too.
+pointer, in proportion to the wheel's travel, down to a 0.5 s visible window.
+Over the waveform the wheel is the player's: at the whole clip or the closest
+zoom it does nothing, and the page stays put. When the page scrolls the player
+under a still pointer, the page goes on scrolling until the wheel rests for half
+a second or the mouse moves (`wheelZoom="modifier"`: only Ctrl/Cmd + wheel zooms
+and the wheel alone scrolls the page; `zoom={false}`: no zoom at all). A trackpad
+pinch arrives as Ctrl + wheel and zooms too.
 Shift + wheel or a horizontal wheel pans while zoomed; so does dragging or
 clicking the overview strip under the ruler. While playing zoomed
 in, the view follows the playhead. The "× · reset" chip (or `0`) shows the
@@ -578,7 +581,7 @@ import '@saitdigital/rt-dspplr/styles.css';
 | `display` | `'waveform'` | `'waveform'`, `'spectrogram'` or `'both'`. |
 | `waveformStyle` | `'envelope'` | `'envelope'` or `'bars'`. |
 | `spectrogram` | none | Options of the spectrogram, see below. |
-| `wheelZoom` | `'plain'` | `'plain'`: the wheel zooms. `'modifier'`: only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. |
+| `wheelZoom` | `'plain'` | `'plain'`: the wheel zooms and never scrolls the page. `'modifier'`: only Ctrl/Cmd + wheel zooms, the wheel alone scrolls the page. |
 | `zoom` | `true` | `false`: no zoom or pan; the wheel scrolls the page, clicks still seek. |
 | `ruler` | `true` | Time ruler and zoom overview under the track. |
 | `theme` | `'light'` | `'light'`, `'dark'` or `'auto'`. The `--rtd-*` tokens restyle it. |
