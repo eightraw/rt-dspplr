@@ -12,6 +12,9 @@ const npmCli = process.env.npm_execpath;
 assert.ok(npmCli, 'Run through npm run test:package');
 const npm = (args, cwd) => execFileSync(process.execPath, [npmCli, ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 try {
+    // What prepack does besides the build, which --ignore-scripts skips: on a fresh checkout the
+    // package folder has no changelog of its own.
+    fs.copyFileSync(path.join(root, '../../CHANGELOG.md'), path.join(root, 'CHANGELOG.md'));
     const [pack] = JSON.parse(npm(['pack', '--ignore-scripts', '--json', '--pack-destination', temp], root));
     assert.ok(pack.files.every(file => !file.path.endsWith('.wasm') && !file.path.includes('node_modules/')));
     assert.ok(pack.files.some(file => file.path === 'dist/bundle-sizes.json'));

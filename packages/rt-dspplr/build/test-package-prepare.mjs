@@ -86,7 +86,7 @@ try {
     // ---- the output against the shipped schema and assertManifest() ------------------------
     const check = `import fs from 'node:fs';
 import { createRequire } from 'node:module';
-import { assertManifest } from '@saitdigital/rt-dspplr/format';
+import { assertManifest, parseManifest } from '@saitdigital/rt-dspplr/format';
 import { prepareAudio } from '@saitdigital/rt-dspplr/prepare';
 const require = createRequire(import.meta.url);
 const schema = require('@saitdigital/rt-dspplr/manifest.schema.json');
@@ -101,7 +101,8 @@ const job = prepareAudio('talk.wav', { outDir: 'prepared-api', segmentSeconds: 3
 const m = await job.done;
 if (job.stats.threads < 2) throw new Error('the installed worker was not found (' + job.stats.threads + ' thread)');
 for (const f of ['source.wav', 'peaks.bin', 'bands.bin', 'spectrogram.bin']) if (!fs.existsSync('prepared-api/' + f)) throw new Error(f);
-if (JSON.stringify(m.segments) !== JSON.stringify(manifest.segments)) throw new Error('CLI and API segments differ');
+// The file holds the segments as columns; the API returns them as the player reads them.
+if (JSON.stringify(m.segments) !== JSON.stringify(parseManifest(manifest).segments)) throw new Error('CLI and API segments differ');
 console.log('installed CLI output: schema and assertManifest agree; installed API ran on ' + job.stats.threads + ' threads, same segments');`;
     fs.writeFileSync(path.join(temp, 'check.mjs'), check);
     const ajv = pathToFileURL(path.join(root, '..', '..', 'node_modules', 'ajv', 'dist', '2020.js')).href;
